@@ -1,0 +1,17 @@
+{
+  "name": "claude-statusline",
+  "version": "1.0.0",
+  "description": "Rich multi-line status bar showing model, cost, context window, git status, rate limits, burn rate, and token tracking",
+  "author": {
+    "name": "Andrew Kent",
+    "url": "https://github.com/AndrewTKent"
+  },
+  "homepage": "https://github.com/AndrewTKent/claude-statusline",
+  "category": "productivity",
+  "license": "MIT",
+  "keywords": ["statusline", "status-bar", "cost-tracking", "rate-limits", "dashboard"],
+  "statusLine": {
+    "type": "command",
+    "command": "bin/statusline.sh"
+  }
+}

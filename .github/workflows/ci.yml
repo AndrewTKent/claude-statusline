@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run ShellCheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: bin/
+          additional_files: install.sh uninstall.sh
+
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install jq
+        run: |
+          if command -v jq >/dev/null; then echo "jq already installed"; else
+            if [ "$(uname)" = "Darwin" ]; then brew install jq; else sudo apt-get install -y jq; fi
+          fi
+      - name: Test empty input
+        run: |
+          OUTPUT=$(echo '' | bash bin/statusline.sh)
+          [ "$OUTPUT" = "Claude" ] || { echo "FAIL: expected 'Claude', got '$OUTPUT'"; exit 1; }
+          echo "PASS: empty input returns 'Claude'"
+      - name: Test install script (dry run)
+        run: |
+          mkdir -p ~/.claude
+          echo '{"permissions":{}}' > ~/.claude/settings.json
+          bash install.sh
+          [ -f ~/.claude/statusline.sh ] || { echo "FAIL: script not installed"; exit 1; }
+          jq -e '.statusLine' ~/.claude/settings.json || { echo "FAIL: settings not patched"; exit 1; }
+          echo "PASS: install script works"

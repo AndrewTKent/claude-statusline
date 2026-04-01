@@ -1,0 +1,27 @@
+{
+  "name": "claude-statusline",
+  "version": "1.0.0",
+  "description": "Rich multi-line status bar for Claude Code — model, cost, context, git, rate limits",
+  "keywords": ["claude", "claude-code", "statusline", "status-bar", "terminal", "cli"],
+  "author": "Andrew Kent",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AndrewTKent/claude-statusline.git"
+  },
+  "homepage": "https://github.com/AndrewTKent/claude-statusline",
+  "bin": {
+    "claude-statusline": "./bin/cli.js"
+  },
+  "files": [
+    "bin/",
+    "lib/",
+    "assets/"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "scripts": {
+    "prepublishOnly": "mkdir -p assets && cp ../bin/statusline.sh assets/ && cp ../config/statusline.conf.example assets/"
+  }
+}
