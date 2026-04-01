@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2059,SC2034,SC2154,SC2153,SC1090,SC2329,SC2016
 set -f
 
 input=$(cat)
