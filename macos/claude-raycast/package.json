@@ -1,0 +1,36 @@
+{
+  "$schema": "https://www.raycast.com/schemas/extension.json",
+  "name": "claude-statusline",
+  "title": "Claude Code Status",
+  "description": "View Claude Code session metrics — cost, rate limits, context, tokens",
+  "icon": "command-icon.png",
+  "author": "AndrewTKent",
+  "license": "MIT",
+  "commands": [
+    {
+      "name": "claude-status",
+      "title": "Claude Status",
+      "description": "View current Claude Code session metrics",
+      "mode": "view"
+    },
+    {
+      "name": "menu-bar",
+      "title": "Claude Status Bar",
+      "description": "Always-visible Claude Code cost and rate limit in menu bar",
+      "mode": "menu-bar",
+      "interval": "30s"
+    }
+  ],
+  "dependencies": {
+    "@raycast/api": "^1.80.0"
+  },
+  "devDependencies": {
+    "@raycast/eslint-config": "^1.0.11",
+    "typescript": "^5.4.0"
+  },
+  "scripts": {
+    "build": "ray build",
+    "dev": "ray develop",
+    "lint": "ray lint"
+  }
+}

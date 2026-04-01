@@ -1,0 +1,9 @@
+# Build artifacts
+macos/ClaudeMenuBar/.build/
+macos/claude-raycast/node_modules/
+macos/claude-raycast/dist/
+npm/node_modules/
+npm/assets/
+
+# macOS
+.DS_Store
