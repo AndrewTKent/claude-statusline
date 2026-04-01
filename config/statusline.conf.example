@@ -1,0 +1,14 @@
+# Claude Code Status Line Configuration
+# Copy to ~/.claude/statusline.conf
+
+# Billing rate in $/hour (enables billable amount display)
+# HOURLY_RATE=150
+
+# Daily cost ceiling in $ (enables budget progress bar)
+# DAILY_BUDGET=20
+
+# Render format: default | sigil | sparkline | iterm2 | rprompt
+# FORMAT=default
+
+# Account labels: map email patterns to short names
+# ACCOUNT_LABELS="work:*@yourcompany.com personal:you@gmail.com"
