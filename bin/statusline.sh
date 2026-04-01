@@ -489,6 +489,20 @@ needs_refresh=false
 needs_profile_refresh=false
 now=$(date +%s)
 
+# Detect account switch: if credentials file changed, invalidate caches
+creds_mtime_file="/tmp/claude/statusline-creds-mtime"
+creds_file="$HOME/.claude/.credentials.json"
+if [ -f "$creds_file" ]; then
+    creds_mtime=$(stat -f %m "$creds_file" 2>/dev/null || stat -c %Y "$creds_file" 2>/dev/null)
+    old_creds_mtime=$(cat "$creds_mtime_file" 2>/dev/null)
+    if [ "$old_creds_mtime" != "$creds_mtime" ]; then
+        rm -f "$cache_file" "$profile_cache_file" "$lock_file"
+        echo "$creds_mtime" > "$creds_mtime_file"
+        needs_refresh=true
+        needs_profile_refresh=true
+    fi
+fi
+
 if [ -f "$cache_file" ]; then
     cache_mtime=$(stat -f %m "$cache_file" 2>/dev/null || stat -c %Y "$cache_file" 2>/dev/null)
     cache_age=$(( now - cache_mtime ))
@@ -507,6 +521,14 @@ fi
 
 # Fire-and-forget background refresh (never blocks the status line)
 if $needs_refresh || $needs_profile_refresh; then
+    # Clean up stale lock files (PID dead or lock older than 30s)
+    if [ -f "$lock_file" ]; then
+        lock_pid=$(cat "$lock_file" 2>/dev/null)
+        lock_age=$(( now - $(stat -f %m "$lock_file" 2>/dev/null || stat -c %Y "$lock_file" 2>/dev/null || echo "$now") ))
+        if [ "$lock_age" -gt 30 ] || ! kill -0 "$lock_pid" 2>/dev/null; then
+            rm -f "$lock_file"
+        fi
+    fi
     # Use a lock file to prevent concurrent refreshes from racing
     if (set -o noclobber; echo $$ > "$lock_file") 2>/dev/null; then
         (
