@@ -16,6 +16,7 @@ jobs:
         with:
           scandir: bin/
           additional_files: install.sh uninstall.sh
+          severity: error
 
   test:
     runs-on: ${{ matrix.os }}
