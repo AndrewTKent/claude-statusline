@@ -303,94 +303,17 @@ if [ -n "$SESSION_ID" ] && [ "$(awk "BEGIN {print ($COST > 0)}")" = "1" ]; then
 fi
 DAILY_FMT=$(printf "%.2f" "$DAILY_COST")
 
-# ── Token challenge tracker (incremental checkpoint) ─────
-TOKEN_CHECKPOINT="$HOME/.claude/token-checkpoint.json"
+# ── Token challenge tracker (reads stats-cache directly) ─────
 TOKEN_DISPLAY=""
 
 if [ -n "$SESSION_ID" ]; then
     SESSION_TOKENS=$((INPUT_TOKENS + OUTPUT_TOKENS))
     get_subagent_tokens "$SESSION_ID" "$CWD"
 
-    PROJECTS_DIR="$HOME/.claude/projects"
     CHALLENGE_TOKENS=0
-
-    # Sum input_tokens + output_tokens from JSONL usage blocks (batched for large file counts)
-    sum_jsonl_tokens() {
-        xargs -0 -n 200 jq -s '[.[].message.usage | select(.) | (.input_tokens // 0) + (.output_tokens // 0)] | add // 0' 2>/dev/null \
-            | awk '{s+=$1} END {print s+0}'
-    }
-
-    # Checkpoint stores: {"total": N, "files": {"path": tokens, ...}}
-    # On incremental render: re-scan changed files, replace their entry, recompute total.
-    TOKEN_WATERMARK="/tmp/claude/statusline-token-watermark"
-    mkdir -p /tmp/claude
-
-    if [ -f "$TOKEN_CHECKPOINT" ] && [ -f "$TOKEN_WATERMARK" ]; then
-        CHALLENGE_TOKENS=$(jq '.total // 0' "$TOKEN_CHECKPOINT" 2>/dev/null)
+    if [ -f "$HOME/.claude/stats-cache.json" ]; then
+        CHALLENGE_TOKENS=$(jq '[.modelUsage[] | .inputTokens + .outputTokens] | add // 0' "$HOME/.claude/stats-cache.json" 2>/dev/null)
         [ -z "$CHALLENGE_TOKENS" ] && CHALLENGE_TOKENS=0
-
-        if [ -d "$PROJECTS_DIR" ]; then
-            # Find files changed since last scan
-            mapfile -d '' changed < <(find "$PROJECTS_DIR" -name "*.jsonl" -newer "$TOKEN_WATERMARK" -print0 2>/dev/null)
-
-            if [ "${#changed[@]}" -gt 0 ]; then
-                # Subtract old values for changed files, add new values
-                for f in "${changed[@]}"; do
-                    old_val=$(jq -r --arg f "$f" '.files[$f] // 0' "$TOKEN_CHECKPOINT" 2>/dev/null)
-                    [ -z "$old_val" ] && old_val=0
-                    new_val=$(jq -s '[.[].message.usage | select(.) | (.input_tokens // 0) + (.output_tokens // 0)] | add // 0' "$f" 2>/dev/null)
-                    [ -z "$new_val" ] && new_val=0
-                    CHALLENGE_TOKENS=$((CHALLENGE_TOKENS - old_val + new_val))
-                    # Update file entry in checkpoint
-                    jq_update "$TOKEN_CHECKPOINT" --arg f "$f" --argjson v "$new_val" \
-                        '.files[$f] = $v'
-                done
-                # Update total
-                jq_update "$TOKEN_CHECKPOINT" --argjson t "$CHALLENGE_TOKENS" '.total = $t'
-                touch "$TOKEN_WATERMARK"
-            fi
-        fi
-    else
-        # First run: use stats-cache as instant estimate
-        CHALLENGE_TOKENS=0
-        if [ -f "$HOME/.claude/stats-cache.json" ]; then
-            CHALLENGE_TOKENS=$(jq '[.modelUsage[] | .inputTokens + .outputTokens] | add // 0' "$HOME/.claude/stats-cache.json" 2>/dev/null)
-            [ -z "$CHALLENGE_TOKENS" ] && CHALLENGE_TOKENS=0
-        fi
-
-        printf '{"total":%s,"files":{}}' "$CHALLENGE_TOKENS" > "$TOKEN_CHECKPOINT"
-        touch "$TOKEN_WATERMARK"
-
-        # Background full scan builds accurate per-file index
-        (
-            if [ -d "$PROJECTS_DIR" ]; then
-                # Process files in batches of 50, output "file\ttokens" per file
-                result=$(find "$PROJECTS_DIR" -name "*.jsonl" -print0 2>/dev/null \
-                    | xargs -0 -n 50 sh -c '
-                        for f do
-                            t=$(jq -s "[.[].message.usage | select(.) | (.input_tokens // 0) + (.output_tokens // 0)] | add // 0" "$f" 2>/dev/null)
-                            [ -z "$t" ] && t=0
-                            printf "%s\t%s\n" "$f" "$t"
-                        done
-                    ' _ 2>/dev/null \
-                    | awk -F'\t' '
-                        BEGIN { printf "{\"files\":{" }
-                        NR>1 { printf "," }
-                        {
-                            s += $2
-                            # Escape backslashes and quotes in path
-                            gsub(/\\/, "\\\\", $1)
-                            gsub(/"/, "\\\"", $1)
-                            printf "\"%s\":%s", $1, $2
-                        }
-                        END { printf "},\"total\":%s}", s }
-                    ')
-                if [ -n "$result" ] && echo "$result" | jq -e '.total > 0' >/dev/null 2>&1; then
-                    echo "$result" > "$TOKEN_CHECKPOINT"
-                    touch "$TOKEN_WATERMARK"
-                fi
-            fi
-        ) &
     fi
 
     if [ "$CHALLENGE_TOKENS" -gt 0 ] 2>/dev/null; then
