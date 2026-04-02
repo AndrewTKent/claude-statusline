@@ -382,7 +382,7 @@ if [ -n "$SESSION_ID" ]; then
         TOKEN_PCT_COLOR=$(color_for_pct "$TOKEN_PCT")
         INPUT_M=$(awk "BEGIN {printf \"%.1f\", $TOTAL_INPUT / 1000000}")
         OUTPUT_M=$(awk "BEGIN {printf \"%.1f\", $TOTAL_OUTPUT / 1000000}")
-        TOKEN_DISPLAY="${TOKEN_BAR} ${TOKEN_PCT_COLOR}$(printf "%3d" "$TOKEN_PCT")%${reset} ${cyan}${INPUT_M}${reset}${dim}+${reset}${magenta}${OUTPUT_M}M${reset}${dim}/${GOAL_M}M${reset}${TOKEN_SUFFIX}"
+        TOKEN_DISPLAY="${TOKEN_BAR} ${TOKEN_PCT_COLOR}$(printf "%3d" "$TOKEN_PCT")%${reset} ${dim}(${reset}${cyan}${INPUT_M}${reset}${dim}+${reset}${magenta}${OUTPUT_M}M${reset}${dim})/${GOAL_M}M${reset}${TOKEN_SUFFIX}"
     fi
 fi
 
