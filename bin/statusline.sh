@@ -87,12 +87,38 @@ jq_update() {
     fi
 }
 
+# ── Account label resolution ─────────────────────────────
+# Resolves email to account label (e.g., "work", "personal")
+# Checks ACCOUNT_LABELS config first, then hardcoded fallbacks
+resolve_account_label() {
+    local email="$1"
+    [ -z "$email" ] && return
+
+    # Check ACCOUNT_LABELS config: "work:*@company.com personal:me@gmail.com"
+    if [ -n "$ACCOUNT_LABELS" ]; then
+        local pair label pattern
+        for pair in $ACCOUNT_LABELS; do
+            label="${pair%%:*}"
+            pattern="${pair#*:}"
+            # shellcheck disable=SC2254
+            case "$email" in $pattern) echo "$label"; return ;; esac
+        done
+    fi
+
+    # Hardcoded fallbacks
+    case "$email" in
+        *@coram.ai)                echo "work" ;;
+        andrewkent10@gmail.com)    echo "personal" ;;
+        ?*)                        echo "$email" ;;
+    esac
+}
+
 # ── Reusable ledger function ─────────────────────────────
-# Usage: update_ledger <file> <session_id> <value> <today>
+# Usage: update_ledger <file> <session_id> <value> <today> [acct]
 # Returns the daily delta (sum of all session deltas) via LEDGER_RESULT
 LEDGER_RESULT=0
 update_ledger() {
-    local file="$1" sid="$2" value="$3" today="$4"
+    local file="$1" sid="$2" value="$3" today="$4" acct="${5:-}"
 
     if [ -f "$file" ]; then
         # Single jq call to get date + baseline existence
@@ -103,24 +129,83 @@ update_ledger() {
 
         if [ "$ledger_date" = "$today" ]; then
             if [ -z "$has_baseline" ]; then
-                jq_update "$file" --arg sid "$sid" --argjson val "$value" \
-                    '.sessions[$sid] = {"baseline": $val, "current": $val}'
+                if [ -n "$acct" ]; then
+                    jq_update "$file" --arg sid "$sid" --argjson val "$value" --arg acct "$acct" \
+                        '.sessions[$sid] = {"baseline": $val, "current": $val, "acct": $acct}'
+                else
+                    jq_update "$file" --arg sid "$sid" --argjson val "$value" \
+                        '.sessions[$sid] = {"baseline": $val, "current": $val}'
+                fi
             else
-                jq_update "$file" --arg sid "$sid" --argjson val "$value" \
-                    '.sessions[$sid].current = $val'
+                if [ -n "$acct" ]; then
+                    jq_update "$file" --arg sid "$sid" --argjson val "$value" --arg acct "$acct" \
+                        '.sessions[$sid].current = $val | .sessions[$sid].acct = $acct'
+                else
+                    jq_update "$file" --arg sid "$sid" --argjson val "$value" \
+                        '.sessions[$sid].current = $val'
+                fi
             fi
             LEDGER_RESULT=$(jq '[.sessions[] | .current - .baseline] | add // 0' "$file" 2>/dev/null)
             [ -z "$LEDGER_RESULT" ] && LEDGER_RESULT=0
         else
-            printf '{"date":"%s","sessions":{"%s":{"baseline":%s,"current":%s}}}' \
-                "$today" "$sid" "$value" "$value" > "$file"
+            if [ -n "$acct" ]; then
+                printf '{"date":"%s","sessions":{"%s":{"baseline":%s,"current":%s,"acct":"%s"}}}' \
+                    "$today" "$sid" "$value" "$value" "$acct" > "$file"
+            else
+                printf '{"date":"%s","sessions":{"%s":{"baseline":%s,"current":%s}}}' \
+                    "$today" "$sid" "$value" "$value" > "$file"
+            fi
             LEDGER_RESULT=0
         fi
     else
-        printf '{"date":"%s","sessions":{"%s":{"baseline":%s,"current":%s}}}' \
-            "$today" "$sid" "$value" "$value" > "$file"
+        if [ -n "$acct" ]; then
+            printf '{"date":"%s","sessions":{"%s":{"baseline":%s,"current":%s,"acct":"%s"}}}' \
+                "$today" "$sid" "$value" "$value" "$acct" > "$file"
+        else
+            printf '{"date":"%s","sessions":{"%s":{"baseline":%s,"current":%s}}}' \
+                "$today" "$sid" "$value" "$value" > "$file"
+        fi
         LEDGER_RESULT=0
     fi
+}
+
+# ── Subagent token tracking ──────────────────────────────
+# Sums tokens from subagent JSONL files for the current session.
+# Caches result for 30s to avoid scanning on every render.
+SUBAGENT_TOKENS=0
+get_subagent_tokens() {
+    local sid="$1" cwd="$2"
+    SUBAGENT_TOKENS=0
+    [ -z "$sid" ] || [ -z "$cwd" ] && return
+
+    local cache_file="/tmp/claude/statusline-subagent-${sid}.txt"
+    mkdir -p /tmp/claude
+
+    # Check cache (30s TTL)
+    if [ -f "$cache_file" ]; then
+        local cache_age
+        local cache_mtime
+        cache_mtime=$(stat -f %m "$cache_file" 2>/dev/null || stat -c %Y "$cache_file" 2>/dev/null)
+        cache_age=$(( $(date +%s) - cache_mtime ))
+        if [ "$cache_age" -lt 30 ]; then
+            SUBAGENT_TOKENS=$(cat "$cache_file" 2>/dev/null)
+            [ -z "$SUBAGENT_TOKENS" ] && SUBAGENT_TOKENS=0
+            return
+        fi
+    fi
+
+    # Map CWD to project dir name (Claude's convention: slashes become dashes)
+    local project_dir
+    project_dir=$(echo "$cwd" | tr '/' '-')
+    local subagent_path="$HOME/.claude/projects/${project_dir}/${sid}/subagents"
+
+    if [ -d "$subagent_path" ]; then
+        # Sum input + output tokens across subagent files
+        SUBAGENT_TOKENS=$(jq -s '[.[].message.usage | select(.) | (.input_tokens // 0) + (.output_tokens // 0)] | add // 0' "$subagent_path"/agent-*.jsonl 2>/dev/null)
+        [ -z "$SUBAGENT_TOKENS" ] && SUBAGENT_TOKENS=0
+    fi
+
+    echo "$SUBAGENT_TOKENS" > "$cache_file"
 }
 
 iso_to_epoch() {
@@ -199,45 +284,81 @@ eval "$(echo "$input" | jq -r '
     "CTX_SIZE=" + (.context_window.context_window_size // 200000 | tostring | @sh)
 ' 2>/dev/null)"
 
+# ── Early account resolution (needed before ledger writes) ──
+ACCT_TAG=""
+ACCT_EMAIL=""
+profile_cache_file="/tmp/claude/statusline-profile-cache.json"
+if [ -f "$profile_cache_file" ]; then
+    ACCT_EMAIL=$(jq -r '.account.email // empty' "$profile_cache_file" 2>/dev/null)
+    ACCT_TAG=$(resolve_account_label "$ACCT_EMAIL")
+fi
+
 # ── Daily cost ledger ──────────────────────────────────
 DAILY_LEDGER="$HOME/.claude/daily-cost.json"
 TODAY=$(date +%Y-%m-%d)
 DAILY_COST="$COST"
 if [ -n "$SESSION_ID" ] && [ "$(awk "BEGIN {print ($COST > 0)}")" = "1" ]; then
-    update_ledger "$DAILY_LEDGER" "$SESSION_ID" "$COST" "$TODAY"
+    update_ledger "$DAILY_LEDGER" "$SESSION_ID" "$COST" "$TODAY" "$ACCT_TAG"
     DAILY_COST="${LEDGER_RESULT:-0}"
 fi
 DAILY_FMT=$(printf "%.2f" "$DAILY_COST")
 
-# ── Token challenge tracker ───────────────────────────────
-TOKEN_LEDGER="$HOME/.claude/token-challenge.json"
+# ── Token challenge tracker (incremental checkpoint) ─────
+TOKEN_CHECKPOINT="$HOME/.claude/token-checkpoint.json"
 TOKEN_DISPLAY=""
 
 if [ -n "$SESSION_ID" ]; then
     SESSION_TOKENS=$((INPUT_TOKENS + OUTPUT_TOKENS))
+    get_subagent_tokens "$SESSION_ID" "$CWD"
 
-    if [ -f "$TOKEN_LEDGER" ]; then
-        TL_HAS_BASE=$(jq --arg sid "$SESSION_ID" '.sessions[$sid].baseline // empty' "$TOKEN_LEDGER" 2>/dev/null)
-        if [ -z "$TL_HAS_BASE" ]; then
-            jq_update "$TOKEN_LEDGER" --arg sid "$SESSION_ID" --argjson tok "$SESSION_TOKENS" \
-                '.sessions[$sid] = {"baseline": $tok, "current": $tok}'
-        else
-            jq_update "$TOKEN_LEDGER" --arg sid "$SESSION_ID" --argjson tok "$SESSION_TOKENS" \
-                '.sessions[$sid].current = $tok'
+    PROJECTS_DIR="$HOME/.claude/projects"
+    CHALLENGE_TOKENS=0
+
+    # Sum input_tokens + output_tokens from JSONL usage blocks (batched for large file counts)
+    sum_jsonl_tokens() {
+        xargs -0 -n 200 jq -s '[.[].message.usage | select(.) | (.input_tokens // 0) + (.output_tokens // 0)] | add // 0' 2>/dev/null \
+            | awk '{s+=$1} END {print s+0}'
+    }
+
+    if [ -f "$TOKEN_CHECKPOINT" ]; then
+        # Incremental: sum tokens from JSONL files newer than checkpoint
+        CHALLENGE_TOKENS=$(jq '.total // 0' "$TOKEN_CHECKPOINT" 2>/dev/null)
+        [ -z "$CHALLENGE_TOKENS" ] && CHALLENGE_TOKENS=0
+
+        DELTA_TOKENS=0
+        if [ -d "$PROJECTS_DIR" ]; then
+            DELTA_TOKENS=$(find "$PROJECTS_DIR" -name "*.jsonl" -newer "$TOKEN_CHECKPOINT" -print0 2>/dev/null \
+                | sum_jsonl_tokens)
+            [ -z "$DELTA_TOKENS" ] && DELTA_TOKENS=0
         fi
-        CHALLENGE_TOKENS=$(jq '.starting_total + ([.sessions[] | .current - .baseline] | add // 0)' "$TOKEN_LEDGER" 2>/dev/null)
+
+        CHALLENGE_TOKENS=$((CHALLENGE_TOKENS + DELTA_TOKENS))
+        printf '{"total":%s}' "$CHALLENGE_TOKENS" > "$TOKEN_CHECKPOINT"
     else
-        STARTING=0
+        # First run: full scan — runs in background, uses stats-cache as initial estimate
+        CHALLENGE_TOKENS=0
         if [ -f "$HOME/.claude/stats-cache.json" ]; then
-            STARTING=$(jq '[.modelUsage[].inputTokens, .modelUsage[].outputTokens] | add // 0' "$HOME/.claude/stats-cache.json" 2>/dev/null)
-            [ -z "$STARTING" ] && STARTING=0
+            CHALLENGE_TOKENS=$(jq '[.modelUsage[] | .inputTokens + .outputTokens] | add // 0' "$HOME/.claude/stats-cache.json" 2>/dev/null)
+            [ -z "$CHALLENGE_TOKENS" ] && CHALLENGE_TOKENS=0
         fi
-        printf '{"starting_total":%s,"sessions":{"%s":{"baseline":%s,"current":%s}}}' \
-            "$STARTING" "$SESSION_ID" "$SESSION_TOKENS" "$SESSION_TOKENS" > "$TOKEN_LEDGER"
-        CHALLENGE_TOKENS="$STARTING"
+
+        # Write initial checkpoint from stats-cache (instant)
+        printf '{"total":%s}' "$CHALLENGE_TOKENS" > "$TOKEN_CHECKPOINT"
+
+        # Kick off accurate full scan in background — replaces checkpoint when done
+        (
+            FULL_TOTAL=0
+            if [ -d "$PROJECTS_DIR" ]; then
+                FULL_TOTAL=$(find "$PROJECTS_DIR" -name "*.jsonl" -print0 2>/dev/null \
+                    | sum_jsonl_tokens)
+                [ -z "$FULL_TOTAL" ] && FULL_TOTAL=0
+            fi
+            # Only update if scan produced a meaningful result
+            [ "$FULL_TOTAL" -gt 0 ] 2>/dev/null && printf '{"total":%s}' "$FULL_TOTAL" > "$TOKEN_CHECKPOINT"
+        ) &
     fi
 
-    if [ -n "$CHALLENGE_TOKENS" ] && [ "$CHALLENGE_TOKENS" != "null" ]; then
+    if [ "$CHALLENGE_TOKENS" -gt 0 ] 2>/dev/null; then
         TOKEN_M=$(awk "BEGIN {printf \"%.1f\", $CHALLENGE_TOKENS / 1000000}")
         GOAL_M="100"
         TOKEN_PCT=$(awk "BEGIN {printf \"%.0f\", $CHALLENGE_TOKENS / (${GOAL_M} * 10000)}")
@@ -246,7 +367,7 @@ if [ -n "$SESSION_ID" ]; then
 
         # Daily token tracking
         DAILY_TOKEN_LEDGER="$HOME/.claude/daily-tokens.json"
-        update_ledger "$DAILY_TOKEN_LEDGER" "$SESSION_ID" "$SESSION_TOKENS" "$TODAY"
+        update_ledger "$DAILY_TOKEN_LEDGER" "$SESSION_ID" "$SESSION_TOKENS" "$TODAY" "$ACCT_TAG"
         DAILY_TOKENS="${LEDGER_RESULT:-0}"
 
         # Session token delta
@@ -271,6 +392,10 @@ if [ -n "$SESSION_ID" ]; then
         }")
 
         TOKEN_SUFFIX=" ${magenta}+${SESSION_TOKEN_FMT}${reset}"
+        if [ "$SUBAGENT_TOKENS" -gt 0 ] 2>/dev/null; then
+            sub_fmt=$(format_tokens "$SUBAGENT_TOKENS")
+            TOKEN_SUFFIX+=" ${dim}+${sub_fmt} sub${reset}"
+        fi
         if [ "$DAILY_TOKENS" -gt "$SESSION_DELTA" ] 2>/dev/null; then
             TOKEN_SUFFIX+=" ${dim}(+${DAILY_TOKEN_FMT}/d)${reset}"
         fi
@@ -584,14 +709,13 @@ usage_data=""
 profile_data=""
 [ -f "$profile_cache_file" ] && profile_data=$(cat "$profile_cache_file" 2>/dev/null)
 
-# ── Account label ──────────────────────────────────────
+# ── Account label (colorize ACCT_TAG resolved earlier) ──
 ACCOUNT_LABEL=""
-if [ -n "$profile_data" ]; then
-    acct_email=$(echo "$profile_data" | jq -r '.account.email // empty' 2>/dev/null)
-    case "$acct_email" in
-        *@coram.ai)       ACCOUNT_LABEL="${cyan}work${reset}" ;;
-        andrewkent10@gmail.com) ACCOUNT_LABEL="${magenta}personal${reset}" ;;
-        ?*)               ACCOUNT_LABEL="${dim}${acct_email}${reset}" ;;
+if [ -n "$ACCT_TAG" ]; then
+    case "$ACCT_TAG" in
+        work)     ACCOUNT_LABEL="${cyan}work${reset}" ;;
+        personal) ACCOUNT_LABEL="${magenta}personal${reset}" ;;
+        *)        ACCOUNT_LABEL="${dim}${ACCT_TAG}${reset}" ;;
     esac
 fi
 
@@ -893,8 +1017,8 @@ render_sparkline() {
         local ts
         ts=$(date +%s)
         local entry
-        entry=$(printf '{"ts":%s,"sid":"%s","cost":%s,"tokens":%s,"ctx":%s,"rate":%s}' \
-            "$ts" "$SESSION_ID" "$COST" "$((INPUT_TOKENS + OUTPUT_TOKENS))" "$CONTEXT_INT" "${five_hour_pct:-0}")
+        entry=$(printf '{"ts":%s,"sid":"%s","cost":%s,"tokens":%s,"sub":%s,"ctx":%s,"rate":%s,"acct":"%s"}' \
+            "$ts" "$SESSION_ID" "$COST" "$((INPUT_TOKENS + OUTPUT_TOKENS))" "${SUBAGENT_TOKENS:-0}" "$CONTEXT_INT" "${five_hour_pct:-0}" "${ACCT_TAG:-}")
         echo "$entry" >> "$history_file"
 
         # Prune: keep only last entry per session, max 100 entries
