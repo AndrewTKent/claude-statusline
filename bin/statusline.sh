@@ -499,7 +499,21 @@ if [ -f "$creds_file" ]; then
         rm -f "$cache_file" "$profile_cache_file" "$lock_file"
         echo "$creds_mtime" > "$creds_mtime_file"
         needs_refresh=true
-        needs_profile_refresh=true
+        # Synchronous profile fetch on account switch — avoids stale label
+        token=$(get_oauth_token)
+        if [ -n "$token" ] && [ "$token" != "null" ]; then
+            p_response=$(curl -s --max-time 2 \
+                -H "Accept: application/json" \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer $token" \
+                -H "anthropic-beta: oauth-2025-04-20" \
+                -H "User-Agent: claude-code/2.1.34" \
+                "https://api.anthropic.com/api/oauth/profile" 2>/dev/null)
+            if [ -n "$p_response" ] && echo "$p_response" | jq -e '.account' >/dev/null 2>&1; then
+                echo "$p_response" > "$profile_cache_file"
+            fi
+        fi
+        needs_profile_refresh=false
     fi
 fi
 
