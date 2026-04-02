@@ -1194,6 +1194,11 @@ notify_check
 # ── Format dispatch ───────────────────────────────────────
 FORMAT="${STATUSLINE_FORMAT:-${FORMAT:-default}}"
 
+# ── Set terminal tab title ────────────────────────────────
+TAB_TITLE="${DIR_NAME}"
+[ -n "$BRANCH" ] && [ "$BRANCH" != "main" ] && [ "$BRANCH" != "master" ] && TAB_TITLE="${DIR_NAME} (${SHORT_BRANCH})"
+printf '\033]0;%s\007' "$TAB_TITLE"
+
 case "$FORMAT" in
     sigil)     render_sigil ;;
     rprompt)   render_rprompt ;;
