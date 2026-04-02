@@ -311,9 +311,14 @@ if [ -n "$SESSION_ID" ]; then
     get_subagent_tokens "$SESSION_ID" "$CWD"
 
     CHALLENGE_TOKENS=0
+    TOTAL_INPUT=0
+    TOTAL_OUTPUT=0
     if [ -f "$HOME/.claude/stats-cache.json" ]; then
-        CHALLENGE_TOKENS=$(jq '[.modelUsage[] | .inputTokens + .outputTokens] | add // 0' "$HOME/.claude/stats-cache.json" 2>/dev/null)
-        [ -z "$CHALLENGE_TOKENS" ] && CHALLENGE_TOKENS=0
+        eval "$(jq -r '
+            "TOTAL_INPUT=" + ([.modelUsage[].inputTokens] | add // 0 | tostring),
+            "TOTAL_OUTPUT=" + ([.modelUsage[].outputTokens] | add // 0 | tostring)
+        ' "$HOME/.claude/stats-cache.json" 2>/dev/null)"
+        CHALLENGE_TOKENS=$((TOTAL_INPUT + TOTAL_OUTPUT))
     fi
 
     if [ "$CHALLENGE_TOKENS" -gt 0 ] 2>/dev/null; then
@@ -321,7 +326,23 @@ if [ -n "$SESSION_ID" ]; then
         GOAL_M="100"
         TOKEN_PCT=$(awk "BEGIN {printf \"%.0f\", $CHALLENGE_TOKENS / (${GOAL_M} * 10000)}")
         [ "$TOKEN_PCT" -gt 100 ] 2>/dev/null && TOKEN_PCT=100
-        TOKEN_BAR=$(build_bar "$TOKEN_PCT" 10)
+
+        # Split bar: cyan for input, magenta for output
+        BAR_WIDTH=10
+        INPUT_PCT=$(awk "BEGIN {printf \"%.0f\", $TOTAL_INPUT / (${GOAL_M} * 10000)}")
+        OUTPUT_PCT=$(awk "BEGIN {printf \"%.0f\", $TOTAL_OUTPUT / (${GOAL_M} * 10000)}")
+        INPUT_DOTS=$(( INPUT_PCT * BAR_WIDTH / 100 ))
+        OUTPUT_DOTS=$(( OUTPUT_PCT * BAR_WIDTH / 100 ))
+        # Clamp so they don't exceed bar width
+        [ $((INPUT_DOTS + OUTPUT_DOTS)) -gt "$BAR_WIDTH" ] && OUTPUT_DOTS=$((BAR_WIDTH - INPUT_DOTS))
+        EMPTY_DOTS=$((BAR_WIDTH - INPUT_DOTS - OUTPUT_DOTS))
+        [ "$EMPTY_DOTS" -lt 0 ] && EMPTY_DOTS=0
+
+        INPUT_STR="" OUTPUT_STR="" EMPTY_STR=""
+        for ((i=0; i<INPUT_DOTS; i++)); do INPUT_STR+="●"; done
+        for ((i=0; i<OUTPUT_DOTS; i++)); do OUTPUT_STR+="●"; done
+        for ((i=0; i<EMPTY_DOTS; i++)); do EMPTY_STR+="○"; done
+        TOKEN_BAR="${cyan}${INPUT_STR}${magenta}${OUTPUT_STR}${dim}${EMPTY_STR}${reset}"
 
         # Daily token tracking
         DAILY_TOKEN_LEDGER="$HOME/.claude/daily-tokens.json"
