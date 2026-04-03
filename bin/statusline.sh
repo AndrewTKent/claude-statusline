@@ -721,7 +721,7 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
     five_hour_bar=$(build_bar "$five_hour_pct" "$bar_width")
     five_hour_pct_color=$(color_for_pct "$five_hour_pct")
 
-    rate_lines+="${white}$(printf "%-7s" "current")${reset} ${five_hour_bar} ${five_hour_pct_color}$(printf "%5.1f" "$five_hour_pct_display")%%${reset}"
+    rate_lines+="${white}$(printf "%-7s" "current")${reset} ${five_hour_bar} ${five_hour_pct_color}$(printf "%5.1f" "$five_hour_pct_display")%${reset}"
     [ -n "$five_hour_reset" ] && rate_lines+=" ${white}${five_hour_reset}${reset}"
 
     # ── Burn-down projection ──────────────────────────
@@ -782,7 +782,7 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
     seven_day_bar=$(build_bar "$seven_day_pct" "$bar_width")
     seven_day_pct_color=$(color_for_pct "$seven_day_pct")
 
-    rate_lines+="\n${white}$(printf "%-7s" "weekly")${reset} ${seven_day_bar} ${seven_day_pct_color}$(printf "%5.1f" "$seven_day_pct_display")%%${reset}"
+    rate_lines+="\n${white}$(printf "%-7s" "weekly")${reset} ${seven_day_bar} ${seven_day_pct_color}$(printf "%5.1f" "$seven_day_pct_display")%${reset}"
     [ -n "$seven_day_reset" ] && rate_lines+=" ${white}${seven_day_reset}${reset}"
 
     # ── Weekly burn-down projection ──────────────────
@@ -860,7 +860,7 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
         extra_bar=$(build_bar "$extra_pct" "$bar_width")
         extra_pct_color=$(color_for_pct "$extra_pct")
 
-        rate_lines+="\n${white}$(printf "%-7s" "extra")${reset} ${extra_bar} ${extra_pct_color}$(printf "%5.1f" "$extra_pct_display")%%${reset} ${white}\$${extra_used}${dim}/${reset}${white}\$${extra_limit}${reset}"
+        rate_lines+="\n${white}$(printf "%-7s" "extra")${reset} ${extra_bar} ${extra_pct_color}$(printf "%5.1f" "$extra_pct_display")%${reset} ${white}\$${extra_used}${dim}/${reset}${white}\$${extra_limit}${reset}"
     fi
 fi
 
