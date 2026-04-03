@@ -14,13 +14,13 @@
 ---
 
 ```
-  Opus 4.6 │ work │ voice-agent (EDGE-420*↑1)[PR✓] │ $2.14 ($8.90/d) @$5.30/h │ ⏱ 24:12 ctx:72%
+  Opus 4.6 │ work │ my-project (feature-123*↑1)[PR✓] │ $2.14 ($8.90/d) @$5.30/h │ ⏱ 24:12 ctx:72%
   context ●●●●●●●○○○  72%
   current ●●●●○○○○○○  42% 3:45pm →full ~52m
   weekly  ●●●●●●●○○○  71% apr 4, 10:00am
   extra   ●●●○○○○○○○  32% $63.53/$200.00
   budget  ●●●●○○○○○○  45% $4.50/$10
-  tokens  ●●●○○○○○○○  34% 34.1M/100M +120k (+890k/d)
+  tokens  ●●●●●●○○○○  60% (11.8+48.7M)/100M +120k +45k sub (+890k/d)
 ```
 
 Everything you need to not get rate-limited, blow your budget, or lose context mid-task. One bash script, zero dependencies beyond `jq`.
@@ -57,14 +57,14 @@ Restart Claude Code. Done.
 ### Line 1 — The headline
 
 ```
-Opus 4.6 │ work │ voice-agent (EDGE-420*↑1)[PR✓] │ $2.14 ($8.90/d) @$5.30/h │ ⏱ 24:12 ctx:72%
+Opus 4.6 │ work │ my-project (feature-123*↑1)[PR✓] │ $2.14 ($8.90/d) @$5.30/h │ ⏱ 24:12 ctx:72%
 ```
 
 | Segment | What it means |
 |---------|---------------|
 | `Opus 4.6` | Model + effort level (`.high`, `.low`, etc.) |
-| `work` | Account label — auto-detected from OAuth, configurable |
-| `EDGE-420*↑1` | Git branch, `*` = dirty, `↑1` = 1 commit ahead |
+| `work` | Account label — auto-detected from OAuth email, configurable |
+| `feature-123*↑1` | Git branch, `*` = dirty, `↑1` = 1 commit ahead |
 | `[PR✓]` | PR status: `[PR✓]` approved, `[PR✗]` checks failing, `[draft]`, `[PR△]` changes requested, `[PR⋯]` pending |
 | `$2.14` | Session cost |
 | `($8.90/d)` | Daily aggregate across all sessions |
@@ -82,7 +82,32 @@ Opus 4.6 │ work │ voice-agent (EDGE-420*↑1)[PR✓] │ $2.14 ($8.90/d) @$5
 | `weekly` | 7-day rate limit + reset date | The slow squeeze |
 | `extra` | Extra credits spent / limit | Your overflow budget |
 | `budget` | Daily spend vs your cap | Only shows if `DAILY_BUDGET` is set |
-| `tokens` | Cumulative tokens + session/daily deltas | Track your burn across sessions |
+| `tokens` | Cumulative tokens with input/output split + subagent tracking | See below |
+
+### Token tracking
+
+The token bar shows your all-time token usage from `stats-cache.json`, split by color:
+
+```
+tokens  ●●●●●●○○○○  60% (11.8+48.7M)/100M +120k +45k sub (+890k/d)
+        ╰cyan╯╰magenta╯     ╰cyan╯╰magenta╯
+```
+
+- **Cyan dots / number** — input tokens (your prompts)
+- **Magenta dots / number** — output tokens (Claude's responses)
+- `+120k` — tokens consumed this session
+- `+45k sub` — tokens consumed by subagents (Agent tool) in this session
+- `(+890k/d)` — daily aggregate across all sessions
+
+Subagent tokens are tracked by scanning `~/.claude/projects/<project>/<session>/subagents/*.jsonl` with a 30-second cache.
+
+### Account tagging
+
+All cost and token ledgers are tagged with your account label (e.g., `work` or `personal`), derived from your OAuth email. This lets you aggregate spend by account after the fact.
+
+### Terminal tab titles
+
+The script sets the terminal tab title (via ANSI escape) to `repo-name` on main/master, or `repo-name (branch)` on feature branches. Useful in Zed, iTerm2, and other terminals to tell sessions apart at a glance.
 
 ### Background — Notifications
 
@@ -108,7 +133,7 @@ The full cockpit. Adapts to terminal width (>=100 cols wide, <100 compact).
 ### `sigil` — Single dense line
 
 ```
-◈ Opus 4.6 · $2.14 ($8.90/d) · ●●●●●○○○○○ 55% · ⎇ EDGE-420✦↑1[PR✓] · 42%⏱24:12 · 71%w
+◈ Opus 4.6 · $2.14 ($8.90/d) · ●●●●●○○○○○ 55% · ⎇ feature-123✦↑1[PR✓] · 42%⏱24:12 · 71%w
 ```
 
 Everything on one line. Width-adaptive — drops segments as the terminal narrows. Good for tmux status bars or small terminals.
@@ -211,11 +236,14 @@ Run on a 30s launchd timer for auto-refresh. See [`macos/claude-widget/README.md
 Claude Code pipes a JSON status blob into the script via stdin on every tool call. The script:
 
 1. **Parses** model, cost, context, tokens, session metadata (single `jq` call)
-2. **Updates** daily cost/token ledgers in `~/.claude/`
-3. **Fetches** rate limits from Anthropic's OAuth API — background, non-blocking
-4. **Detects** account switches (credential file mtime change → cache invalidation)
-5. **Checks** notification thresholds (fires once per crossing, deduped)
-6. **Renders** in your chosen format
+2. **Resolves** account label from OAuth profile cache (tagged on all ledger entries)
+3. **Updates** daily cost/token ledgers in `~/.claude/`
+4. **Scans** subagent JSONL files for the current session (cached 30s)
+5. **Fetches** rate limits from Anthropic's OAuth API — background, non-blocking
+6. **Detects** account switches (credential file mtime change → cache invalidation)
+7. **Sets** terminal tab title to repo + branch
+8. **Checks** notification thresholds (fires once per crossing, deduped)
+9. **Renders** in your chosen format
 
 ### Architecture
 
@@ -224,11 +252,15 @@ Claude Code                    statusline.sh
     │                              │
     ├─ stdin JSON ────────────────►│ parse (jq)
     │                              │
-    │                              ├─► update daily-cost.json
-    │                              ├─► update token-challenge.json
+    │                              ├─► resolve account label (profile cache)
+    │                              ├─► update daily-cost.json    (tagged w/ account)
+    │                              ├─► update daily-tokens.json  (tagged w/ account)
+    │                              ├─► scan subagent JSONL files (cached 30s)
+    │                              ├─► read stats-cache.json     (token challenge total)
     │                              ├─► background: fetch /api/oauth/usage (cached 60s)
     │                              ├─► background: fetch /api/oauth/profile (cached 5min)
     │                              ├─► check notification thresholds
+    │                              ├─► set terminal tab title (\033]0;repo (branch)\007)
     │                              │
     │  stdout ANSI ◄──────────────├─► render (default|sigil|sparkline|rprompt|iterm2)
     │                              │
@@ -245,6 +277,8 @@ Claude Code                    statusline.sh
 | PR status | `gh pr view` cached 90s, background-refreshed |
 | Ledger writes | Atomic (mktemp + mv) |
 | Account switch | Credential mtime tracking, instant cache invalidation |
+| Subagent scan | File-based cache with 30s TTL, scoped to current session |
+| Token challenge | Single `jq` read from `stats-cache.json` (no JSONL scanning) |
 
 ### Files
 
@@ -252,13 +286,14 @@ Claude Code                    statusline.sh
 |------|---------|----------|
 | `~/.claude/statusline.sh` | The script (or symlink) | Permanent |
 | `~/.claude/statusline.conf` | Config | Permanent |
-| `~/.claude/daily-cost.json` | Daily cost ledger | Resets daily |
-| `~/.claude/token-challenge.json` | Cumulative token tracker | Persistent |
-| `~/.claude/daily-tokens.json` | Daily token tracker | Resets daily |
-| `~/.claude/session-history.jsonl` | Sparkline history | Rolling 100 entries |
+| `~/.claude/daily-cost.json` | Daily cost ledger (account-tagged) | Resets daily |
+| `~/.claude/daily-tokens.json` | Daily token tracker (account-tagged) | Resets daily |
+| `~/.claude/stats-cache.json` | Token challenge source (Claude Code managed) | Persistent |
+| `~/.claude/session-history.jsonl` | Sparkline history (w/ account + subagent fields) | Rolling 100 entries |
 | `~/.claude/rprompt.txt` | Zsh RPROMPT (rprompt format) | Updated each render |
 | `/tmp/claude/statusline-usage-cache.json` | Rate limit API cache | 60s TTL |
 | `/tmp/claude/statusline-profile-cache.json` | Profile API cache | 5min TTL |
+| `/tmp/claude/statusline-subagent-*.txt` | Subagent token cache per session | 30s TTL |
 | `/tmp/claude/statusline-raw.json` | Raw status for macOS apps | Updated each render |
 | `/tmp/claude/statusline-notif-state.json` | Notification dedup state | Per-threshold |
 | `/tmp/claude/statusline-refresh.lock` | Background refresh lock | Transient |
