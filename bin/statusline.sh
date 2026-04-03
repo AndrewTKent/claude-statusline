@@ -752,6 +752,23 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
                         [ "$mins_to_full" -le 30 ] && bd_color="$yellow"
                         [ "$mins_to_full" -le 15 ] && bd_color="$red"
                         rate_lines+=" ${bd_color}→full ~${mins_to_full}m${reset}"
+
+                        # Survive indicator: buffer or downtime until window resets
+                        mins_to_reset=$(( secs_to_reset / 60 ))
+                        if [ "$mins_to_reset" -gt 0 ] 2>/dev/null; then
+                            if [ "$mins_to_full" -gt "$mins_to_reset" ] 2>/dev/null; then
+                                buffer=$(( mins_to_full - mins_to_reset ))
+                                rate_lines+=" ${green}✓${buffer}m${reset}"
+                            else
+                                downtime=$(( mins_to_reset - mins_to_full ))
+                                if [ "$downtime" -ge 60 ] 2>/dev/null; then
+                                    dt_display=$(awk "BEGIN { printf \"%.1fh\", $downtime / 60 }")
+                                else
+                                    dt_display="${downtime}m"
+                                fi
+                                rate_lines+=" ${red}✗${dt_display}${reset}"
+                            fi
+                        fi
                     fi
                 fi
             fi
@@ -765,6 +782,72 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
 
     rate_lines+="\n${white}$(printf "%-7s" "weekly")${reset} ${seven_day_bar} ${seven_day_pct_color}$(printf "%3d" "$seven_day_pct")%${reset}"
     [ -n "$seven_day_reset" ] && rate_lines+=" ${white}${seven_day_reset}${reset}"
+
+    # ── Weekly burn-down projection ──────────────────
+    if [ "$seven_day_pct" -gt 2 ] 2>/dev/null && [ -n "$seven_day_reset_iso" ] && [ "$seven_day_reset_iso" != "" ]; then
+        weekly_reset_epoch=$(iso_to_epoch "$seven_day_reset_iso")
+        if [ -n "$weekly_reset_epoch" ]; then
+            now_wd=$(date +%s)
+            # 7-day window: 604800 seconds
+            weekly_secs_to_reset=$(( weekly_reset_epoch - now_wd ))
+            [ "$weekly_secs_to_reset" -lt 0 ] && weekly_secs_to_reset=0
+            weekly_secs_elapsed=$(( 604800 - weekly_secs_to_reset ))
+            [ "$weekly_secs_elapsed" -lt 60 ] && weekly_secs_elapsed=60
+
+            if [ "$weekly_secs_elapsed" -gt 0 ] && [ "$seven_day_pct" -gt 0 ] 2>/dev/null; then
+                weekly_remaining_pct=$(( 100 - seven_day_pct ))
+                if [ "$weekly_remaining_pct" -gt 0 ]; then
+                    # Hours to full
+                    hrs_to_full=$(awk "BEGIN {
+                        rate = $seven_day_pct / $weekly_secs_elapsed;
+                        if (rate > 0) printf \"%.1f\", $weekly_remaining_pct / rate / 3600;
+                        else print 999
+                    }")
+                    hrs_to_reset=$(awk "BEGIN { printf \"%.1f\", $weekly_secs_to_reset / 3600 }")
+
+                    # Display as days if > 48h, otherwise hours
+                    display_to_full=$(awk "BEGIN {
+                        h = $hrs_to_full;
+                        if (h >= 48) printf \"%.1fd\", h / 24;
+                        else printf \"%.0fh\", h
+                    }")
+
+                    # Only show if projection is within the window (< 7 days)
+                    if awk "BEGIN { exit ($hrs_to_full < 168) ? 0 : 1 }" 2>/dev/null; then
+                        wd_color="$green"
+                        awk "BEGIN { exit ($hrs_to_full <= 72) ? 0 : 1 }" 2>/dev/null && wd_color="$orange"
+                        awk "BEGIN { exit ($hrs_to_full <= 36) ? 0 : 1 }" 2>/dev/null && wd_color="$yellow"
+                        awk "BEGIN { exit ($hrs_to_full <= 12) ? 0 : 1 }" 2>/dev/null && wd_color="$red"
+                        rate_lines+=" ${wd_color}→full ~${display_to_full}${reset}"
+
+                        # Survive indicator: buffer or downtime
+                        weekly_gap=$(awk "BEGIN { printf \"%.1f\", $hrs_to_full - $hrs_to_reset }")
+                        if awk "BEGIN { exit ($hrs_to_full > $hrs_to_reset) ? 0 : 1 }" 2>/dev/null; then
+                            # Buffer — format as days if >= 48h
+                            weekly_buf_display=$(awk "BEGIN {
+                                h = $weekly_gap;
+                                if (h < 0) h = -h;
+                                if (h >= 48) printf \"%.1fd\", h / 24;
+                                else if (h >= 1) printf \"%.0fh\", h;
+                                else printf \"%.0fm\", h * 60
+                            }")
+                            rate_lines+=" ${green}✓${weekly_buf_display}${reset}"
+                        else
+                            # Downtime
+                            weekly_dt_display=$(awk "BEGIN {
+                                h = $weekly_gap;
+                                if (h < 0) h = -h;
+                                if (h >= 48) printf \"%.1fd\", h / 24;
+                                else if (h >= 1) printf \"%.0fh\", h;
+                                else printf \"%.0fm\", h * 60
+                            }")
+                            rate_lines+=" ${red}✗${weekly_dt_display}${reset}"
+                        fi
+                    fi
+                fi
+            fi
+        fi
+    fi
 
     # Extra usage credits
     if [ "$extra_enabled" = "true" ]; then
