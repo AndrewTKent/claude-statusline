@@ -665,7 +665,8 @@ if $needs_refresh || $needs_profile_refresh; then
                             prev_ts=$(stat -f %m "$cache_file" 2>/dev/null || stat -c %Y "$cache_file" 2>/dev/null)
                             prev_5h=$(jq -r '.five_hour.utilization // 0' "$cache_file" 2>/dev/null)
                             prev_7d=$(jq -r '.seven_day.utilization // 0' "$cache_file" 2>/dev/null)
-                            printf '{"ts":%s,"five_hour":%s,"seven_day":%s}' "$prev_ts" "$prev_5h" "$prev_7d" > "/tmp/claude/statusline-usage-prev.json"
+                            prev_extra=$(jq -r '.extra_usage.used_credits // 0' "$cache_file" 2>/dev/null)
+                            printf '{"ts":%s,"five_hour":%s,"seven_day":%s,"extra_used":%s}' "$prev_ts" "$prev_5h" "$prev_7d" "$prev_extra" > "/tmp/claude/statusline-usage-prev.json"
                         fi
                         echo "$response" > "$cache_file"
                     fi
@@ -900,6 +901,39 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
         extra_pct_color=$(color_for_pct "$extra_pct")
 
         rate_lines+="\n${white}$(printf "%-7s" "extra")${reset} ${extra_bar} ${extra_pct_color}$(printf "%5.1f" "$extra_pct_display")%${reset} ${white}\$${extra_used}${dim}/${reset}${white}\$${extra_limit}${reset}"
+
+        # Project extra $ spend until current window resets (only when at 100% current)
+        if [ "$five_hour_pct" -ge 100 ] 2>/dev/null && [ -f "$prev_poll_file" ] && [ -n "$five_hour_reset_iso" ]; then
+            proj_reset_epoch=$(iso_to_epoch "$five_hour_reset_iso")
+            if [ -n "$proj_reset_epoch" ]; then
+                proj_now=$(date +%s)
+                proj_secs_to_reset=$(( proj_reset_epoch - proj_now ))
+                [ "$proj_secs_to_reset" -lt 0 ] && proj_secs_to_reset=0
+
+                proj_poll_ts=$(stat -f %m "$cache_file" 2>/dev/null || stat -c %Y "$cache_file" 2>/dev/null)
+                proj_prev_ts=$(jq -r '.ts // 0' "$prev_poll_file" 2>/dev/null)
+                proj_prev_extra=$(jq -r '.extra_used // 0' "$prev_poll_file" 2>/dev/null)
+                proj_poll_interval=$(( proj_poll_ts - proj_prev_ts ))
+
+                if [ "$proj_poll_interval" -gt 10 ] 2>/dev/null; then
+                    # extra_used_raw is in cents, proj_prev_extra is in cents
+                    proj_extra_spend=$(awk "BEGIN {
+                        delta = $extra_used_raw - $proj_prev_extra;
+                        if (delta <= 0) { print \"\"; exit }
+                        rate_per_sec = delta / $proj_poll_interval;
+                        secs_since = $proj_now - $proj_poll_ts;
+                        spent_since = rate_per_sec * secs_since;
+                        remaining_secs = $proj_secs_to_reset;
+                        projected = (rate_per_sec * remaining_secs) / 100;
+                        if (projected < 0.01) { print \"\"; exit }
+                        printf \"~\$%.0f\", projected
+                    }")
+                    if [ -n "$proj_extra_spend" ]; then
+                        rate_lines+=" ${orange}${proj_extra_spend} until reset${reset}"
+                    fi
+                fi
+            fi
+        fi
     fi
 fi
 
