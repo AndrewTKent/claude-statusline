@@ -765,6 +765,23 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
     rate_lines+="${white}$(printf "%-7s" "current")${reset} ${five_hour_bar} ${five_hour_pct_color}$(printf "%5.1f" "$five_hour_pct_display")%${reset}"
     [ -n "$five_hour_reset" ] && rate_lines+=" ${white}${five_hour_reset}${reset}"
 
+    # When at 100%, show countdown to reset
+    if [ "$five_hour_pct" -ge 100 ] 2>/dev/null && [ -n "$five_hour_reset_iso" ]; then
+        countdown_epoch=$(iso_to_epoch "$five_hour_reset_iso")
+        if [ -n "$countdown_epoch" ]; then
+            countdown_now=$(date +%s)
+            countdown_secs=$(( countdown_epoch - countdown_now ))
+            [ "$countdown_secs" -lt 0 ] && countdown_secs=0
+            countdown_mins=$(( countdown_secs / 60 ))
+            if [ "$countdown_mins" -ge 60 ] 2>/dev/null; then
+                countdown_display=$(awk "BEGIN { printf \"%.1fh\", $countdown_mins / 60 }")
+            else
+                countdown_display="${countdown_mins}m"
+            fi
+            rate_lines+=" ${red}resets ${countdown_display}${reset}"
+        fi
+    fi
+
     # ── Burn-down projection ──────────────────────────
     # Estimate minutes until 100% based on utilization velocity
     if [ "$five_hour_pct" -gt 5 ] 2>/dev/null && [ -n "$five_hour_reset_iso" ] && [ "$five_hour_reset_iso" != "" ]; then
