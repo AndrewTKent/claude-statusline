@@ -660,6 +660,13 @@ if $needs_refresh || $needs_profile_refresh; then
                         -H "User-Agent: claude-code/2.1.34" \
                         "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
                     if [ -n "$response" ] && echo "$response" | jq -e '.five_hour' >/dev/null 2>&1; then
+                        # Save previous poll for interpolation
+                        if [ -f "$cache_file" ]; then
+                            prev_ts=$(stat -f %m "$cache_file" 2>/dev/null || stat -c %Y "$cache_file" 2>/dev/null)
+                            prev_5h=$(jq -r '.five_hour.utilization // 0' "$cache_file" 2>/dev/null)
+                            prev_7d=$(jq -r '.seven_day.utilization // 0' "$cache_file" 2>/dev/null)
+                            printf '{"ts":%s,"five_hour":%s,"seven_day":%s}' "$prev_ts" "$prev_5h" "$prev_7d" > "/tmp/claude/statusline-usage-prev.json"
+                        fi
                         echo "$response" > "$cache_file"
                     fi
                 fi
@@ -715,7 +722,40 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
         "extra_limit_raw=" + (.extra_usage.monthly_limit // 0 | tostring | @sh)
     ' 2>/dev/null)"
 
-    five_hour_pct_display=$(printf "%.1f" "$five_hour_pct" 2>/dev/null || echo "0.0")
+    # Interpolate between polls for fractional precision
+    prev_poll_file="/tmp/claude/statusline-usage-prev.json"
+    if [ -f "$prev_poll_file" ] && [ -f "$cache_file" ]; then
+        poll_ts=$(stat -f %m "$cache_file" 2>/dev/null || stat -c %Y "$cache_file" 2>/dev/null)
+        prev_ts=$(jq -r '.ts // 0' "$prev_poll_file" 2>/dev/null)
+        prev_5h=$(jq -r '.five_hour // 0' "$prev_poll_file" 2>/dev/null)
+        prev_7d=$(jq -r '.seven_day // 0' "$prev_poll_file" 2>/dev/null)
+        interp_now=$(date +%s)
+        poll_interval=$(( poll_ts - prev_ts ))
+        secs_since_poll=$(( interp_now - poll_ts ))
+
+        if [ "$poll_interval" -gt 10 ] 2>/dev/null && [ "$secs_since_poll" -ge 0 ] 2>/dev/null; then
+            five_hour_pct_display=$(awk "BEGIN {
+                rate = ($five_hour_pct - $prev_5h) / $poll_interval;
+                if (rate < 0) rate = 0;
+                est = $five_hour_pct + rate * $secs_since_poll;
+                if (est > 100) est = 100;
+                printf \"%.1f\", est
+            }")
+            seven_day_pct_display=$(awk "BEGIN {
+                rate = ($seven_day_pct_raw - $prev_7d) / $poll_interval;
+                if (rate < 0) rate = 0;
+                est = $seven_day_pct_raw + rate * $secs_since_poll;
+                if (est > 100) est = 100;
+                printf \"%.1f\", est
+            }")
+        else
+            five_hour_pct_display=$(printf "%.1f" "$five_hour_pct" 2>/dev/null || echo "0.0")
+            seven_day_pct_display=$(printf "%.1f" "$seven_day_pct_raw" 2>/dev/null || echo "0.0")
+        fi
+    else
+        five_hour_pct_display=$(printf "%.1f" "$five_hour_pct" 2>/dev/null || echo "0.0")
+        seven_day_pct_display=$(printf "%.1f" "$seven_day_pct_raw" 2>/dev/null || echo "0.0")
+    fi
     five_hour_pct=$(printf "%.0f" "$five_hour_pct" 2>/dev/null || echo 0)
     five_hour_reset=$(format_reset_time "$five_hour_reset_iso" "time")
     five_hour_bar=$(build_bar "$five_hour_pct" "$bar_width")
@@ -776,7 +816,6 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
         fi
     fi
 
-    seven_day_pct_display=$(printf "%.1f" "$seven_day_pct_raw" 2>/dev/null || echo "0.0")
     seven_day_pct=$(printf "%.0f" "$seven_day_pct_raw" 2>/dev/null || echo 0)
     seven_day_reset=$(format_reset_time "$seven_day_reset_iso" "datetime")
     seven_day_bar=$(build_bar "$seven_day_pct" "$bar_width")
