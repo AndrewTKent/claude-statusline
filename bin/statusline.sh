@@ -784,7 +784,7 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
 
     # ── Burn-down projection ──────────────────────────
     # Estimate minutes until 100% based on utilization velocity
-    if [ "$five_hour_pct" -gt 5 ] 2>/dev/null && [ -n "$five_hour_reset_iso" ] && [ "$five_hour_reset_iso" != "" ]; then
+    if [ "$five_hour_pct" -gt 0 ] 2>/dev/null && [ -n "$five_hour_reset_iso" ] && [ "$five_hour_reset_iso" != "" ]; then
         reset_epoch=$(iso_to_epoch "$five_hour_reset_iso")
         if [ -n "$reset_epoch" ]; then
             now_bd=$(date +%s)
@@ -805,19 +805,30 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
                         if (rate > 0) printf \"%.0f\", $remaining_pct / rate / 60;
                         else print 999
                     }")
-                    if [ "$mins_to_full" -le 120 ] 2>/dev/null && [ "$mins_to_full" -gt 0 ] 2>/dev/null; then
+                    if [ "$mins_to_full" -gt 0 ] 2>/dev/null && [ "$mins_to_full" -lt 6000 ] 2>/dev/null; then
                         bd_color="$green"
                         [ "$mins_to_full" -le 60 ] && bd_color="$orange"
                         [ "$mins_to_full" -le 30 ] && bd_color="$yellow"
                         [ "$mins_to_full" -le 15 ] && bd_color="$red"
-                        rate_lines+=" ${bd_color}→full ~${mins_to_full}m${reset}"
+
+                        if [ "$mins_to_full" -ge 60 ] 2>/dev/null; then
+                            full_display=$(awk "BEGIN { printf \"%.1fh\", $mins_to_full / 60 }")
+                        else
+                            full_display="${mins_to_full}m"
+                        fi
+                        rate_lines+=" ${bd_color}→full ~${full_display}${reset}"
 
                         # Survive indicator: buffer or downtime until window resets
                         mins_to_reset=$(( secs_to_reset / 60 ))
                         if [ "$mins_to_reset" -gt 0 ] 2>/dev/null; then
                             if [ "$mins_to_full" -gt "$mins_to_reset" ] 2>/dev/null; then
                                 buffer=$(( mins_to_full - mins_to_reset ))
-                                rate_lines+=" ${green}✓${buffer}m${reset}"
+                                if [ "$buffer" -ge 60 ] 2>/dev/null; then
+                                    buf_display=$(awk "BEGIN { printf \"%.1fh\", $buffer / 60 }")
+                                else
+                                    buf_display="${buffer}m"
+                                fi
+                                rate_lines+=" ${green}✓${buf_display}${reset}"
                             else
                                 downtime=$(( mins_to_reset - mins_to_full ))
                                 if [ "$downtime" -ge 60 ] 2>/dev/null; then
