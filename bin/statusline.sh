@@ -105,12 +105,8 @@ resolve_account_label() {
         done
     fi
 
-    # Hardcoded fallbacks
-    case "$email" in
-        *@coram.ai)                echo "work" ;;
-        andrewkent10@gmail.com)    echo "personal" ;;
-        ?*)                        echo "$email" ;;
-    esac
+    # No config match — use email as label
+    echo "$email"
 }
 
 # ── Reusable ledger function ─────────────────────────────
