@@ -16,9 +16,9 @@
 ```
   Opus 4.6 │ work │ my-project (feature-123*↑1)[PR✓] │ $2.14 ($8.90/d) @$5.30/h │ ⏱ 24:12 ctx:72%
   context ●●●●●●●○○○  72%
-  current ●●●●○○○○○○  42% 3:45pm →full ~52m
-  weekly  ●●●●●●●○○○  71% apr 4, 10:00am
-  extra   ●●●○○○○○○○  32% $63.53/$200.00
+  current ●●●●○○○○○○  42.3% 3:45pm →full ~52m ✓18m
+  weekly  ●●●●●●●○○○  71.4% apr 4, 10:00am →full ~2.1d ✗8h
+  extra   ●●●○○○○○○○  32.0% $63.53/$200.00
   budget  ●●●●○○○○○○  45% $4.50/$10
   tokens  ●●●●●●○○○○  60% (11.8+48.7M)/100M +120k +45k sub (+890k/d)
 ```
@@ -79,8 +79,11 @@ Opus 4.6 │ work │ my-project (feature-123*↑1)[PR✓] │ $2.14 ($8.90/d) @
 | `context` | Context window fill | At 95% your session is about to die |
 | `current` | 5-hour rate limit + reset time | The one that actually blocks you |
 | `→full ~52m` | Burn-down projection | Minutes until you hit the wall at current pace |
+| `✓18m` / `✗1.7h` | Survive indicator | Buffer until reset (✓) or downtime before reset (✗) |
 | `weekly` | 7-day rate limit + reset date | The slow squeeze |
+| `→full ~2.1d` | Weekly burn-down projection | Days/hours until weekly limit at current pace |
 | `extra` | Extra credits spent / limit | Your overflow budget |
+| `~$18 until reset` | Projected extra spend | Estimated extra credit burn until current window resets (only at 100%) |
 | `budget` | Daily spend vs your cap | Only shows if `DAILY_BUDGET` is set |
 | `tokens` | Cumulative tokens with input/output split + subagent tracking | See below |
 
@@ -240,10 +243,12 @@ Claude Code pipes a JSON status blob into the script via stdin on every tool cal
 3. **Updates** daily cost/token ledgers in `~/.claude/`
 4. **Scans** subagent JSONL files for the current session (cached 30s)
 5. **Fetches** rate limits from Anthropic's OAuth API — background, non-blocking
-6. **Detects** account switches (credential file mtime change → cache invalidation)
-7. **Sets** terminal tab title to repo + branch
-8. **Checks** notification thresholds (fires once per crossing, deduped)
-9. **Renders** in your chosen format
+6. **Interpolates** usage between polls — tracks velocity across consecutive API responses for smooth fractional percentages
+7. **Projects** burn-down, survive indicators, and extra credit spend from interpolated rates
+8. **Detects** account switches (credential file mtime change → cache invalidation)
+9. **Sets** terminal tab title to repo + branch
+10. **Checks** notification thresholds (fires once per crossing, deduped)
+11. **Renders** in your chosen format
 
 ### Architecture
 
@@ -271,7 +276,7 @@ Claude Code                    statusline.sh
 
 | Concern | How it's handled |
 |---------|-----------------|
-| Network latency | Background subshell, never blocks render |
+| Network latency | Background subshell, never blocks render (5min poll interval) |
 | Concurrent sessions | Lock file with stale-PID detection (auto-cleanup at 30s) |
 | Git dirty check | `git diff-index --quiet HEAD` (faster than `git status`) |
 | PR status | `gh pr view` cached 90s, background-refreshed |
@@ -291,7 +296,8 @@ Claude Code                    statusline.sh
 | `~/.claude/stats-cache.json` | Token challenge source (Claude Code managed) | Persistent |
 | `~/.claude/session-history.jsonl` | Sparkline history (w/ account + subagent fields) | Rolling 100 entries |
 | `~/.claude/rprompt.txt` | Zsh RPROMPT (rprompt format) | Updated each render |
-| `/tmp/claude/statusline-usage-cache.json` | Rate limit API cache | 60s TTL |
+| `/tmp/claude/statusline-usage-cache.json` | Rate limit API cache | 5min TTL |
+| `/tmp/claude/statusline-usage-prev.json` | Previous poll for interpolation | Updated each poll |
 | `/tmp/claude/statusline-profile-cache.json` | Profile API cache | 5min TTL |
 | `/tmp/claude/statusline-subagent-*.txt` | Subagent token cache per session | 30s TTL |
 | `/tmp/claude/statusline-raw.json` | Raw status for macOS apps | Updated each render |
