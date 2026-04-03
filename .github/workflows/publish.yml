@@ -1,0 +1,53 @@
+name: Publish to npm
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'bin/statusline.sh'
+      - 'npm/**'
+      - 'config/**'
+      - 'install.sh'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Bump patch version
+        working-directory: npm
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          npm version patch --no-git-tag-version
+          VERSION=$(jq -r .version package.json)
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Build package assets
+        working-directory: npm
+        run: |
+          mkdir -p assets
+          cp ../bin/statusline.sh assets/
+          cp ../config/statusline.conf.example assets/
+
+      - name: Publish to npm
+        working-directory: npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Commit version bump
+        run: |
+          git add npm/package.json
+          git commit -m "chore: bump npm to v${VERSION} [skip ci]"
+          git push
