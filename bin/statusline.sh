@@ -326,12 +326,13 @@ PROJECTS = Path.home() / '.claude' / 'projects'
 STATS = Path.home() / '.claude' / 'stats-cache.json'
 with open(STATS) as f: stats = json.load(f)
 
-# Scan all session + subagent files for token usage
+# Scan all session + subagent files with GLOBAL requestId dedup
+# (same requestId can appear in parent + subagent files — only count once)
 daily = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+global_seen = {}
 for root, _, files in os.walk(PROJECTS):
     for fname in files:
         if not fname.endswith('.jsonl'): continue
-        seen = {}
         try:
             with open(os.path.join(root, fname)) as f:
                 for line in f:
@@ -340,14 +341,14 @@ for root, _, files in os.walk(PROJECTS):
                         obj = json.loads(line)
                         ts, msg = obj.get('timestamp',''), obj.get('message',{})
                         usage, rid = msg.get('usage',{}), obj.get('requestId', msg.get('id',''))
-                        if ts and usage and rid: seen[rid] = (ts, msg.get('model','unknown'), usage)
+                        if ts and usage and rid: global_seen[rid] = (ts, msg.get('model','unknown'), usage)
                     except: pass
-            for rid, (ts, model, usage) in seen.items():
-                try: date = datetime.fromisoformat(ts.replace('Z','+00:00')).strftime('%Y-%m-%d')
-                except: continue
-                for f in ('input_tokens','output_tokens','cache_read_input_tokens','cache_creation_input_tokens'):
-                    daily[date][model][f] += usage.get(f,0)
         except: pass
+for rid, (ts, model, usage) in global_seen.items():
+    try: date = datetime.fromisoformat(ts.replace('Z','+00:00')).strftime('%Y-%m-%d')
+    except: continue
+    for f in ('input_tokens','output_tokens','cache_read_input_tokens','cache_creation_input_tokens'):
+        daily[date][model][f] += usage.get(f,0)
 
 # Rebuild stats from scratch (full scan)
 model_usage = defaultdict(lambda: {'inputTokens':0,'outputTokens':0,'cacheReadInputTokens':0,'cacheCreationInputTokens':0})
