@@ -455,15 +455,36 @@ fi
 GIT_INFO=""
 IS_DIRTY=false
 BRANCH=""
+IN_WORKTREE=false
+WORKTREE_NAME=""
 if [ -d "$CWD" ] && git -C "$CWD" rev-parse --git-dir > /dev/null 2>&1; then
     BRANCH=$(git -C "$CWD" branch --show-current 2>/dev/null)
+    # Detect worktree: git-common-dir differs from git-dir when in a worktree
+    GIT_DIR=$(git -C "$CWD" rev-parse --git-dir 2>/dev/null)
+    GIT_COMMON=$(git -C "$CWD" rev-parse --git-common-dir 2>/dev/null)
+    if [ -n "$GIT_DIR" ] && [ -n "$GIT_COMMON" ]; then
+        # Normalize paths for comparison
+        GIT_DIR_REAL=$(cd "$CWD" && cd "$GIT_DIR" 2>/dev/null && pwd)
+        GIT_COMMON_REAL=$(cd "$CWD" && cd "$GIT_COMMON" 2>/dev/null && pwd)
+        if [ "$GIT_DIR_REAL" != "$GIT_COMMON_REAL" ]; then
+            IN_WORKTREE=true
+            WORKTREE_NAME="${CWD##*/}"
+        fi
+    fi
     if [ -n "$BRANCH" ]; then
         # Use git diff-index for fast dirty check (single call, no untracked scan)
         if ! git -C "$CWD" diff-index --quiet HEAD -- 2>/dev/null; then
             IS_DIRTY=true
         fi
 
-        if $IS_DIRTY; then
+        if $IN_WORKTREE; then
+            local_wt="${magenta}⌥${WORKTREE_NAME}${reset} "
+            if $IS_DIRTY; then
+                GIT_INFO=" ${local_wt}${orange}(${BRANCH}${red}*${orange})${reset}"
+            else
+                GIT_INFO=" ${local_wt}${green}(${BRANCH})${reset}"
+            fi
+        elif $IS_DIRTY; then
             GIT_INFO=" ${orange}(${BRANCH}${red}*${orange})${reset}"
         else
             GIT_INFO=" ${green}(${BRANCH})${reset}"
