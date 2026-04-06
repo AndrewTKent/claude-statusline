@@ -306,14 +306,81 @@ if [ -n "$SESSION_ID" ]; then
     SESSION_TOKENS=$((INPUT_TOKENS + OUTPUT_TOKENS))
     get_subagent_tokens "$SESSION_ID" "$CWD"
 
+    # Auto-recover stale stats-cache (>6 hours old)
+    STATS_FILE="$HOME/.claude/stats-cache.json"
+    STATS_RECOVERY_LOCK="/tmp/claude/stats-recovery.lock"
+    if [ -f "$STATS_FILE" ]; then
+        stats_mtime=$(stat -f %m "$STATS_FILE" 2>/dev/null || stat -c %Y "$STATS_FILE" 2>/dev/null || echo "$now")
+        stats_age=$(( now - stats_mtime ))
+        if [ "$stats_age" -gt 21600 ] && [ ! -f "$STATS_RECOVERY_LOCK" ]; then
+            # Background recovery: scan recent session files and update stats-cache
+            (
+                echo $$ > "$STATS_RECOVERY_LOCK"
+                python3 -c "
+import json, os
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+
+PROJECTS = Path.home() / '.claude' / 'projects'
+STATS = Path.home() / '.claude' / 'stats-cache.json'
+with open(STATS) as f: stats = json.load(f)
+
+# Scan all session + subagent files for token usage
+daily = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+for root, _, files in os.walk(PROJECTS):
+    for fname in files:
+        if not fname.endswith('.jsonl'): continue
+        seen = {}
+        try:
+            with open(os.path.join(root, fname)) as f:
+                for line in f:
+                    if '\"usage\"' not in line: continue
+                    try:
+                        obj = json.loads(line)
+                        ts, msg = obj.get('timestamp',''), obj.get('message',{})
+                        usage, rid = msg.get('usage',{}), obj.get('requestId', msg.get('id',''))
+                        if ts and usage and rid: seen[rid] = (ts, msg.get('model','unknown'), usage)
+                    except: pass
+            for rid, (ts, model, usage) in seen.items():
+                try: date = datetime.fromisoformat(ts.replace('Z','+00:00')).strftime('%Y-%m-%d')
+                except: continue
+                for f in ('input_tokens','output_tokens','cache_read_input_tokens','cache_creation_input_tokens'):
+                    daily[date][model][f] += usage.get(f,0)
+        except: pass
+
+# Rebuild stats from scratch (full scan)
+model_usage = defaultdict(lambda: {'inputTokens':0,'outputTokens':0,'cacheReadInputTokens':0,'cacheCreationInputTokens':0})
+dmt = []
+for date in sorted(daily):
+    tbm = {}
+    for model, usage in daily[date].items():
+        tbm[model] = usage.get('input_tokens',0) + usage.get('output_tokens',0)
+        mu = model_usage[model]
+        mu['inputTokens'] += usage.get('input_tokens',0)
+        mu['outputTokens'] += usage.get('output_tokens',0)
+        mu['cacheReadInputTokens'] += usage.get('cache_read_input_tokens',0)
+        mu['cacheCreationInputTokens'] += usage.get('cache_creation_input_tokens',0)
+    dmt.append({'date':date,'tokensByModel':tbm})
+
+stats['dailyModelTokens'] = dmt
+stats['modelUsage'] = {k:dict(v) for k,v in model_usage.items()}
+import shutil; shutil.copy2(STATS, f'{STATS}.bak')
+with open(STATS,'w') as f: json.dump(stats, f, indent=2)
+" 2>/dev/null
+                rm -f "$STATS_RECOVERY_LOCK"
+            ) &
+        fi
+    fi
+
     CHALLENGE_TOKENS=0
     TOTAL_INPUT=0
     TOTAL_OUTPUT=0
-    if [ -f "$HOME/.claude/stats-cache.json" ]; then
+    if [ -f "$STATS_FILE" ]; then
         eval "$(jq -r '
             "TOTAL_INPUT=" + ([.modelUsage[].inputTokens] | add // 0 | tostring),
             "TOTAL_OUTPUT=" + ([.modelUsage[].outputTokens] | add // 0 | tostring)
-        ' "$HOME/.claude/stats-cache.json" 2>/dev/null)"
+        ' "$STATS_FILE" 2>/dev/null)"
         CHALLENGE_TOKENS=$((TOTAL_INPUT + TOTAL_OUTPUT))
     fi
 
