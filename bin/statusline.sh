@@ -388,7 +388,6 @@ with open(STATS,'w') as f: json.dump(stats, f, indent=2)
         TOKEN_M=$(awk "BEGIN {printf \"%.1f\", $CHALLENGE_TOKENS / 1000000}")
         GOAL_M="100"
         TOKEN_PCT=$(awk "BEGIN {printf \"%.0f\", $CHALLENGE_TOKENS / (${GOAL_M} * 10000)}")
-        [ "$TOKEN_PCT" -gt 100 ] 2>/dev/null && TOKEN_PCT=100
 
         # Split bar: cyan for input, magenta for output
         BAR_WIDTH=10
