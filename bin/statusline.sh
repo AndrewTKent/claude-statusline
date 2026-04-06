@@ -612,31 +612,41 @@ needs_refresh=false
 needs_profile_refresh=false
 now=$(date +%s)
 
-# Detect account switch: if credentials file changed, invalidate caches
-creds_mtime_file="/tmp/claude/statusline-creds-mtime"
+# Detect account switch: compare token hash (works with keychain + file)
+token_hash_file="/tmp/claude/statusline-token-hash"
+current_token=$(get_oauth_token)
+if [ -n "$current_token" ] && [ "$current_token" != "null" ]; then
+    current_hash=$(printf '%s' "$current_token" | shasum -a 256 2>/dev/null | cut -c1-16)
+    old_hash=$(cat "$token_hash_file" 2>/dev/null)
+    if [ "$old_hash" != "$current_hash" ]; then
+        rm -f "$cache_file" "$profile_cache_file" "$lock_file"
+        echo "$current_hash" > "$token_hash_file"
+        needs_refresh=true
+        # Synchronous profile fetch on account switch — avoids stale label
+        p_response=$(curl -s --max-time 2 \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $current_token" \
+            -H "anthropic-beta: oauth-2025-04-20" \
+            -H "User-Agent: claude-code/2.1.34" \
+            "https://api.anthropic.com/api/oauth/profile" 2>/dev/null)
+        if [ -n "$p_response" ] && echo "$p_response" | jq -e '.account' >/dev/null 2>&1; then
+            echo "$p_response" > "$profile_cache_file"
+        fi
+        needs_profile_refresh=false
+    fi
+fi
+# Legacy fallback: also check credentials file mtime
 creds_file="$HOME/.claude/.credentials.json"
 if [ -f "$creds_file" ]; then
+    creds_mtime_file="/tmp/claude/statusline-creds-mtime"
     creds_mtime=$(stat -f %m "$creds_file" 2>/dev/null || stat -c %Y "$creds_file" 2>/dev/null)
     old_creds_mtime=$(cat "$creds_mtime_file" 2>/dev/null)
     if [ "$old_creds_mtime" != "$creds_mtime" ]; then
         rm -f "$cache_file" "$profile_cache_file" "$lock_file"
         echo "$creds_mtime" > "$creds_mtime_file"
         needs_refresh=true
-        # Synchronous profile fetch on account switch — avoids stale label
-        token=$(get_oauth_token)
-        if [ -n "$token" ] && [ "$token" != "null" ]; then
-            p_response=$(curl -s --max-time 2 \
-                -H "Accept: application/json" \
-                -H "Content-Type: application/json" \
-                -H "Authorization: Bearer $token" \
-                -H "anthropic-beta: oauth-2025-04-20" \
-                -H "User-Agent: claude-code/2.1.34" \
-                "https://api.anthropic.com/api/oauth/profile" 2>/dev/null)
-            if [ -n "$p_response" ] && echo "$p_response" | jq -e '.account' >/dev/null 2>&1; then
-                echo "$p_response" > "$profile_cache_file"
-            fi
-        fi
-        needs_profile_refresh=false
+        needs_profile_refresh=true
     fi
 fi
 
