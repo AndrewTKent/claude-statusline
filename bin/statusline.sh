@@ -504,6 +504,13 @@ case "$effort_val" in
     max)    EFFORT="${red}.max${reset}" ;;
 esac
 
+# ── Fast mode ──────────────────────────────────────────
+FAST_MODE=""
+settings_fast=$(jq -r '.fastMode // false' "$HOME/.claude/settings.json" 2>/dev/null)
+if [ "$settings_fast" = "true" ]; then
+    FAST_MODE=" ${yellow}⚡fast${reset}"
+fi
+
 # ── Focus mode ──────────────────────────────────────────
 FOCUS=""
 [ -f "$FOCUS_FILE" ] && FOCUS=" ${red}[FOCUS]${reset}"
@@ -1124,14 +1131,14 @@ fi
 # ── Render: default (multi-line) ──────────────────────────
 render_default() {
     if [ "$COLS" -ge 100 ]; then
-        line1="${blue}${MODEL}${reset}${EFFORT}"
+        line1="${blue}${MODEL}${reset}${EFFORT}${FAST_MODE}"
         [ -n "$ACCOUNT_LABEL" ] && line1+="${sep}${ACCOUNT_LABEL}"
         line1+="${sep}${cyan}${DIR_NAME}${reset}${SHORT_GIT_INFO}"
         line1+="${sep}${magenta}\$${COST_FMT}${reset}${DAILY_SUFFIX}${BURN_RATE}"
         [ -n "$SESSION_TIME" ] && line1+="${sep}${dim}⏱${reset} ${white}${SESSION_TIME}${reset}"
         line1+="${CTX_BADGE}${FOCUS}"
     else
-        line1="${blue}${MODEL}${reset}${EFFORT}"
+        line1="${blue}${MODEL}${reset}${EFFORT}${FAST_MODE}"
         [ -n "$ACCOUNT_LABEL" ] && line1+="${sep}${ACCOUNT_LABEL}"
         [ -n "$TINY_GIT_INFO" ] && line1+="${sep}${TINY_GIT_INFO}"
         line1+="${sep}${magenta}\$${COST_FMT}${reset}${DAILY_SUFFIX}"
