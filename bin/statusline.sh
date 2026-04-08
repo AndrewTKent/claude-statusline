@@ -307,88 +307,87 @@ if [ -n "$SESSION_ID" ]; then
     get_subagent_tokens "$SESSION_ID" "$CWD"
 
     # Auto-recover stale stats-cache
-    # If >2 hours old, scan only the CURRENT session's JSONL to patch today's tokens.
-    # Lightweight (~50ms) vs full scan (~minutes). Runs in foreground, no lock needed.
+    # Full scan of all session JSONLs, deduped by request ID. Runs in background.
+    # Lock file prevents concurrent scans; stale lock (>5 min) is ignored.
     STATS_FILE="$HOME/.claude/stats-cache.json"
-    if [ -f "$STATS_FILE" ] && [ -n "$SESSION_ID" ] && [ -n "$CWD" ]; then
-        stats_mtime=$(stat -f %m "$STATS_FILE" 2>/dev/null || stat -c %Y "$STATS_FILE" 2>/dev/null || echo "$now")
+    SCAN_LOCK="/tmp/claude/stats-scan.lock"
+    if [ -n "$SESSION_ID" ]; then
+        stats_mtime=0
+        [ -f "$STATS_FILE" ] && stats_mtime=$(stat -f %m "$STATS_FILE" 2>/dev/null || stat -c %Y "$STATS_FILE" 2>/dev/null || echo 0)
         stats_age=$(( now - stats_mtime ))
-        if [ "$stats_age" -gt 7200 ]; then
-            # Find current session JSONL and patch stats-cache with its tokens
+        lock_stale=1
+        if [ -f "$SCAN_LOCK" ]; then
+            lock_mtime=$(stat -f %m "$SCAN_LOCK" 2>/dev/null || stat -c %Y "$SCAN_LOCK" 2>/dev/null || echo 0)
+            lock_age=$(( now - lock_mtime ))
+            [ "$lock_age" -lt 300 ] && lock_stale=0
+        fi
+        if [ "$stats_age" -gt 300 ] && [ "$lock_stale" -eq 1 ]; then
+            mkdir -p /tmp/claude
+            touch "$SCAN_LOCK"
             python3 -c "
-import json, os, sys
+import json, sys
 from datetime import datetime
 from pathlib import Path
 from collections import defaultdict
 
-sid = '$SESSION_ID'
-cwd = '$CWD'
 stats_path = Path.home() / '.claude' / 'stats-cache.json'
-
-# Find session JSONL — check project dirs matching CWD
-project_dir = str(cwd).replace('/', '-')
-if project_dir.startswith('-'): project_dir = project_dir[1:]
 base = Path.home() / '.claude' / 'projects'
-session_file = None
-for p in [base / project_dir, base / ('-' + project_dir)]:
-    candidate = p / f'{sid}.jsonl'
-    if candidate.exists():
-        session_file = candidate
-        break
 
-if not session_file:
-    sys.exit(0)
-
-# Scan session + its subagents
-files_to_scan = [session_file]
-sub_dir = session_file.parent / sid / 'subagents'
-if sub_dir.exists():
-    files_to_scan.extend(sub_dir.glob('*.jsonl'))
-
+# Full scan: all session JSONLs + subagents, deduped by request ID
 seen = {}
-for f in files_to_scan:
+for jsonl in base.rglob('*.jsonl'):
     try:
-        for line in open(f):
+        for line in open(jsonl):
             if '\"usage\"' not in line: continue
             try:
                 obj = json.loads(line)
-                ts, msg = obj.get('timestamp',''), obj.get('message',{})
-                usage, rid = msg.get('usage',{}), obj.get('requestId', msg.get('id',''))
-                if ts and usage and rid: seen[rid] = (ts, msg.get('model','unknown'), usage)
+                ts = obj.get('timestamp', '')
+                msg = obj.get('message', {})
+                usage = msg.get('usage', {})
+                rid = obj.get('requestId', msg.get('id', ''))
+                if ts and usage and rid:
+                    # Keep the entry with the highest output_tokens per rid
+                    # (streaming logs partial counts before the final tally)
+                    prev = seen.get(rid)
+                    if not prev or usage.get('output_tokens', 0) > prev[2].get('output_tokens', 0):
+                        seen[rid] = (ts, msg.get('model', 'unknown'), usage)
             except: pass
     except: pass
 
 if not seen: sys.exit(0)
 
-# Compute session tokens by date+model
-daily = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+# Compute totals from scratch — no incremental patching
+model_usage = defaultdict(lambda: {'inputTokens': 0, 'outputTokens': 0, 'cacheReadInputTokens': 0, 'cacheCreationInputTokens': 0})
+daily = defaultdict(lambda: defaultdict(int))
+
 for rid, (ts, model, usage) in seen.items():
-    try: date = datetime.fromisoformat(ts.replace('Z','+00:00')).strftime('%Y-%m-%d')
-    except: continue
-    for field in ('input_tokens','output_tokens'):
-        daily[date][model][field] += usage.get(field, 0)
+    inp = usage.get('input_tokens', 0)
+    out = usage.get('output_tokens', 0)
+    cr = usage.get('cache_read_input_tokens', 0)
+    cc = usage.get('cache_creation_input_tokens', 0)
+    model_usage[model]['inputTokens'] += inp
+    model_usage[model]['outputTokens'] += out
+    model_usage[model]['cacheReadInputTokens'] += cr
+    model_usage[model]['cacheCreationInputTokens'] += cc
+    try:
+        date = datetime.fromisoformat(ts.replace('Z', '+00:00')).strftime('%Y-%m-%d')
+        daily[date][model] += inp + out
+    except: pass
 
-# Patch stats-cache: update modelUsage totals and dailyModelTokens
-with open(stats_path) as f: stats = json.load(f)
+# Build stats object
+stats = {}
+try:
+    with open(stats_path) as f: stats = json.load(f)
+except: pass
 
-existing_dmt = {e['date']: e for e in stats.get('dailyModelTokens', [])}
-for date, models in daily.items():
-    if date not in existing_dmt:
-        existing_dmt[date] = {'date': date, 'tokensByModel': {}}
-    for model, usage in models.items():
-        t = usage.get('input_tokens', 0) + usage.get('output_tokens', 0)
-        # Only update if our count is higher (don't shrink)
-        cur = existing_dmt[date]['tokensByModel'].get(model, 0)
-        if t > cur:
-            existing_dmt[date]['tokensByModel'][model] = t
-            # Update modelUsage totals
-            mu = stats.setdefault('modelUsage', {}).setdefault(model, {'inputTokens':0,'outputTokens':0,'cacheReadInputTokens':0,'cacheCreationInputTokens':0})
-            mu['inputTokens'] += usage.get('input_tokens', 0) - (cur // 2)  # rough split
-            mu['outputTokens'] += usage.get('output_tokens', 0) - (cur // 2)
+stats['modelUsage'] = {m: dict(u) for m, u in model_usage.items()}
+stats['dailyModelTokens'] = sorted(
+    [{'date': d, 'tokensByModel': dict(models)} for d, models in daily.items()],
+    key=lambda e: e['date']
+)
 
-stats['dailyModelTokens'] = sorted(existing_dmt.values(), key=lambda e: e['date'])
 with open(stats_path, 'w') as f: json.dump(stats, f, indent=2)
-" 2>/dev/null
+" 2>/dev/null &
         fi
     fi
 
