@@ -5,8 +5,11 @@ set -f
 input=$(cat)
 
 # Config: ~/.claude/statusline.conf (sourced as bash)
-#   HOURLY_RATE=150    # Billing rate in $/hour (enables cost tracking)
-#   DAILY_BUDGET=20    # Daily cost ceiling in $ (enables budget bar)
+#   HOURLY_RATE=150           # Billing rate in $/hour (enables cost tracking)
+#   DAILY_BUDGET=20           # Daily cost ceiling in $ (enables budget bar)
+#   CHALLENGE_GOAL_M=100      # Token goal in millions (enables challenge progress line)
+#   CHALLENGE_START_DATE=...  # ISO date (YYYY-MM-DD) for challenge window start
+#   CHALLENGE_LABEL=100m      # Label shown on the challenge line
 
 if [ -z "$input" ]; then
     printf "Claude"
@@ -17,6 +20,9 @@ fi
 CONFIG_FILE="$HOME/.claude/statusline.conf"
 HOURLY_RATE=0
 DAILY_BUDGET=0
+CHALLENGE_GOAL_M=0                      # Challenge goal in millions (0 = disabled)
+CHALLENGE_START_DATE=""                 # ISO date, e.g. 2026-03-23
+CHALLENGE_LABEL="goal"
 [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
 
 FOCUS_FILE="$HOME/.claude/focus"
@@ -475,9 +481,10 @@ with open(stats_path, 'w') as f: json.dump(stats, f, indent=2)
         TOKEN_DISPLAY="${G_BAR} ${cyan}${G_WORK_PCT}%w${reset}${dim}/${reset}${magenta}${G_PERSONAL_PCT}%p${reset} ${dim}(${reset}${cyan}${G_WORK_M}w${reset}${dim}+${reset}${magenta}${G_PERSONAL_M}p${reset}${dim}=${reset}${G_TOTAL_M}M${dim})${reset}"
     fi
 
-    # ── Challenge display: progress toward 100M (since Mar 23) ──
-    if [ "$C_TOTAL" -gt 0 ] 2>/dev/null; then
-        GOAL_M="100"
+    # ── Challenge display: progress toward goal (opt-in via config) ──
+    # Only renders when CHALLENGE_GOAL_M is set in ~/.claude/statusline.conf.
+    if [ "$C_TOTAL" -gt 0 ] 2>/dev/null && [ "$CHALLENGE_GOAL_M" -gt 0 ] 2>/dev/null; then
+        GOAL_M="$CHALLENGE_GOAL_M"
         C_PCT=$(awk "BEGIN {printf \"%.0f\", $C_TOTAL / (${GOAL_M} * 10000)}")
         [ "$C_PCT" -gt 100 ] 2>/dev/null && C_PCT=100
 
@@ -1207,7 +1214,7 @@ render_default() {
     [ -n "$rate_lines" ] && printf "\n%b" "$rate_lines"
     [ -n "$BUDGET_DISPLAY" ] && printf "\n%b" "$BUDGET_DISPLAY"
     [ -n "$TOKEN_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "tokens")${reset} %b" "$TOKEN_DISPLAY"
-    [ -n "$CHALLENGE_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "100m")${reset} %b" "$CHALLENGE_DISPLAY"
+    [ -n "$CHALLENGE_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "$CHALLENGE_LABEL")${reset} %b" "$CHALLENGE_DISPLAY"
 }
 
 # ── Render: sigil (single dense line) ─────────────────────
