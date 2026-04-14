@@ -391,78 +391,115 @@ with open(stats_path, 'w') as f: json.dump(stats, f, indent=2)
         fi
     fi
 
-    CHALLENGE_TOKENS=0
-    TOTAL_INPUT=0
-    TOTAL_OUTPUT=0
-    if [ -f "$STATS_FILE" ]; then
-        eval "$(jq -r '
-            "TOTAL_INPUT=" + ([.modelUsage[].inputTokens] | add // 0 | tostring),
-            "TOTAL_OUTPUT=" + ([.modelUsage[].outputTokens] | add // 0 | tostring)
-        ' "$STATS_FILE" 2>/dev/null)"
-        CHALLENGE_TOKENS=$((TOTAL_INPUT + TOTAL_OUTPUT))
+    # Two separate displays:
+    #   TOKEN_DISPLAY      — all-time work/personal ratio (100% bar, no goal)
+    #   CHALLENGE_DISPLAY  — since Mar 23 progress toward 100M goal
+    # Source: token-scan-cache.json (written by scan-tokens.py, incremental).
+    SCAN_CACHE="$HOME/.claude/token-scan-cache.json"
+    SCAN_SCRIPT="$HOME/agent-workflows/claude/scripts/scan-tokens.py"
+    CHALLENGE_DISPLAY=""
+
+    # Trigger background scan if cache is stale (>60s) or missing
+    if [ -f "$SCAN_SCRIPT" ]; then
+        scan_mtime=0
+        [ -f "$SCAN_CACHE" ] && scan_mtime=$(stat -f %m "$SCAN_CACHE" 2>/dev/null || stat -c %Y "$SCAN_CACHE" 2>/dev/null || echo 0)
+        scan_age=$(( now - scan_mtime ))
+        if [ "$scan_age" -gt 60 ]; then
+            (python3 "$SCAN_SCRIPT" --quiet >/dev/null 2>&1 &) >/dev/null 2>&1
+        fi
     fi
 
-    if [ "$CHALLENGE_TOKENS" -gt 0 ] 2>/dev/null; then
-        TOKEN_M=$(awk "BEGIN {printf \"%.1f\", $CHALLENGE_TOKENS / 1000000}")
-        GOAL_M="100"
-        TOKEN_PCT=$(awk "BEGIN {printf \"%.0f\", $CHALLENGE_TOKENS / (${GOAL_M} * 10000)}")
+    G_WORK=0 G_PERSONAL=0 G_UNKNOWN=0 G_TOTAL=0
+    C_WORK=0 C_PERSONAL=0 C_TOTAL=0
+    if [ -f "$SCAN_CACHE" ]; then
+        eval "$(jq -r '
+            "G_WORK=" + (.global.work_tokens // 0 | tostring),
+            "G_PERSONAL=" + (.global.personal_tokens // 0 | tostring),
+            "G_UNKNOWN=" + (.global.unknown_tokens // 0 | tostring),
+            "G_TOTAL=" + (.global.total_tokens // 0 | tostring),
+            "C_WORK=" + (.challenge.work_tokens // 0 | tostring),
+            "C_PERSONAL=" + (.challenge.personal_tokens // 0 | tostring),
+            "C_TOTAL=" + (.challenge.total_tokens // 0 | tostring)
+        ' "$SCAN_CACHE" 2>/dev/null)"
+    fi
 
-        # Split bar: cyan for input, magenta for output
+    # Daily ledger + session delta (shared by both displays)
+    DAILY_TOKEN_LEDGER="$HOME/.claude/daily-tokens.json"
+    update_ledger "$DAILY_TOKEN_LEDGER" "$SESSION_ID" "$SESSION_TOKENS" "$TODAY" "$ACCT_TAG"
+    DAILY_TOKENS="${LEDGER_RESULT:-0}"
+    SESSION_DELTA=0
+    if [ -f "$DAILY_TOKEN_LEDGER" ]; then
+        SESSION_DELTA=$(jq --arg sid "$SESSION_ID" '(.sessions[$sid].current // 0) - (.sessions[$sid].baseline // 0)' "$DAILY_TOKEN_LEDGER" 2>/dev/null)
+        [ -z "$SESSION_DELTA" ] && SESSION_DELTA=0
+    fi
+    SESSION_TOKEN_FMT=$(awk "BEGIN {
+        t=$SESSION_DELTA;
+        if (t >= 1000000) printf \"%.1fM\", t/1000000;
+        else if (t >= 1000) printf \"%.0fk\", t/1000;
+        else printf \"%d\", t
+    }")
+    DAILY_TOKEN_FMT=$(awk "BEGIN {
+        t=$DAILY_TOKENS;
+        if (t >= 1000000) printf \"%.1fM\", t/1000000;
+        else if (t >= 1000) printf \"%.0fk\", t/1000;
+        else printf \"%d\", t
+    }")
+    SHARED_SUFFIX=" ${magenta}+${SESSION_TOKEN_FMT}${reset}"
+    if [ "$SUBAGENT_TOKENS" -gt 0 ] 2>/dev/null; then
+        sub_fmt=$(format_tokens "$SUBAGENT_TOKENS")
+        SHARED_SUFFIX+=" ${dim}+${sub_fmt} sub${reset}"
+    fi
+    if [ "$DAILY_TOKENS" -gt "$SESSION_DELTA" ] 2>/dev/null; then
+        SHARED_SUFFIX+=" ${dim}(+${DAILY_TOKEN_FMT}/d)${reset}"
+    fi
+
+    # ── Global display: 100% ratio bar (work vs personal, all-time) ──
+    if [ "$G_TOTAL" -gt 0 ] 2>/dev/null; then
         BAR_WIDTH=10
-        INPUT_PCT=$(awk "BEGIN {printf \"%.0f\", $TOTAL_INPUT / (${GOAL_M} * 10000)}")
-        OUTPUT_PCT=$(awk "BEGIN {printf \"%.0f\", $TOTAL_OUTPUT / (${GOAL_M} * 10000)}")
-        INPUT_DOTS=$(( INPUT_PCT * BAR_WIDTH / 100 ))
-        OUTPUT_DOTS=$(( OUTPUT_PCT * BAR_WIDTH / 100 ))
-        # Clamp so they don't exceed bar width
-        [ $((INPUT_DOTS + OUTPUT_DOTS)) -gt "$BAR_WIDTH" ] && OUTPUT_DOTS=$((BAR_WIDTH - INPUT_DOTS))
-        EMPTY_DOTS=$((BAR_WIDTH - INPUT_DOTS - OUTPUT_DOTS))
-        [ "$EMPTY_DOTS" -lt 0 ] && EMPTY_DOTS=0
+        G_WORK_PCT=$(awk "BEGIN {printf \"%.0f\", $G_WORK * 100 / $G_TOTAL}")
+        G_PERSONAL_PCT=$(awk "BEGIN {printf \"%.0f\", $G_PERSONAL * 100 / $G_TOTAL}")
+        G_WORK_DOTS=$(( G_WORK_PCT * BAR_WIDTH / 100 ))
+        G_PERSONAL_DOTS=$(( G_PERSONAL_PCT * BAR_WIDTH / 100 ))
+        [ $((G_WORK_DOTS + G_PERSONAL_DOTS)) -gt "$BAR_WIDTH" ] && G_PERSONAL_DOTS=$((BAR_WIDTH - G_WORK_DOTS))
+        G_EMPTY_DOTS=$((BAR_WIDTH - G_WORK_DOTS - G_PERSONAL_DOTS))
+        [ "$G_EMPTY_DOTS" -lt 0 ] && G_EMPTY_DOTS=0
+        G_WORK_STR="" G_PERSONAL_STR="" G_EMPTY_STR=""
+        for ((i=0; i<G_WORK_DOTS; i++)); do G_WORK_STR+="●"; done
+        for ((i=0; i<G_PERSONAL_DOTS; i++)); do G_PERSONAL_STR+="●"; done
+        for ((i=0; i<G_EMPTY_DOTS; i++)); do G_EMPTY_STR+="●"; done
+        G_BAR="${cyan}${G_WORK_STR}${magenta}${G_PERSONAL_STR}${dim}${G_EMPTY_STR}${reset}"
 
-        INPUT_STR="" OUTPUT_STR="" EMPTY_STR=""
-        for ((i=0; i<INPUT_DOTS; i++)); do INPUT_STR+="●"; done
-        for ((i=0; i<OUTPUT_DOTS; i++)); do OUTPUT_STR+="●"; done
-        for ((i=0; i<EMPTY_DOTS; i++)); do EMPTY_STR+="○"; done
-        TOKEN_BAR="${cyan}${INPUT_STR}${magenta}${OUTPUT_STR}${dim}${EMPTY_STR}${reset}"
+        G_WORK_M=$(awk "BEGIN {printf \"%.2f\", $G_WORK / 1000000}")
+        G_PERSONAL_M=$(awk "BEGIN {printf \"%.2f\", $G_PERSONAL / 1000000}")
+        G_TOTAL_M=$(awk "BEGIN {printf \"%.2f\", $G_TOTAL / 1000000}")
+        TOKEN_DISPLAY="${G_BAR} ${cyan}${G_WORK_PCT}%w${reset}${dim}/${reset}${magenta}${G_PERSONAL_PCT}%p${reset} ${dim}(${reset}${cyan}${G_WORK_M}w${reset}${dim}+${reset}${magenta}${G_PERSONAL_M}p${reset}${dim}=${reset}${G_TOTAL_M}M${dim})${reset}"
+    fi
 
-        # Daily token tracking
-        DAILY_TOKEN_LEDGER="$HOME/.claude/daily-tokens.json"
-        update_ledger "$DAILY_TOKEN_LEDGER" "$SESSION_ID" "$SESSION_TOKENS" "$TODAY" "$ACCT_TAG"
-        DAILY_TOKENS="${LEDGER_RESULT:-0}"
+    # ── Challenge display: progress toward 100M (since Mar 23) ──
+    if [ "$C_TOTAL" -gt 0 ] 2>/dev/null; then
+        GOAL_M="100"
+        C_PCT=$(awk "BEGIN {printf \"%.0f\", $C_TOTAL / (${GOAL_M} * 10000)}")
+        [ "$C_PCT" -gt 100 ] 2>/dev/null && C_PCT=100
 
-        # Session token delta
-        SESSION_DELTA=0
-        if [ -f "$DAILY_TOKEN_LEDGER" ]; then
-            SESSION_DELTA=$(jq --arg sid "$SESSION_ID" '(.sessions[$sid].current // 0) - (.sessions[$sid].baseline // 0)' "$DAILY_TOKEN_LEDGER" 2>/dev/null)
-            [ -z "$SESSION_DELTA" ] && SESSION_DELTA=0
-        fi
+        BAR_WIDTH=10
+        C_WORK_PCT=$(awk "BEGIN {printf \"%.0f\", $C_WORK / (${GOAL_M} * 10000)}")
+        C_PERSONAL_PCT=$(awk "BEGIN {printf \"%.0f\", $C_PERSONAL / (${GOAL_M} * 10000)}")
+        C_WORK_DOTS=$(( C_WORK_PCT * BAR_WIDTH / 100 ))
+        C_PERSONAL_DOTS=$(( C_PERSONAL_PCT * BAR_WIDTH / 100 ))
+        [ $((C_WORK_DOTS + C_PERSONAL_DOTS)) -gt "$BAR_WIDTH" ] && C_PERSONAL_DOTS=$((BAR_WIDTH - C_WORK_DOTS))
+        C_EMPTY_DOTS=$((BAR_WIDTH - C_WORK_DOTS - C_PERSONAL_DOTS))
+        [ "$C_EMPTY_DOTS" -lt 0 ] && C_EMPTY_DOTS=0
+        C_WORK_STR="" C_PERSONAL_STR="" C_EMPTY_STR=""
+        for ((i=0; i<C_WORK_DOTS; i++)); do C_WORK_STR+="●"; done
+        for ((i=0; i<C_PERSONAL_DOTS; i++)); do C_PERSONAL_STR+="●"; done
+        for ((i=0; i<C_EMPTY_DOTS; i++)); do C_EMPTY_STR+="○"; done
+        C_BAR="${cyan}${C_WORK_STR}${magenta}${C_PERSONAL_STR}${dim}${C_EMPTY_STR}${reset}"
 
-        SESSION_TOKEN_FMT=$(awk "BEGIN {
-            t=$SESSION_DELTA;
-            if (t >= 1000000) printf \"%.1fM\", t/1000000;
-            else if (t >= 1000) printf \"%.0fk\", t/1000;
-            else printf \"%d\", t
-        }")
-
-        DAILY_TOKEN_FMT=$(awk "BEGIN {
-            t=$DAILY_TOKENS;
-            if (t >= 1000000) printf \"%.1fM\", t/1000000;
-            else if (t >= 1000) printf \"%.0fk\", t/1000;
-            else printf \"%d\", t
-        }")
-
-        TOKEN_SUFFIX=" ${magenta}+${SESSION_TOKEN_FMT}${reset}"
-        if [ "$SUBAGENT_TOKENS" -gt 0 ] 2>/dev/null; then
-            sub_fmt=$(format_tokens "$SUBAGENT_TOKENS")
-            TOKEN_SUFFIX+=" ${dim}+${sub_fmt} sub${reset}"
-        fi
-        if [ "$DAILY_TOKENS" -gt "$SESSION_DELTA" ] 2>/dev/null; then
-            TOKEN_SUFFIX+=" ${dim}(+${DAILY_TOKEN_FMT}/d)${reset}"
-        fi
-
-        TOKEN_PCT_COLOR=$(color_for_pct "$TOKEN_PCT")
-        INPUT_M=$(awk "BEGIN {printf \"%.1f\", $TOTAL_INPUT / 1000000}")
-        OUTPUT_M=$(awk "BEGIN {printf \"%.1f\", $TOTAL_OUTPUT / 1000000}")
-        TOKEN_DISPLAY="${TOKEN_BAR} ${TOKEN_PCT_COLOR}$(printf "%3d" "$TOKEN_PCT")%${reset} ${dim}(${reset}${cyan}${INPUT_M}${reset}${dim}+${reset}${magenta}${OUTPUT_M}M${reset}${dim})/${GOAL_M}M${reset}${TOKEN_SUFFIX}"
+        C_WORK_M=$(awk "BEGIN {printf \"%.2f\", $C_WORK / 1000000}")
+        C_PERSONAL_M=$(awk "BEGIN {printf \"%.2f\", $C_PERSONAL / 1000000}")
+        C_TOTAL_M=$(awk "BEGIN {printf \"%.2f\", $C_TOTAL / 1000000}")
+        C_PCT_COLOR=$(color_for_pct "$C_PCT")
+        CHALLENGE_DISPLAY="${C_BAR} ${C_PCT_COLOR}$(printf "%3d" "$C_PCT")%${reset} ${dim}(${reset}${cyan}${C_WORK_M}w${reset}${dim}+${reset}${magenta}${C_PERSONAL_M}p${reset}${dim}=${reset}${C_TOTAL_M}M${dim})/${GOAL_M}M${reset}${SHARED_SUFFIX}"
     fi
 fi
 
@@ -879,7 +916,7 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
         five_hour_pct_display=$(printf "%.1f" "$five_hour_pct" 2>/dev/null || echo "0.0")
         seven_day_pct_display=$(printf "%.1f" "$seven_day_pct_raw" 2>/dev/null || echo "0.0")
     fi
-    five_hour_pct=$(printf "%.0f" "$five_hour_pct" 2>/dev/null || echo 0)
+    five_hour_pct=$(printf "%.0f" "$five_hour_pct_display" 2>/dev/null || echo 0)
     five_hour_reset=$(format_reset_time "$five_hour_reset_iso" "time")
     five_hour_bar=$(build_bar "$five_hour_pct" "$bar_width")
     five_hour_pct_color=$(color_for_pct "$five_hour_pct")
@@ -967,7 +1004,7 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
         fi
     fi
 
-    seven_day_pct=$(printf "%.0f" "$seven_day_pct_raw" 2>/dev/null || echo 0)
+    seven_day_pct=$(printf "%.0f" "$seven_day_pct_display" 2>/dev/null || echo 0)
     seven_day_reset=$(format_reset_time "$seven_day_reset_iso" "datetime")
     seven_day_bar=$(build_bar "$seven_day_pct" "$bar_width")
     seven_day_pct_color=$(color_for_pct "$seven_day_pct")
@@ -1170,6 +1207,7 @@ render_default() {
     [ -n "$rate_lines" ] && printf "\n%b" "$rate_lines"
     [ -n "$BUDGET_DISPLAY" ] && printf "\n%b" "$BUDGET_DISPLAY"
     [ -n "$TOKEN_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "tokens")${reset} %b" "$TOKEN_DISPLAY"
+    [ -n "$CHALLENGE_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "100m")${reset} %b" "$CHALLENGE_DISPLAY"
 }
 
 # ── Render: sigil (single dense line) ─────────────────────
