@@ -737,7 +737,7 @@ get_oauth_token() {
 # ── Fetch rate limits + profile (background, never blocking) ──
 cache_file="/tmp/claude/statusline-usage-cache.json"
 profile_cache_file="/tmp/claude/statusline-profile-cache.json"
-cache_max_age=300
+cache_max_age=60
 profile_cache_max_age=300
 lock_file="/tmp/claude/statusline-refresh.lock"
 mkdir -p /tmp/claude
