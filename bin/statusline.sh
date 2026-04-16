@@ -1030,7 +1030,7 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
                         awk "BEGIN { exit ($hrs_to_full <= 72) ? 0 : 1 }" 2>/dev/null && wd_color="$orange"
                         awk "BEGIN { exit ($hrs_to_full <= 36) ? 0 : 1 }" 2>/dev/null && wd_color="$yellow"
                         awk "BEGIN { exit ($hrs_to_full <= 12) ? 0 : 1 }" 2>/dev/null && wd_color="$red"
-                        rate_lines+=" ${wd_color}$(pad_right "→full ~${display_to_full}" 11)${reset}"
+                        rate_lines+=" ${wd_color}$(pad_right "→full ~${display_to_full}" 12)${reset}"
 
                         # Survive indicator: buffer or downtime
                         weekly_gap_mins=$(awk "BEGIN { printf \"%.0f\", ($hrs_to_full - $hrs_to_reset) * 60 }")
