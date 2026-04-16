@@ -57,8 +57,8 @@ format_tokens() {
 fmt_duration_m() {
     awk "BEGIN {
         m = $1; if (m < 0) m = -m;
-        if (m >= 2880) printf \"%.1fd\", m / 1440;
-        else if (m >= 60) printf \"%.1fh\", m / 60;
+        if (m >= 2880) printf \"%.2fd\", m / 1440;
+        else if (m >= 60) printf \"%.2fh\", m / 60;
         else printf \"%.0fm\", m
     }"
 }
@@ -893,22 +893,22 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
                 if (rate < 0) rate = 0;
                 est = $five_hour_pct + rate * $secs_since_poll;
                 if (est > 100) est = 100;
-                printf \"%.1f\", est
+                printf \"%.2f\", est
             }")
             seven_day_pct_display=$(awk "BEGIN {
                 rate = ($seven_day_pct_raw - $prev_7d) / $poll_interval;
                 if (rate < 0) rate = 0;
                 est = $seven_day_pct_raw + rate * $secs_since_poll;
                 if (est > 100) est = 100;
-                printf \"%.1f\", est
+                printf \"%.2f\", est
             }")
         else
-            five_hour_pct_display=$(printf "%.1f" "$five_hour_pct" 2>/dev/null || echo "0.0")
-            seven_day_pct_display=$(printf "%.1f" "$seven_day_pct_raw" 2>/dev/null || echo "0.0")
+            five_hour_pct_display=$(printf "%.2f" "$five_hour_pct" 2>/dev/null || echo "0.00")
+            seven_day_pct_display=$(printf "%.2f" "$seven_day_pct_raw" 2>/dev/null || echo "0.00")
         fi
     else
-        five_hour_pct_display=$(printf "%.1f" "$five_hour_pct" 2>/dev/null || echo "0.0")
-        seven_day_pct_display=$(printf "%.1f" "$seven_day_pct_raw" 2>/dev/null || echo "0.0")
+        five_hour_pct_display=$(printf "%.2f" "$five_hour_pct" 2>/dev/null || echo "0.00")
+        seven_day_pct_display=$(printf "%.2f" "$seven_day_pct_raw" 2>/dev/null || echo "0.00")
     fi
     five_hour_pct=$(printf "%.0f" "$five_hour_pct_display" 2>/dev/null || echo 0)
     five_hour_reset=$(format_reset_time "$five_hour_reset_iso" "time")
@@ -917,7 +917,7 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
 
     # Pct padded to 9 cols (6 for "85.7%" + 3 trailing) so reset/dollars/breakdown
     # all start at the same column across rate rows AND token rows.
-    rate_lines+="${white}$(printf "%-7s" "current")${reset} ${five_hour_bar} ${five_hour_pct_color}$(printf "%5.1f" "$five_hour_pct_display")%   ${reset}"
+    rate_lines+="${white}$(printf "%-7s" "current")${reset} ${five_hour_bar} ${five_hour_pct_color}$(printf "%6.2f" "$five_hour_pct_display")%  ${reset}"
     # Reset-time padded to 15 so "→full ..." lines up across current / weekly.
     if [ -n "$five_hour_reset" ]; then
         rate_lines+=" ${white}$(pad_right "$five_hour_reset" 15)${reset}"
@@ -969,7 +969,7 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
 
                         full_display=$(fmt_duration_m "$mins_to_full")
                         # Pad "→full ~Xm" to 11 cols so "✗buf" lines up.
-                        rate_lines+=" ${bd_color}$(pad_right "→full ~${full_display}" 12)${reset}"
+                        rate_lines+=" ${bd_color}$(pad_right "→full ~${full_display}" 14)${reset}"
 
                         # Survive indicator: buffer or downtime until window resets
                         mins_to_reset=$(( secs_to_reset / 60 ))
@@ -993,7 +993,7 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
     seven_day_bar=$(build_bar "$seven_day_pct" "$bar_width")
     seven_day_pct_color=$(color_for_pct "$seven_day_pct")
 
-    rate_lines+="\n${white}$(printf "%-7s" "weekly")${reset} ${seven_day_bar} ${seven_day_pct_color}$(printf "%5.1f" "$seven_day_pct_display")%   ${reset}"
+    rate_lines+="\n${white}$(printf "%-7s" "weekly")${reset} ${seven_day_bar} ${seven_day_pct_color}$(printf "%6.2f" "$seven_day_pct_display")%  ${reset}"
     if [ -n "$seven_day_reset" ]; then
         rate_lines+=" ${white}$(pad_right "$seven_day_reset" 15)${reset}"
     else
@@ -1017,10 +1017,10 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
                     # Hours to full
                     hrs_to_full=$(awk "BEGIN {
                         rate = $seven_day_pct / $weekly_secs_elapsed;
-                        if (rate > 0) printf \"%.1f\", $weekly_remaining_pct / rate / 3600;
+                        if (rate > 0) printf \"%.2f\", $weekly_remaining_pct / rate / 3600;
                         else print 999
                     }")
-                    hrs_to_reset=$(awk "BEGIN { printf \"%.1f\", $weekly_secs_to_reset / 3600 }")
+                    hrs_to_reset=$(awk "BEGIN { printf \"%.2f\", $weekly_secs_to_reset / 3600 }")
                     mins_to_full_weekly=$(awk "BEGIN { printf \"%.0f\", $hrs_to_full * 60 }")
                     display_to_full=$(fmt_duration_m "$mins_to_full_weekly")
 
@@ -1030,7 +1030,7 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
                         awk "BEGIN { exit ($hrs_to_full <= 72) ? 0 : 1 }" 2>/dev/null && wd_color="$orange"
                         awk "BEGIN { exit ($hrs_to_full <= 36) ? 0 : 1 }" 2>/dev/null && wd_color="$yellow"
                         awk "BEGIN { exit ($hrs_to_full <= 12) ? 0 : 1 }" 2>/dev/null && wd_color="$red"
-                        rate_lines+=" ${wd_color}$(pad_right "→full ~${display_to_full}" 12)${reset}"
+                        rate_lines+=" ${wd_color}$(pad_right "→full ~${display_to_full}" 14)${reset}"
 
                         # Survive indicator: buffer or downtime
                         weekly_gap_mins=$(awk "BEGIN { printf \"%.0f\", ($hrs_to_full - $hrs_to_reset) * 60 }")
@@ -1049,14 +1049,14 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
 
     # Extra usage credits
     if [ "$extra_enabled" = "true" ]; then
-        extra_pct_display=$(printf "%.1f" "$extra_pct_raw" 2>/dev/null || echo "0.0")
+        extra_pct_display=$(printf "%.2f" "$extra_pct_raw" 2>/dev/null || echo "0.00")
         extra_pct=$(printf "%.0f" "$extra_pct_raw" 2>/dev/null || echo 0)
         extra_used=$(awk "BEGIN {printf \"%.2f\", $extra_used_raw / 100}" 2>/dev/null)
         extra_limit=$(awk "BEGIN {printf \"%.2f\", $extra_limit_raw / 100}" 2>/dev/null)
         extra_bar=$(build_bar "$extra_pct" "$bar_width")
         extra_pct_color=$(color_for_pct "$extra_pct")
 
-        rate_lines+="\n${white}$(printf "%-7s" "extra")${reset} ${extra_bar} ${extra_pct_color}$(printf "%5.1f" "$extra_pct_display")%   ${reset} ${white}\$${extra_used}${dim}/${reset}${white}\$${extra_limit}${reset}"
+        rate_lines+="\n${white}$(printf "%-7s" "extra")${reset} ${extra_bar} ${extra_pct_color}$(printf "%6.2f" "$extra_pct_display")%  ${reset} ${white}\$${extra_used}${dim}/${reset}${white}\$${extra_limit}${reset}"
 
         # Project extra $ spend until current window resets (only when at 100% current)
         if [ "$five_hour_pct" -ge 100 ] 2>/dev/null && [ -f "$prev_poll_file" ] && [ -n "$five_hour_reset_iso" ]; then
