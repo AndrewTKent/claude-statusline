@@ -1167,8 +1167,7 @@ render_default() {
         # Row 1: identity (model, account, dir+git, ctx badge, focus).
         line1="${blue}${MODEL}${reset}${EFFORT}${FAST_MODE}"
         [ -n "$ACCOUNT_LABEL" ] && line1+="${sep}${ACCOUNT_LABEL}"
-        line1+="${sep}${cyan}${DIR_NAME}${reset}${SHORT_GIT_INFO}"
-        line1+="${CTX_BADGE}${FOCUS}"
+        line1+="${sep}${cyan}${DIR_NAME}${reset}${SHORT_GIT_INFO}${FOCUS}"
         # Row 2: state (cost + burn + billable + timer + idle). Split so the
         # header doesn't get truncated by Claude Code's status area width.
         # Each segment is pipe-separated; vars have a leading space we strip.
@@ -1181,8 +1180,7 @@ render_default() {
         line1="${blue}${MODEL}${reset}${EFFORT}${FAST_MODE}"
         [ -n "$ACCOUNT_LABEL" ] && line1+="${sep}${ACCOUNT_LABEL}"
         [ -n "$TINY_GIT_INFO" ] && line1+="${sep}${TINY_GIT_INFO}"
-        line1+="${sep}${magenta}\$${COST_FMT}${reset}${DAILY_SUFFIX}${BILLABLE}"
-        line1+="${CTX_BADGE}${FOCUS}"
+        line1+="${sep}${magenta}\$${COST_FMT}${reset}${DAILY_SUFFIX}${BILLABLE}${FOCUS}"
     fi
 
     printf "%b\n" "$line1"
