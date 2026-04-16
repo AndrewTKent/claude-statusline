@@ -969,7 +969,7 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
 
                         full_display=$(fmt_duration_m "$mins_to_full")
                         # Pad "→full ~Xm" to 11 cols so "✗buf" lines up.
-                        rate_lines+=" ${bd_color}$(pad_right "→full ~${full_display}" 11)${reset}"
+                        rate_lines+=" ${bd_color}$(pad_right "→full ~${full_display}" 12)${reset}"
 
                         # Survive indicator: buffer or downtime until window resets
                         mins_to_reset=$(( secs_to_reset / 60 ))
