@@ -53,6 +53,36 @@ format_tokens() {
     fi
 }
 
+# fmt_duration_m MINUTES — m / h / d depending on size. Always takes minutes.
+fmt_duration_m() {
+    awk "BEGIN {
+        m = $1; if (m < 0) m = -m;
+        if (m >= 2880) printf \"%.1fd\", m / 1440;
+        else if (m >= 60) printf \"%.1fh\", m / 60;
+        else printf \"%.0fm\", m
+    }"
+}
+
+# secs_since_last_user SID CWD — seconds since the last user-role message in the
+# session JSONL. Bounded tail scan (last 200 lines). Empty if no match.
+secs_since_last_user() {
+    local sid="$1" cwd="$2"
+    [ -z "$sid" ] || [ -z "$cwd" ] && return
+    local project_dir
+    project_dir=$(echo "$cwd" | tr '/' '-')
+    local session_file="$HOME/.claude/projects/${project_dir}/${sid}.jsonl"
+    [ -f "$session_file" ] || return
+    local ts
+    ts=$(tail -n 200 "$session_file" 2>/dev/null | grep '"type":"user"' | tail -1 | jq -r '.timestamp // empty' 2>/dev/null)
+    [ -z "$ts" ] && return
+    local clean="${ts%.*}"
+    clean="${clean%Z}"
+    local ts_epoch
+    ts_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%S" "$clean" +%s 2>/dev/null)
+    [ -z "$ts_epoch" ] && return
+    echo $(( $(date +%s) - ts_epoch ))
+}
+
 color_for_pct() {
     local pct=$1
     if [ "$pct" -ge 90 ] 2>/dev/null; then printf "$red"
@@ -78,6 +108,22 @@ build_bar() {
     for ((i=0; i<empty; i++)); do empty_str+="○"; done
 
     printf "${bar_color}${filled_str}${dim}${empty_str}${reset}"
+}
+
+# build_ratio_bar WORK_PCT PERSONAL_PCT WIDTH EMPTY_CHAR
+# Two-color stacked ratio bar: cyan work + magenta personal + dim empty.
+build_ratio_bar() {
+    local work_pct=$1 personal_pct=$2 width=$3 empty_char=$4
+    local work_dots=$(( work_pct * width / 100 ))
+    local personal_dots=$(( personal_pct * width / 100 ))
+    [ $((work_dots + personal_dots)) -gt "$width" ] && personal_dots=$((width - work_dots))
+    local empty_dots=$((width - work_dots - personal_dots))
+    [ "$empty_dots" -lt 0 ] && empty_dots=0
+    local work_str="" personal_str="" empty_str="" i
+    for ((i=0; i<work_dots; i++)); do work_str+="●"; done
+    for ((i=0; i<personal_dots; i++)); do personal_str+="●"; done
+    for ((i=0; i<empty_dots; i++)); do empty_str+="$empty_char"; done
+    printf "${cyan}${work_str}${magenta}${personal_str}${dim}${empty_str}${reset}"
 }
 
 # Atomic jq update: reads file, applies jq filter, writes back atomically.
@@ -117,8 +163,10 @@ resolve_account_label() {
 
 # ── Reusable ledger function ─────────────────────────────
 # Usage: update_ledger <file> <session_id> <value> <today> [acct]
-# Returns the daily delta (sum of all session deltas) via LEDGER_RESULT
+# Returns daily delta (sum of all session deltas) via LEDGER_RESULT
+# and this session's delta (current - baseline) via LEDGER_SESSION_DELTA.
 LEDGER_RESULT=0
+LEDGER_SESSION_DELTA=0
 update_ledger() {
     local file="$1" sid="$2" value="$3" today="$4" acct="${5:-}"
 
@@ -147,8 +195,13 @@ update_ledger() {
                         '.sessions[$sid].current = $val'
                 fi
             fi
-            LEDGER_RESULT=$(jq '[.sessions[] | .current - .baseline] | add // 0' "$file" 2>/dev/null)
+            # Single jq call emits both totals; saves the follow-up SESSION_DELTA read.
+            eval "$(jq -r --arg sid "$sid" '
+                "LEDGER_RESULT=" + ([.sessions[] | .current - .baseline] | add // 0 | tostring),
+                "LEDGER_SESSION_DELTA=" + ((.sessions[$sid].current // 0) - (.sessions[$sid].baseline // 0) | tostring)
+            ' "$file" 2>/dev/null)"
             [ -z "$LEDGER_RESULT" ] && LEDGER_RESULT=0
+            [ -z "$LEDGER_SESSION_DELTA" ] && LEDGER_SESSION_DELTA=0
         else
             if [ -n "$acct" ]; then
                 printf '{"date":"%s","sessions":{"%s":{"baseline":%s,"current":%s,"acct":"%s"}}}' \
@@ -158,6 +211,7 @@ update_ledger() {
                     "$today" "$sid" "$value" "$value" > "$file"
             fi
             LEDGER_RESULT=0
+            LEDGER_SESSION_DELTA=0
         fi
     else
         if [ -n "$acct" ]; then
@@ -168,6 +222,7 @@ update_ledger() {
                 "$today" "$sid" "$value" "$value" > "$file"
         fi
         LEDGER_RESULT=0
+        LEDGER_SESSION_DELTA=0
     fi
 }
 
@@ -202,9 +257,15 @@ get_subagent_tokens() {
     local subagent_path="$HOME/.claude/projects/${project_dir}/${sid}/subagents"
 
     if [ -d "$subagent_path" ]; then
-        # Sum input + output tokens across subagent files
-        SUBAGENT_TOKENS=$(jq -s '[.[].message.usage | select(.) | (.input_tokens // 0) + (.output_tokens // 0)] | add // 0' "$subagent_path"/agent-*.jsonl 2>/dev/null)
-        [ -z "$SUBAGENT_TOKENS" ] && SUBAGENT_TOKENS=0
+        # Sum input + output tokens across subagent files.
+        # set +f locally: script-wide `set -f` (L3) blocks glob expansion otherwise.
+        set +f
+        local agent_files=( "$subagent_path"/agent-*.jsonl )
+        set -f
+        if [ -e "${agent_files[0]}" ]; then
+            SUBAGENT_TOKENS=$(jq -s '[.[].message.usage | select(.) | (.input_tokens // 0) + (.output_tokens // 0)] | add // 0' "${agent_files[@]}" 2>/dev/null)
+            [ -z "$SUBAGENT_TOKENS" ] && SUBAGENT_TOKENS=0
+        fi
     fi
 
     echo "$SUBAGENT_TOKENS" > "$cache_file"
@@ -305,119 +366,53 @@ if [ -n "$SESSION_ID" ] && [ "$(awk "BEGIN {print ($COST > 0)}")" = "1" ]; then
 fi
 DAILY_FMT=$(printf "%.2f" "$DAILY_COST")
 
-# ── Token challenge tracker (reads stats-cache directly) ─────
+# ── Token challenge tracker (reads token-scan-cache.json) ─────
 TOKEN_DISPLAY=""
 
+IDLE_DISPLAY=""
 if [ -n "$SESSION_ID" ]; then
     SESSION_TOKENS=$((INPUT_TOKENS + OUTPUT_TOKENS))
     get_subagent_tokens "$SESSION_ID" "$CWD"
 
-    # Auto-recover stale stats-cache
-    # Full scan of all session JSONLs, deduped by request ID. Runs in background.
-    # Lock file prevents concurrent scans; stale lock (>5 min) is ignored.
-    STATS_FILE="$HOME/.claude/stats-cache.json"
-    SCAN_LOCK="/tmp/claude/stats-scan.lock"
-    if [ -n "$SESSION_ID" ]; then
-        stats_mtime=0
-        [ -f "$STATS_FILE" ] && stats_mtime=$(stat -f %m "$STATS_FILE" 2>/dev/null || stat -c %Y "$STATS_FILE" 2>/dev/null || echo 0)
-        stats_age=$(( now - stats_mtime ))
-        lock_stale=1
-        if [ -f "$SCAN_LOCK" ]; then
-            lock_mtime=$(stat -f %m "$SCAN_LOCK" 2>/dev/null || stat -c %Y "$SCAN_LOCK" 2>/dev/null || echo 0)
-            lock_age=$(( now - lock_mtime ))
-            [ "$lock_age" -lt 300 ] && lock_stale=0
-        fi
-        if [ "$stats_age" -gt 300 ] && [ "$lock_stale" -eq 1 ]; then
-            mkdir -p /tmp/claude
-            touch "$SCAN_LOCK"
-            python3 -c "
-import json, sys
-from datetime import datetime
-from pathlib import Path
-from collections import defaultdict
-
-stats_path = Path.home() / '.claude' / 'stats-cache.json'
-base = Path.home() / '.claude' / 'projects'
-
-# Full scan: all session JSONLs + subagents, deduped by request ID
-seen = {}
-for jsonl in base.rglob('*.jsonl'):
-    try:
-        for line in open(jsonl):
-            if '\"usage\"' not in line: continue
-            try:
-                obj = json.loads(line)
-                ts = obj.get('timestamp', '')
-                msg = obj.get('message', {})
-                usage = msg.get('usage', {})
-                rid = obj.get('requestId', msg.get('id', ''))
-                if ts and usage and rid:
-                    # Keep the entry with the highest output_tokens per rid
-                    # (streaming logs partial counts before the final tally)
-                    prev = seen.get(rid)
-                    if not prev or usage.get('output_tokens', 0) > prev[2].get('output_tokens', 0):
-                        seen[rid] = (ts, msg.get('model', 'unknown'), usage)
-            except: pass
-    except: pass
-
-if not seen: sys.exit(0)
-
-# Compute totals from scratch — no incremental patching
-model_usage = defaultdict(lambda: {'inputTokens': 0, 'outputTokens': 0, 'cacheReadInputTokens': 0, 'cacheCreationInputTokens': 0})
-daily = defaultdict(lambda: defaultdict(int))
-
-for rid, (ts, model, usage) in seen.items():
-    inp = usage.get('input_tokens', 0)
-    out = usage.get('output_tokens', 0)
-    cr = usage.get('cache_read_input_tokens', 0)
-    cc = usage.get('cache_creation_input_tokens', 0)
-    model_usage[model]['inputTokens'] += inp
-    model_usage[model]['outputTokens'] += out
-    model_usage[model]['cacheReadInputTokens'] += cr
-    model_usage[model]['cacheCreationInputTokens'] += cc
-    try:
-        date = datetime.fromisoformat(ts.replace('Z', '+00:00')).strftime('%Y-%m-%d')
-        daily[date][model] += inp + out
-    except: pass
-
-# Build stats object
-stats = {}
-try:
-    with open(stats_path) as f: stats = json.load(f)
-except: pass
-
-stats['modelUsage'] = {m: dict(u) for m, u in model_usage.items()}
-stats['dailyModelTokens'] = sorted(
-    [{'date': d, 'tokensByModel': dict(models)} for d, models in daily.items()],
-    key=lambda e: e['date']
-)
-
-with open(stats_path, 'w') as f: json.dump(stats, f, indent=2)
-" 2>/dev/null &
+    # Time since last user message — signals how long the current turn has been running.
+    # Only show when idle > 30s, to avoid flicker during fast back-and-forth.
+    _idle_s=$(secs_since_last_user "$SESSION_ID" "$CWD")
+    if [ -n "$_idle_s" ] && [ "$_idle_s" -gt 30 ] 2>/dev/null; then
+        _idle_m=$(( _idle_s / 60 ))
+        if [ "$_idle_s" -lt 60 ]; then
+            IDLE_DISPLAY=" ${dim}idle ${_idle_s}s${reset}"
+        else
+            IDLE_DISPLAY=" ${dim}idle $(fmt_duration_m "$_idle_m")${reset}"
         fi
     fi
 
     # Two separate displays:
     #   TOKEN_DISPLAY      — all-time work/personal ratio (100% bar, no goal)
     #   CHALLENGE_DISPLAY  — since Mar 23 progress toward 100M goal
-    # Source: token-scan-cache.json (written by scan-tokens.py, incremental).
+    # Source: token-scan-summary.json (~200B, fast) with fallback to token-scan-cache.json (30MB+).
+    # Both written by scan-tokens.py. Summary is preferred to avoid re-parsing the big cache every render.
     SCAN_CACHE="$HOME/.claude/token-scan-cache.json"
+    SCAN_SUMMARY="$HOME/.claude/token-scan-summary.json"
     SCAN_SCRIPT="$HOME/agent-workflows/claude/scripts/scan-tokens.py"
     CHALLENGE_DISPLAY=""
 
-    # Trigger background scan if cache is stale (>60s) or missing
+    # Trigger background scan if cache is stale (>180s) or missing.
+    # Tokens don't move fast; scanner walks every JSONL so keep frequency low per terminal.
     if [ -f "$SCAN_SCRIPT" ]; then
         scan_mtime=0
         [ -f "$SCAN_CACHE" ] && scan_mtime=$(stat -f %m "$SCAN_CACHE" 2>/dev/null || stat -c %Y "$SCAN_CACHE" 2>/dev/null || echo 0)
         scan_age=$(( now - scan_mtime ))
-        if [ "$scan_age" -gt 60 ]; then
+        if [ "$scan_age" -gt 180 ]; then
             (python3 "$SCAN_SCRIPT" --quiet >/dev/null 2>&1 &) >/dev/null 2>&1
         fi
     fi
 
     G_WORK=0 G_PERSONAL=0 G_UNKNOWN=0 G_TOTAL=0
     C_WORK=0 C_PERSONAL=0 C_TOTAL=0
-    if [ -f "$SCAN_CACHE" ]; then
+    scan_src=""
+    [ -f "$SCAN_SUMMARY" ] && scan_src="$SCAN_SUMMARY"
+    [ -z "$scan_src" ] && [ -f "$SCAN_CACHE" ] && scan_src="$SCAN_CACHE"
+    if [ -n "$scan_src" ]; then
         eval "$(jq -r '
             "G_WORK=" + (.global.work_tokens // 0 | tostring),
             "G_PERSONAL=" + (.global.personal_tokens // 0 | tostring),
@@ -426,18 +421,15 @@ with open(stats_path, 'w') as f: json.dump(stats, f, indent=2)
             "C_WORK=" + (.challenge.work_tokens // 0 | tostring),
             "C_PERSONAL=" + (.challenge.personal_tokens // 0 | tostring),
             "C_TOTAL=" + (.challenge.total_tokens // 0 | tostring)
-        ' "$SCAN_CACHE" 2>/dev/null)"
+        ' "$scan_src" 2>/dev/null)"
     fi
 
-    # Daily ledger + session delta (shared by both displays)
+    # Daily ledger + session delta (shared by both displays).
+    # update_ledger emits both totals — no follow-up jq read needed.
     DAILY_TOKEN_LEDGER="$HOME/.claude/daily-tokens.json"
     update_ledger "$DAILY_TOKEN_LEDGER" "$SESSION_ID" "$SESSION_TOKENS" "$TODAY" "$ACCT_TAG"
     DAILY_TOKENS="${LEDGER_RESULT:-0}"
-    SESSION_DELTA=0
-    if [ -f "$DAILY_TOKEN_LEDGER" ]; then
-        SESSION_DELTA=$(jq --arg sid "$SESSION_ID" '(.sessions[$sid].current // 0) - (.sessions[$sid].baseline // 0)' "$DAILY_TOKEN_LEDGER" 2>/dev/null)
-        [ -z "$SESSION_DELTA" ] && SESSION_DELTA=0
-    fi
+    SESSION_DELTA="${LEDGER_SESSION_DELTA:-0}"
     SESSION_TOKEN_FMT=$(awk "BEGIN {
         t=$SESSION_DELTA;
         if (t >= 1000000) printf \"%.1fM\", t/1000000;
@@ -460,51 +452,30 @@ with open(stats_path, 'w') as f: json.dump(stats, f, indent=2)
     fi
 
     # ── Global display: 100% ratio bar (work vs personal, all-time) ──
+    # Empty slots use "●" (filled, dim) so bar is always 100% full — it's a ratio, not progress.
     if [ "$G_TOTAL" -gt 0 ] 2>/dev/null; then
-        BAR_WIDTH=10
-        G_WORK_PCT=$(awk "BEGIN {printf \"%.0f\", $G_WORK * 100 / $G_TOTAL}")
-        G_PERSONAL_PCT=$(awk "BEGIN {printf \"%.0f\", $G_PERSONAL * 100 / $G_TOTAL}")
-        G_WORK_DOTS=$(( G_WORK_PCT * BAR_WIDTH / 100 ))
-        G_PERSONAL_DOTS=$(( G_PERSONAL_PCT * BAR_WIDTH / 100 ))
-        [ $((G_WORK_DOTS + G_PERSONAL_DOTS)) -gt "$BAR_WIDTH" ] && G_PERSONAL_DOTS=$((BAR_WIDTH - G_WORK_DOTS))
-        G_EMPTY_DOTS=$((BAR_WIDTH - G_WORK_DOTS - G_PERSONAL_DOTS))
-        [ "$G_EMPTY_DOTS" -lt 0 ] && G_EMPTY_DOTS=0
-        G_WORK_STR="" G_PERSONAL_STR="" G_EMPTY_STR=""
-        for ((i=0; i<G_WORK_DOTS; i++)); do G_WORK_STR+="●"; done
-        for ((i=0; i<G_PERSONAL_DOTS; i++)); do G_PERSONAL_STR+="●"; done
-        for ((i=0; i<G_EMPTY_DOTS; i++)); do G_EMPTY_STR+="●"; done
-        G_BAR="${cyan}${G_WORK_STR}${magenta}${G_PERSONAL_STR}${dim}${G_EMPTY_STR}${reset}"
-
-        G_WORK_M=$(awk "BEGIN {printf \"%.2f\", $G_WORK / 1000000}")
-        G_PERSONAL_M=$(awk "BEGIN {printf \"%.2f\", $G_PERSONAL / 1000000}")
-        G_TOTAL_M=$(awk "BEGIN {printf \"%.2f\", $G_TOTAL / 1000000}")
+        # One awk call emits all 5 values — saves 4 subprocess spawns.
+        eval "$(awk -v w="$G_WORK" -v p="$G_PERSONAL" -v t="$G_TOTAL" 'BEGIN {
+            printf "G_WORK_PCT=%.0f\nG_PERSONAL_PCT=%.0f\nG_WORK_M=%.2f\nG_PERSONAL_M=%.2f\nG_TOTAL_M=%.2f\n",
+                w*100/t, p*100/t, w/1e6, p/1e6, t/1e6
+        }')"
+        G_BAR=$(build_ratio_bar "$G_WORK_PCT" "$G_PERSONAL_PCT" 10 "●")
         TOKEN_DISPLAY="${G_BAR} ${cyan}${G_WORK_PCT}%w${reset}${dim}/${reset}${magenta}${G_PERSONAL_PCT}%p${reset} ${dim}(${reset}${cyan}${G_WORK_M}w${reset}${dim}+${reset}${magenta}${G_PERSONAL_M}p${reset}${dim}=${reset}${G_TOTAL_M}M${dim})${reset}"
     fi
 
     # ── Challenge display: progress toward goal (opt-in via config) ──
     # Only renders when CHALLENGE_GOAL_M is set in ~/.claude/statusline.conf.
+    # Empty slots use "○" because the bar represents progress toward a goal.
     if [ "$C_TOTAL" -gt 0 ] 2>/dev/null && [ "$CHALLENGE_GOAL_M" -gt 0 ] 2>/dev/null; then
         GOAL_M="$CHALLENGE_GOAL_M"
-        C_PCT=$(awk "BEGIN {printf \"%.0f\", $C_TOTAL / (${GOAL_M} * 10000)}")
+        # One awk call emits all 6 values — saves 5 subprocess spawns.
+        eval "$(awk -v w="$C_WORK" -v p="$C_PERSONAL" -v t="$C_TOTAL" -v g="$GOAL_M" 'BEGIN {
+            printf "C_PCT=%.0f\nC_WORK_PCT=%.0f\nC_PERSONAL_PCT=%.0f\nC_WORK_M=%.2f\nC_PERSONAL_M=%.2f\nC_TOTAL_M=%.2f\n",
+                t/(g*10000), w/(g*10000), p/(g*10000), w/1e6, p/1e6, t/1e6
+        }')"
         [ "$C_PCT" -gt 100 ] 2>/dev/null && C_PCT=100
+        C_BAR=$(build_ratio_bar "$C_WORK_PCT" "$C_PERSONAL_PCT" 10 "○")
 
-        BAR_WIDTH=10
-        C_WORK_PCT=$(awk "BEGIN {printf \"%.0f\", $C_WORK / (${GOAL_M} * 10000)}")
-        C_PERSONAL_PCT=$(awk "BEGIN {printf \"%.0f\", $C_PERSONAL / (${GOAL_M} * 10000)}")
-        C_WORK_DOTS=$(( C_WORK_PCT * BAR_WIDTH / 100 ))
-        C_PERSONAL_DOTS=$(( C_PERSONAL_PCT * BAR_WIDTH / 100 ))
-        [ $((C_WORK_DOTS + C_PERSONAL_DOTS)) -gt "$BAR_WIDTH" ] && C_PERSONAL_DOTS=$((BAR_WIDTH - C_WORK_DOTS))
-        C_EMPTY_DOTS=$((BAR_WIDTH - C_WORK_DOTS - C_PERSONAL_DOTS))
-        [ "$C_EMPTY_DOTS" -lt 0 ] && C_EMPTY_DOTS=0
-        C_WORK_STR="" C_PERSONAL_STR="" C_EMPTY_STR=""
-        for ((i=0; i<C_WORK_DOTS; i++)); do C_WORK_STR+="●"; done
-        for ((i=0; i<C_PERSONAL_DOTS; i++)); do C_PERSONAL_STR+="●"; done
-        for ((i=0; i<C_EMPTY_DOTS; i++)); do C_EMPTY_STR+="○"; done
-        C_BAR="${cyan}${C_WORK_STR}${magenta}${C_PERSONAL_STR}${dim}${C_EMPTY_STR}${reset}"
-
-        C_WORK_M=$(awk "BEGIN {printf \"%.2f\", $C_WORK / 1000000}")
-        C_PERSONAL_M=$(awk "BEGIN {printf \"%.2f\", $C_PERSONAL / 1000000}")
-        C_TOTAL_M=$(awk "BEGIN {printf \"%.2f\", $C_TOTAL / 1000000}")
         C_PCT_COLOR=$(color_for_pct "$C_PCT")
         CHALLENGE_DISPLAY="${C_BAR} ${C_PCT_COLOR}$(printf "%3d" "$C_PCT")%${reset} ${dim}(${reset}${cyan}${C_WORK_M}w${reset}${dim}+${reset}${magenta}${C_PERSONAL_M}p${reset}${dim}=${reset}${C_TOTAL_M}M${dim})/${GOAL_M}M${reset}${SHARED_SUFFIX}"
     fi
@@ -829,10 +800,11 @@ if $needs_refresh || $needs_profile_refresh; then
                         # Save previous poll for interpolation
                         if [ -f "$cache_file" ]; then
                             prev_ts=$(stat -f %m "$cache_file" 2>/dev/null || stat -c %Y "$cache_file" 2>/dev/null)
-                            prev_5h=$(jq -r '.five_hour.utilization // 0' "$cache_file" 2>/dev/null)
-                            prev_7d=$(jq -r '.seven_day.utilization // 0' "$cache_file" 2>/dev/null)
-                            prev_extra=$(jq -r '.extra_usage.used_credits // 0' "$cache_file" 2>/dev/null)
-                            printf '{"ts":%s,"five_hour":%s,"seven_day":%s,"extra_used":%s}' "$prev_ts" "$prev_5h" "$prev_7d" "$prev_extra" > "/tmp/claude/statusline-usage-prev.json"
+                            # One jq to pull all three values — saves 2 subprocess spawns per render.
+                            eval "$(jq -r '"prev_5h=" + (.five_hour.utilization // 0 | tostring),
+                                           "prev_7d=" + (.seven_day.utilization // 0 | tostring),
+                                           "prev_extra=" + (.extra_usage.used_credits // 0 | tostring)' "$cache_file" 2>/dev/null)"
+                            printf '{"ts":%s,"five_hour":%s,"seven_day":%s,"extra_used":%s}' "$prev_ts" "${prev_5h:-0}" "${prev_7d:-0}" "${prev_extra:-0}" > "/tmp/claude/statusline-usage-prev.json"
                         fi
                         echo "$response" > "$cache_file"
                     fi
@@ -857,8 +829,6 @@ fi
 # Always read from cache (may be stale by one cycle — imperceptible)
 usage_data=""
 [ -f "$cache_file" ] && usage_data=$(cat "$cache_file" 2>/dev/null)
-profile_data=""
-[ -f "$profile_cache_file" ] && profile_data=$(cat "$profile_cache_file" 2>/dev/null)
 
 # ── Account label (colorize ACCT_TAG resolved earlier) ──
 ACCOUNT_LABEL=""
@@ -893,9 +863,11 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
     prev_poll_file="/tmp/claude/statusline-usage-prev.json"
     if [ -f "$prev_poll_file" ] && [ -f "$cache_file" ]; then
         poll_ts=$(stat -f %m "$cache_file" 2>/dev/null || stat -c %Y "$cache_file" 2>/dev/null)
-        prev_ts=$(jq -r '.ts // 0' "$prev_poll_file" 2>/dev/null)
-        prev_5h=$(jq -r '.five_hour // 0' "$prev_poll_file" 2>/dev/null)
-        prev_7d=$(jq -r '.seven_day // 0' "$prev_poll_file" 2>/dev/null)
+        # One jq pull — saves 2 spawns per render.
+        eval "$(jq -r '"prev_ts=" + (.ts // 0 | tostring),
+                       "prev_5h=" + (.five_hour // 0 | tostring),
+                       "prev_7d=" + (.seven_day // 0 | tostring)' "$prev_poll_file" 2>/dev/null)"
+        : "${prev_ts:=0}" "${prev_5h:=0}" "${prev_7d:=0}"
         interp_now=$(date +%s)
         poll_interval=$(( poll_ts - prev_ts ))
         secs_since_poll=$(( interp_now - poll_ts ))
@@ -939,11 +911,7 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
             countdown_secs=$(( countdown_epoch - countdown_now ))
             [ "$countdown_secs" -lt 0 ] && countdown_secs=0
             countdown_mins=$(( countdown_secs / 60 ))
-            if [ "$countdown_mins" -ge 60 ] 2>/dev/null; then
-                countdown_display=$(awk "BEGIN { printf \"%.1fh\", $countdown_mins / 60 }")
-            else
-                countdown_display="${countdown_mins}m"
-            fi
+            countdown_display=$(fmt_duration_m "$countdown_mins")
             rate_lines+=" ${red}resets ${countdown_display}${reset}"
         fi
     fi
@@ -977,31 +945,17 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
                         [ "$mins_to_full" -le 30 ] && bd_color="$yellow"
                         [ "$mins_to_full" -le 15 ] && bd_color="$red"
 
-                        if [ "$mins_to_full" -ge 60 ] 2>/dev/null; then
-                            full_display=$(awk "BEGIN { printf \"%.1fh\", $mins_to_full / 60 }")
-                        else
-                            full_display="${mins_to_full}m"
-                        fi
+                        full_display=$(fmt_duration_m "$mins_to_full")
                         rate_lines+=" ${bd_color}→full ~${full_display}${reset}"
 
                         # Survive indicator: buffer or downtime until window resets
                         mins_to_reset=$(( secs_to_reset / 60 ))
                         if [ "$mins_to_reset" -gt 0 ] 2>/dev/null; then
                             if [ "$mins_to_full" -gt "$mins_to_reset" ] 2>/dev/null; then
-                                buffer=$(( mins_to_full - mins_to_reset ))
-                                if [ "$buffer" -ge 60 ] 2>/dev/null; then
-                                    buf_display=$(awk "BEGIN { printf \"%.1fh\", $buffer / 60 }")
-                                else
-                                    buf_display="${buffer}m"
-                                fi
+                                buf_display=$(fmt_duration_m $(( mins_to_full - mins_to_reset )))
                                 rate_lines+=" ${green}✓${buf_display}${reset}"
                             else
-                                downtime=$(( mins_to_reset - mins_to_full ))
-                                if [ "$downtime" -ge 60 ] 2>/dev/null; then
-                                    dt_display=$(awk "BEGIN { printf \"%.1fh\", $downtime / 60 }")
-                                else
-                                    dt_display="${downtime}m"
-                                fi
+                                dt_display=$(fmt_duration_m $(( mins_to_reset - mins_to_full )))
                                 rate_lines+=" ${red}✗${dt_display}${reset}"
                             fi
                         fi
@@ -1040,13 +994,8 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
                         else print 999
                     }")
                     hrs_to_reset=$(awk "BEGIN { printf \"%.1f\", $weekly_secs_to_reset / 3600 }")
-
-                    # Display as days if > 48h, otherwise hours
-                    display_to_full=$(awk "BEGIN {
-                        h = $hrs_to_full;
-                        if (h >= 48) printf \"%.1fd\", h / 24;
-                        else printf \"%.0fh\", h
-                    }")
+                    mins_to_full_weekly=$(awk "BEGIN { printf \"%.0f\", $hrs_to_full * 60 }")
+                    display_to_full=$(fmt_duration_m "$mins_to_full_weekly")
 
                     # Only show if projection is within the window (< 7 days)
                     if awk "BEGIN { exit ($hrs_to_full < 168) ? 0 : 1 }" 2>/dev/null; then
@@ -1057,26 +1006,12 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
                         rate_lines+=" ${wd_color}→full ~${display_to_full}${reset}"
 
                         # Survive indicator: buffer or downtime
-                        weekly_gap=$(awk "BEGIN { printf \"%.1f\", $hrs_to_full - $hrs_to_reset }")
+                        weekly_gap_mins=$(awk "BEGIN { printf \"%.0f\", ($hrs_to_full - $hrs_to_reset) * 60 }")
                         if awk "BEGIN { exit ($hrs_to_full > $hrs_to_reset) ? 0 : 1 }" 2>/dev/null; then
-                            # Buffer — format as days if >= 48h
-                            weekly_buf_display=$(awk "BEGIN {
-                                h = $weekly_gap;
-                                if (h < 0) h = -h;
-                                if (h >= 48) printf \"%.1fd\", h / 24;
-                                else if (h >= 1) printf \"%.0fh\", h;
-                                else printf \"%.0fm\", h * 60
-                            }")
+                            weekly_buf_display=$(fmt_duration_m "$weekly_gap_mins")
                             rate_lines+=" ${green}✓${weekly_buf_display}${reset}"
                         else
-                            # Downtime
-                            weekly_dt_display=$(awk "BEGIN {
-                                h = $weekly_gap;
-                                if (h < 0) h = -h;
-                                if (h >= 48) printf \"%.1fd\", h / 24;
-                                else if (h >= 1) printf \"%.0fh\", h;
-                                else printf \"%.0fm\", h * 60
-                            }")
+                            weekly_dt_display=$(fmt_duration_m "$weekly_gap_mins")
                             rate_lines+=" ${red}✗${weekly_dt_display}${reset}"
                         fi
                     fi
@@ -1105,8 +1040,10 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
                 [ "$proj_secs_to_reset" -lt 0 ] && proj_secs_to_reset=0
 
                 proj_poll_ts=$(stat -f %m "$cache_file" 2>/dev/null || stat -c %Y "$cache_file" 2>/dev/null)
-                proj_prev_ts=$(jq -r '.ts // 0' "$prev_poll_file" 2>/dev/null)
-                proj_prev_extra=$(jq -r '.extra_used // 0' "$prev_poll_file" 2>/dev/null)
+                # One jq pull — saves 1 spawn per render.
+                eval "$(jq -r '"proj_prev_ts=" + (.ts // 0 | tostring),
+                               "proj_prev_extra=" + (.extra_used // 0 | tostring)' "$prev_poll_file" 2>/dev/null)"
+                : "${proj_prev_ts:=0}" "${proj_prev_extra:=0}"
                 proj_poll_interval=$(( proj_poll_ts - proj_prev_ts ))
 
                 if [ "$proj_poll_interval" -gt 10 ] 2>/dev/null; then
@@ -1195,14 +1132,14 @@ render_default() {
         line1="${blue}${MODEL}${reset}${EFFORT}${FAST_MODE}"
         [ -n "$ACCOUNT_LABEL" ] && line1+="${sep}${ACCOUNT_LABEL}"
         line1+="${sep}${cyan}${DIR_NAME}${reset}${SHORT_GIT_INFO}"
-        line1+="${sep}${magenta}\$${COST_FMT}${reset}${DAILY_SUFFIX}${BURN_RATE}"
-        [ -n "$SESSION_TIME" ] && line1+="${sep}${dim}⏱${reset} ${white}${SESSION_TIME}${reset}"
+        line1+="${sep}${magenta}\$${COST_FMT}${reset}${DAILY_SUFFIX}${BURN_RATE}${BILLABLE}"
+        [ -n "$SESSION_TIME" ] && line1+="${sep}${dim}⏱${reset} ${white}${SESSION_TIME}${reset}${IDLE_DISPLAY}"
         line1+="${CTX_BADGE}${FOCUS}"
     else
         line1="${blue}${MODEL}${reset}${EFFORT}${FAST_MODE}"
         [ -n "$ACCOUNT_LABEL" ] && line1+="${sep}${ACCOUNT_LABEL}"
         [ -n "$TINY_GIT_INFO" ] && line1+="${sep}${TINY_GIT_INFO}"
-        line1+="${sep}${magenta}\$${COST_FMT}${reset}${DAILY_SUFFIX}"
+        line1+="${sep}${magenta}\$${COST_FMT}${reset}${DAILY_SUFFIX}${BILLABLE}"
         line1+="${CTX_BADGE}${FOCUS}"
     fi
 
