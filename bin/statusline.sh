@@ -1078,7 +1078,14 @@ if [ "$DAILY_BUDGET" -gt 0 ] 2>/dev/null; then
 fi
 
 # ── Terminal width detection ──────────────────────────────
-COLS=$(tput cols 2>/dev/null || echo 120)
+# Under Claude Code the statusline runs in a non-TTY subprocess; tput cols
+# returns a misleading default of 80 regardless of the real terminal width.
+# Only trust tput when stdout is an actual TTY; otherwise assume wide (120).
+if [ -t 1 ]; then
+    COLS=$(tput cols 2>/dev/null || echo 120)
+else
+    COLS=120
+fi
 
 # ── Branch name compression ──────────────────────────────
 SHORT_GIT_INFO="$GIT_INFO"
