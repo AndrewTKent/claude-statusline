@@ -72,6 +72,20 @@ pad_right() {
     printf "%s%*s" "$text" "$n" ""
 }
 
+# fmt_pct VAL — format VAL as a 6-char left-aligned pct (including the "%" sign):
+#   99.0   →   "99%   "  (trailing zeros stripped; API only gives 1-dec precision)
+#   99.5   →   "99.5% "
+#   38.28  →   "38.28%"  (interpolation gave us genuine 2-dec precision)
+#   100    →   "100%  "
+# Shows precision the value actually has, no fake trailing zeros.
+fmt_pct() {
+    awk -v v="$1" 'BEGIN {
+        s = sprintf("%.2f", v)
+        if (s ~ /\./) { sub(/0+$/, "", s); sub(/\.$/, "", s) }
+        printf "%-6s", s "%"
+    }'
+}
+
 # secs_since_last_user SID CWD — seconds since the last user-role message in the
 # session JSONL. Bounded tail scan (last 200 lines). Empty if no match.
 secs_since_last_user() {
@@ -917,7 +931,7 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
 
     # Pct padded to 9 cols (6 for "85.7%" + 3 trailing) so reset/dollars/breakdown
     # all start at the same column across rate rows AND token rows.
-    rate_lines+="${white}$(printf "%-7s" "current")${reset} ${five_hour_bar} ${five_hour_pct_color}$(printf "%6.2f" "$five_hour_pct_display")%  ${reset}"
+    rate_lines+="${white}$(printf "%-7s" "current")${reset} ${five_hour_bar} ${five_hour_pct_color}$(fmt_pct "$five_hour_pct_display")${reset}   "
     # Reset-time padded to 15 so "→full ..." lines up across current / weekly.
     if [ -n "$five_hour_reset" ]; then
         rate_lines+=" ${white}$(pad_right "$five_hour_reset" 15)${reset}"
@@ -993,7 +1007,7 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
     seven_day_bar=$(build_bar "$seven_day_pct" "$bar_width")
     seven_day_pct_color=$(color_for_pct "$seven_day_pct")
 
-    rate_lines+="\n${white}$(printf "%-7s" "weekly")${reset} ${seven_day_bar} ${seven_day_pct_color}$(printf "%6.2f" "$seven_day_pct_display")%  ${reset}"
+    rate_lines+="\n${white}$(printf "%-7s" "weekly")${reset} ${seven_day_bar} ${seven_day_pct_color}$(fmt_pct "$seven_day_pct_display")${reset}   "
     if [ -n "$seven_day_reset" ]; then
         rate_lines+=" ${white}$(pad_right "$seven_day_reset" 15)${reset}"
     else
@@ -1056,7 +1070,7 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
         extra_bar=$(build_bar "$extra_pct" "$bar_width")
         extra_pct_color=$(color_for_pct "$extra_pct")
 
-        rate_lines+="\n${white}$(printf "%-7s" "extra")${reset} ${extra_bar} ${extra_pct_color}$(printf "%6.2f" "$extra_pct_display")%  ${reset} ${white}\$${extra_used}${dim}/${reset}${white}\$${extra_limit}${reset}"
+        rate_lines+="\n${white}$(printf "%-7s" "extra")${reset} ${extra_bar} ${extra_pct_color}$(fmt_pct "$extra_pct_display")${reset}    ${white}\$${extra_used}${dim}/${reset}${white}\$${extra_limit}${reset}"
 
         # Project extra $ spend until current window resets (only when at 100% current)
         if [ "$five_hour_pct" -ge 100 ] 2>/dev/null && [ -f "$prev_poll_file" ] && [ -n "$five_hour_reset_iso" ]; then
