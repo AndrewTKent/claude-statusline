@@ -1135,13 +1135,17 @@ fi
 
 # ── Render: default (multi-line) ──────────────────────────
 render_default() {
+    line1b=""
     if [ "$COLS" -ge 100 ]; then
+        # Row 1: identity (model, account, dir+git, ctx badge, focus).
         line1="${blue}${MODEL}${reset}${EFFORT}${FAST_MODE}"
         [ -n "$ACCOUNT_LABEL" ] && line1+="${sep}${ACCOUNT_LABEL}"
         line1+="${sep}${cyan}${DIR_NAME}${reset}${SHORT_GIT_INFO}"
-        line1+="${sep}${magenta}\$${COST_FMT}${reset}${DAILY_SUFFIX}${BURN_RATE}${BILLABLE}"
-        [ -n "$SESSION_TIME" ] && line1+="${sep}${dim}⏱${reset} ${white}${SESSION_TIME}${reset}${IDLE_DISPLAY}"
         line1+="${CTX_BADGE}${FOCUS}"
+        # Row 2: state (cost + burn + billable + timer + idle). Split so the
+        # header doesn't get truncated by Claude Code's status area width.
+        line1b="${magenta}\$${COST_FMT}${reset}${DAILY_SUFFIX}${BURN_RATE}${BILLABLE}"
+        [ -n "$SESSION_TIME" ] && line1b+="${sep}${dim}⏱${reset} ${white}${SESSION_TIME}${reset}${IDLE_DISPLAY}"
     else
         line1="${blue}${MODEL}${reset}${EFFORT}${FAST_MODE}"
         [ -n "$ACCOUNT_LABEL" ] && line1+="${sep}${ACCOUNT_LABEL}"
@@ -1151,6 +1155,7 @@ render_default() {
     fi
 
     printf "%b\n" "$line1"
+    [ -n "$line1b" ] && printf "%b\n" "$line1b"
 
     # Detail lines (dimmer for visual hierarchy)
     ctx_line="${dim}${white}$(printf "%-7s" "context")${reset} ${CTX_BAR} ${CTX_COLOR}$(printf "%3d" "$CONTEXT_INT")%${reset}"
