@@ -1185,7 +1185,7 @@ render_default() {
     [ -n "$line1b" ] && printf "%b\n" "$line1b"
 
     # Detail lines (dimmer for visual hierarchy)
-    ctx_line="${dim}${white}$(printf "%-7s" "context")${reset} ${CTX_BAR} ${CTX_COLOR}$(printf "%3d" "$CONTEXT_INT")%${reset}"
+    ctx_line="${white}$(printf "%-7s" "context")${reset} ${CTX_BAR} ${CTX_COLOR}$(printf "%3d" "$CONTEXT_INT")%${reset}"
     printf "\n%b" "$ctx_line"
     [ -n "$rate_lines" ] && printf "\n%b" "$rate_lines"
     [ -n "$BUDGET_DISPLAY" ] && printf "\n%b" "$BUDGET_DISPLAY"
