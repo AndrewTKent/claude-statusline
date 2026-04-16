@@ -63,6 +63,15 @@ fmt_duration_m() {
     }"
 }
 
+# pad_right TEXT WIDTH — print TEXT then trailing spaces so total visible width is WIDTH.
+# Bash's ${#var} counts characters (not bytes) under UTF-8 locales, so unicode like "→" counts as 1.
+pad_right() {
+    local text="$1" width=$2
+    local n=$(( width - ${#text} ))
+    [ "$n" -lt 0 ] && n=0
+    printf "%s%*s" "$text" "$n" ""
+}
+
 # secs_since_last_user SID CWD — seconds since the last user-role message in the
 # session JSONL. Bounded tail scan (last 200 lines). Empty if no match.
 secs_since_last_user() {
@@ -460,7 +469,11 @@ if [ -n "$SESSION_ID" ]; then
                 w*100/t, p*100/t, w/1e6, p/1e6, t/1e6
         }')"
         G_BAR=$(build_ratio_bar "$G_WORK_PCT" "$G_PERSONAL_PCT" 10 "●")
-        TOKEN_DISPLAY="${G_BAR} ${cyan}${G_WORK_PCT}%w${reset}${dim}/${reset}${magenta}${G_PERSONAL_PCT}%p${reset} ${dim}(${reset}${cyan}${G_WORK_M}w${reset}${dim}+${reset}${magenta}${G_PERSONAL_M}p${reset}${dim}=${reset}${G_TOTAL_M}M${dim})${reset}"
+        # %2d pct parts so the compound is always 9 chars ("84%w/13%p" or " 5%w/95%p").
+        # Matches 100m's padded pct width below, so (breakdown) aligns across both rows.
+        gw=$(printf "%2d" "$G_WORK_PCT")
+        gp=$(printf "%2d" "$G_PERSONAL_PCT")
+        TOKEN_DISPLAY="${G_BAR} ${cyan}${gw}%w${reset}${dim}/${reset}${magenta}${gp}%p${reset} ${dim}(${reset}${cyan}${G_WORK_M}w${reset}${dim}+${reset}${magenta}${G_PERSONAL_M}p${reset}${dim}=${reset}${G_TOTAL_M}M${dim})${reset}"
     fi
 
     # ── Challenge display: progress toward goal (opt-in via config) ──
@@ -477,7 +490,9 @@ if [ -n "$SESSION_ID" ]; then
         C_BAR=$(build_ratio_bar "$C_WORK_PCT" "$C_PERSONAL_PCT" 10 "○")
 
         C_PCT_COLOR=$(color_for_pct "$C_PCT")
-        CHALLENGE_DISPLAY="${C_BAR} ${C_PCT_COLOR}$(printf "%3d" "$C_PCT")%${reset} ${dim}(${reset}${cyan}${C_WORK_M}w${reset}${dim}+${reset}${magenta}${C_PERSONAL_M}p${reset}${dim}=${reset}${C_TOTAL_M}M${dim})/${GOAL_M}M${reset}${SHARED_SUFFIX}"
+        # Pad pct to 9 cols so (breakdown) starts at the same column as tokens row.
+        c_pct_padded=$(pad_right "$(printf "%3d%%" "$C_PCT")" 9)
+        CHALLENGE_DISPLAY="${C_BAR} ${C_PCT_COLOR}${c_pct_padded}${reset} ${dim}(${reset}${cyan}${C_WORK_M}w${reset}${dim}+${reset}${magenta}${C_PERSONAL_M}p${reset}${dim}=${reset}${C_TOTAL_M}M${dim})/${GOAL_M}M${reset}${SHARED_SUFFIX}"
     fi
 fi
 
@@ -900,8 +915,15 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
     five_hour_bar=$(build_bar "$five_hour_pct" "$bar_width")
     five_hour_pct_color=$(color_for_pct "$five_hour_pct")
 
-    rate_lines+="${white}$(printf "%-7s" "current")${reset} ${five_hour_bar} ${five_hour_pct_color}$(printf "%5.1f" "$five_hour_pct_display")%${reset}"
-    [ -n "$five_hour_reset" ] && rate_lines+=" ${white}${five_hour_reset}${reset}"
+    # Pct padded to 9 cols (6 for "85.7%" + 3 trailing) so reset/dollars/breakdown
+    # all start at the same column across rate rows AND token rows.
+    rate_lines+="${white}$(printf "%-7s" "current")${reset} ${five_hour_bar} ${five_hour_pct_color}$(printf "%5.1f" "$five_hour_pct_display")%   ${reset}"
+    # Reset-time padded to 15 so "→full ..." lines up across current / weekly.
+    if [ -n "$five_hour_reset" ]; then
+        rate_lines+=" ${white}$(pad_right "$five_hour_reset" 15)${reset}"
+    else
+        rate_lines+=" $(printf '%16s' '')"
+    fi
 
     # When at 100%, show countdown to reset
     if [ "$five_hour_pct" -ge 100 ] 2>/dev/null && [ -n "$five_hour_reset_iso" ]; then
@@ -946,7 +968,8 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
                         [ "$mins_to_full" -le 15 ] && bd_color="$red"
 
                         full_display=$(fmt_duration_m "$mins_to_full")
-                        rate_lines+=" ${bd_color}→full ~${full_display}${reset}"
+                        # Pad "→full ~Xm" to 11 cols so "✗buf" lines up.
+                        rate_lines+=" ${bd_color}$(pad_right "→full ~${full_display}" 11)${reset}"
 
                         # Survive indicator: buffer or downtime until window resets
                         mins_to_reset=$(( secs_to_reset / 60 ))
@@ -970,8 +993,12 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
     seven_day_bar=$(build_bar "$seven_day_pct" "$bar_width")
     seven_day_pct_color=$(color_for_pct "$seven_day_pct")
 
-    rate_lines+="\n${white}$(printf "%-7s" "weekly")${reset} ${seven_day_bar} ${seven_day_pct_color}$(printf "%5.1f" "$seven_day_pct_display")%${reset}"
-    [ -n "$seven_day_reset" ] && rate_lines+=" ${white}${seven_day_reset}${reset}"
+    rate_lines+="\n${white}$(printf "%-7s" "weekly")${reset} ${seven_day_bar} ${seven_day_pct_color}$(printf "%5.1f" "$seven_day_pct_display")%   ${reset}"
+    if [ -n "$seven_day_reset" ]; then
+        rate_lines+=" ${white}$(pad_right "$seven_day_reset" 15)${reset}"
+    else
+        rate_lines+=" $(printf '%16s' '')"
+    fi
 
     # ── Weekly burn-down projection ──────────────────
     if [ "$seven_day_pct" -gt 2 ] 2>/dev/null && [ -n "$seven_day_reset_iso" ] && [ "$seven_day_reset_iso" != "" ]; then
@@ -1003,7 +1030,7 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
                         awk "BEGIN { exit ($hrs_to_full <= 72) ? 0 : 1 }" 2>/dev/null && wd_color="$orange"
                         awk "BEGIN { exit ($hrs_to_full <= 36) ? 0 : 1 }" 2>/dev/null && wd_color="$yellow"
                         awk "BEGIN { exit ($hrs_to_full <= 12) ? 0 : 1 }" 2>/dev/null && wd_color="$red"
-                        rate_lines+=" ${wd_color}→full ~${display_to_full}${reset}"
+                        rate_lines+=" ${wd_color}$(pad_right "→full ~${display_to_full}" 11)${reset}"
 
                         # Survive indicator: buffer or downtime
                         weekly_gap_mins=$(awk "BEGIN { printf \"%.0f\", ($hrs_to_full - $hrs_to_reset) * 60 }")
@@ -1029,7 +1056,7 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
         extra_bar=$(build_bar "$extra_pct" "$bar_width")
         extra_pct_color=$(color_for_pct "$extra_pct")
 
-        rate_lines+="\n${white}$(printf "%-7s" "extra")${reset} ${extra_bar} ${extra_pct_color}$(printf "%5.1f" "$extra_pct_display")%${reset} ${white}\$${extra_used}${dim}/${reset}${white}\$${extra_limit}${reset}"
+        rate_lines+="\n${white}$(printf "%-7s" "extra")${reset} ${extra_bar} ${extra_pct_color}$(printf "%5.1f" "$extra_pct_display")%   ${reset} ${white}\$${extra_used}${dim}/${reset}${white}\$${extra_limit}${reset}"
 
         # Project extra $ spend until current window resets (only when at 100% current)
         if [ "$five_hour_pct" -ge 100 ] 2>/dev/null && [ -f "$prev_poll_file" ] && [ -n "$five_hour_reset_iso" ]; then
