@@ -1171,7 +1171,11 @@ render_default() {
         line1+="${CTX_BADGE}${FOCUS}"
         # Row 2: state (cost + burn + billable + timer + idle). Split so the
         # header doesn't get truncated by Claude Code's status area width.
-        line1b="${magenta}\$${COST_FMT}${reset}${DAILY_SUFFIX}${BURN_RATE}${BILLABLE}"
+        # Each segment is pipe-separated; vars have a leading space we strip.
+        line1b="${magenta}\$${COST_FMT}${reset}"
+        [ -n "$DAILY_SUFFIX" ] && line1b+="${sep}${DAILY_SUFFIX# }"
+        [ -n "$BURN_RATE" ] && line1b+="${sep}${BURN_RATE# }"
+        [ -n "$BILLABLE" ] && line1b+="${sep}${BILLABLE# }"
         [ -n "$SESSION_TIME" ] && line1b+="${sep}${dim}⏱${reset} ${white}${SESSION_TIME}${reset}${IDLE_DISPLAY}"
     else
         line1="${blue}${MODEL}${reset}${EFFORT}${FAST_MODE}"
