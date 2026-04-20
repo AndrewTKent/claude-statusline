@@ -452,7 +452,11 @@ if [ -n "$SESSION_ID" ]; then
             "C_PERSONAL=" + (.challenge.personal_tokens // 0 | tostring),
             "C_TOTAL=" + (.challenge.total_tokens // 0 | tostring),
             "R_SESSIONS=" + (.redactions.sessions // 0 | tostring),
-            "R_RANGES=" + (.redactions.ranges // 0 | tostring)
+            "R_RANGES=" + (.redactions.ranges // 0 | tostring),
+            "BOUNTY_ETA_H=" + (.bounty.eta_hours // "" | tostring),
+            "BOUNTY_TARGET=" + (.bounty.target // 0 | tostring),
+            "BOUNTY_CLEARED=" + (.bounty.cleared // false | tostring),
+            "BOUNTY_RATE=" + (.bounty.tokens_per_min // 0 | tostring)
         ' "$scan_src" 2>/dev/null)"
     fi
 
@@ -516,6 +520,20 @@ if [ -n "$SESSION_ID" ]; then
         # Pad pct to 9 cols so (breakdown) starts at the same column as tokens row.
         c_pct_padded=$(pad_right "$(printf "%3d%%" "$C_PCT")" 9)
         CHALLENGE_DISPLAY="${C_BAR} ${C_PCT_COLOR}${c_pct_padded}${reset} ${dim}(${reset}${cyan}${C_WORK_M}w${reset}${dim}+${reset}${magenta}${C_PERSONAL_M}p${reset}${dim}=${reset}${C_TOTAL_M}M${dim})/${GOAL_M}M${reset}${SHARED_SUFFIX}"
+    fi
+
+    # ── Bounty ETA (only while un-cleared and a rate signal exists) ──
+    # Shows active-hours remaining until work tokens reach the bounty floor,
+    # using a gap-aware rate over the last 3 days (computed by scan-tokens.py).
+    BOUNTY_DISPLAY=""
+    if [ "$BOUNTY_CLEARED" = "true" ]; then
+        bounty_target_m=$(awk "BEGIN { printf \"%.0f\", $BOUNTY_TARGET/1000000 }")
+        BOUNTY_DISPLAY="${green}✓${reset} ${dim}cleared ${bounty_target_m}M${reset}"
+    elif [ -n "$BOUNTY_ETA_H" ] && [ "$BOUNTY_ETA_H" != "null" ] && [ "$BOUNTY_ETA_H" != "0" ]; then
+        bounty_target_m=$(awk "BEGIN { printf \"%.0f\", $BOUNTY_TARGET/1000000 }")
+        bounty_gap_m=$(awk "BEGIN { printf \"%.2f\", ($BOUNTY_TARGET - $C_WORK)/1000000 }")
+        bounty_rate_kh=$(awk "BEGIN { printf \"%.0f\", $BOUNTY_RATE*60/1000 }")
+        BOUNTY_DISPLAY="${cyan}→${bounty_target_m}M${reset} ${dim}~${reset}${BOUNTY_ETA_H}h ${dim}active (${reset}${bounty_gap_m}M left @ ${bounty_rate_kh}k/h${dim})${reset}"
     fi
 
     # ── Redaction indicator (only when ranges > 0) ──
@@ -1223,6 +1241,7 @@ render_default() {
     [ -n "$BUDGET_DISPLAY" ] && printf "\n%b" "$BUDGET_DISPLAY"
     [ -n "$TOKEN_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "tokens")${reset} %b" "$TOKEN_DISPLAY"
     [ -n "$CHALLENGE_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "$CHALLENGE_LABEL")${reset} %b" "$CHALLENGE_DISPLAY"
+    [ -n "$BOUNTY_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "bounty")${reset} %b" "$BOUNTY_DISPLAY"
     [ -n "$REDACT_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "redact")${reset} %b" "$REDACT_DISPLAY"
 }
 
