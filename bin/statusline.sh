@@ -202,12 +202,15 @@ update_ledger() {
 
         if [ "$ledger_date" = "$today" ]; then
             if [ -z "$has_baseline" ]; then
+                # First time seeing this session today — seed baseline from existing
+                # current (if any), so delta counts tokens from NOW forward.
+                # Preserves any prior current value already written by another code path.
                 if [ -n "$acct" ]; then
                     jq_update "$file" --arg sid "$sid" --argjson val "$value" --arg acct "$acct" \
-                        '.sessions[$sid] = {"baseline": $val, "current": $val, "acct": $acct}'
+                        '.sessions[$sid] = ((.sessions[$sid] // {}) + {"baseline": (.sessions[$sid].current // $val), "current": $val, "acct": $acct})'
                 else
                     jq_update "$file" --arg sid "$sid" --argjson val "$value" \
-                        '.sessions[$sid] = {"baseline": $val, "current": $val}'
+                        '.sessions[$sid] = ((.sessions[$sid] // {}) + {"baseline": (.sessions[$sid].current // $val), "current": $val})'
                 fi
             else
                 if [ -n "$acct" ]; then
@@ -432,6 +435,7 @@ if [ -n "$SESSION_ID" ]; then
 
     G_WORK=0 G_PERSONAL=0 G_UNKNOWN=0 G_TOTAL=0
     C_WORK=0 C_PERSONAL=0 C_TOTAL=0
+    R_SESSIONS=0 R_RANGES=0
     scan_src=""
     [ -f "$SCAN_SUMMARY" ] && scan_src="$SCAN_SUMMARY"
     [ -z "$scan_src" ] && [ -f "$SCAN_CACHE" ] && scan_src="$SCAN_CACHE"
@@ -443,7 +447,9 @@ if [ -n "$SESSION_ID" ]; then
             "G_TOTAL=" + (.global.total_tokens // 0 | tostring),
             "C_WORK=" + (.challenge.work_tokens // 0 | tostring),
             "C_PERSONAL=" + (.challenge.personal_tokens // 0 | tostring),
-            "C_TOTAL=" + (.challenge.total_tokens // 0 | tostring)
+            "C_TOTAL=" + (.challenge.total_tokens // 0 | tostring),
+            "R_SESSIONS=" + (.redactions.sessions // 0 | tostring),
+            "R_RANGES=" + (.redactions.ranges // 0 | tostring)
         ' "$scan_src" 2>/dev/null)"
     fi
 
@@ -507,6 +513,13 @@ if [ -n "$SESSION_ID" ]; then
         # Pad pct to 9 cols so (breakdown) starts at the same column as tokens row.
         c_pct_padded=$(pad_right "$(printf "%3d%%" "$C_PCT")" 9)
         CHALLENGE_DISPLAY="${C_BAR} ${C_PCT_COLOR}${c_pct_padded}${reset} ${dim}(${reset}${cyan}${C_WORK_M}w${reset}${dim}+${reset}${magenta}${C_PERSONAL_M}p${reset}${dim}=${reset}${C_TOTAL_M}M${dim})/${GOAL_M}M${reset}${SHARED_SUFFIX}"
+    fi
+
+    # ── Redaction indicator (only when ranges > 0) ──
+    # Reminds to run scan-tokens-export.py before submission.
+    REDACT_DISPLAY=""
+    if [ "$R_RANGES" -gt 0 ] 2>/dev/null; then
+        REDACT_DISPLAY="${orange}${R_RANGES}${reset} ${dim}range(s) across ${reset}${orange}${R_SESSIONS}${reset} ${dim}session(s) — review before submission${reset}"
     fi
 fi
 
@@ -1207,6 +1220,7 @@ render_default() {
     [ -n "$BUDGET_DISPLAY" ] && printf "\n%b" "$BUDGET_DISPLAY"
     [ -n "$TOKEN_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "tokens")${reset} %b" "$TOKEN_DISPLAY"
     [ -n "$CHALLENGE_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "$CHALLENGE_LABEL")${reset} %b" "$CHALLENGE_DISPLAY"
+    [ -n "$REDACT_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "redact")${reset} %b" "$REDACT_DISPLAY"
 }
 
 # ── Render: sigil (single dense line) ─────────────────────
