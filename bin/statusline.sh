@@ -222,8 +222,11 @@ update_ledger() {
                 fi
             fi
             # Single jq call emits both totals; saves the follow-up SESSION_DELTA read.
+            # Null-coalesce both .current and .baseline inside the per-session expression
+            # so a stray {current: N} entry without a baseline (legacy ledger rows) doesn't
+            # make jq throw on "number - null" and leave both vars empty.
             eval "$(jq -r --arg sid "$sid" '
-                "LEDGER_RESULT=" + ([.sessions[] | .current - .baseline] | add // 0 | tostring),
+                "LEDGER_RESULT=" + ([.sessions[] | (.current // 0) - (.baseline // 0)] | add // 0 | tostring),
                 "LEDGER_SESSION_DELTA=" + ((.sessions[$sid].current // 0) - (.sessions[$sid].baseline // 0) | tostring)
             ' "$file" 2>/dev/null)"
             [ -z "$LEDGER_RESULT" ] && LEDGER_RESULT=0
