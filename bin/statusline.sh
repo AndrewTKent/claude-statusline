@@ -25,6 +25,12 @@ CHALLENGE_START_DATE=""                 # ISO date, e.g. 2026-03-23
 CHALLENGE_LABEL="goal"
 [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
 
+# Export classifier config so scan-tokens.py (spawned in background) sees it.
+export WORK_PATHS PERSONAL_PATHS WORK_KEYWORDS PERSONAL_KEYWORDS
+export EMAIL_PAYER_MAP CHALLENGE_START BOUNTY_TARGET_TOKENS
+export BOUNTY_LOOKBACK_DAYS BOUNTY_SESSION_GAP_MIN
+export BRANCH_PREFIX_STRIP MAX_BRANCH LABEL_COLORS
+
 FOCUS_FILE="$HOME/.claude/focus"
 
 # ── True Colors (24-bit RGB) ───────────────────────────
@@ -422,7 +428,18 @@ if [ -n "$SESSION_ID" ]; then
     # Both written by scan-tokens.py. Summary is preferred to avoid re-parsing the big cache every render.
     SCAN_CACHE="$HOME/.claude/token-scan-cache.json"
     SCAN_SUMMARY="$HOME/.claude/token-scan-summary.json"
-    SCAN_SCRIPT="$HOME/agent-workflows/claude/scripts/scan-tokens.py"
+    # Resolution order:
+    #   1. $SCAN_SCRIPT env (from statusline.conf)
+    #   2. bin/scan-tokens.py next to this script (repo-local, preferred)
+    #   3. ~/agent-workflows/claude/scripts/scan-tokens.py (legacy location)
+    if [ -z "${SCAN_SCRIPT:-}" ]; then
+        _repo_scan="${BASH_SOURCE[0]%/*}/scan-tokens.py"
+        if [ -f "$_repo_scan" ]; then
+            SCAN_SCRIPT="$_repo_scan"
+        else
+            SCAN_SCRIPT="$HOME/agent-workflows/claude/scripts/scan-tokens.py"
+        fi
+    fi
     CHALLENGE_DISPLAY=""
 
     # Trigger background scan if cache is stale (>180s) or missing.
@@ -432,6 +449,7 @@ if [ -n "$SESSION_ID" ]; then
         [ -f "$SCAN_CACHE" ] && scan_mtime=$(stat -f %m "$SCAN_CACHE" 2>/dev/null || stat -c %Y "$SCAN_CACHE" 2>/dev/null || echo 0)
         scan_age=$(( now - scan_mtime ))
         if [ "$scan_age" -gt 180 ]; then
+            # Pass config vars through so the scanner can classify w/o re-sourcing.
             (python3 "$SCAN_SCRIPT" --quiet >/dev/null 2>&1 &) >/dev/null 2>&1
         fi
     fi
@@ -893,29 +911,48 @@ fi
 usage_data=""
 [ -f "$cache_file" ] && usage_data=$(cat "$cache_file" 2>/dev/null)
 
-# ── Account display — show full email with a color chosen by domain/tag ──
-# ACCT_EMAIL is the authenticated email; ACCT_TAG is the resolved label (for ledgers).
-# Color priority: explicit domain match → tag fallback → default (cyan).
+# ── Account display — show full email with a color chosen by tag ──
+# ACCT_EMAIL is the authenticated email; ACCT_TAG is its resolved label (from
+# ACCOUNT_LABELS in statusline.conf). Color is picked by tag so the config
+# controls both the tag → label mapping AND what color each tag displays as.
+#
+# Default tag → color mapping (override by setting LABEL_COLORS in config):
+#   work     cyan     (primary / pro plan)
+#   personal magenta
+#   alumni   green
+#   anything-else  orange (fallback)
+#
+# LABEL_COLORS format (space-separated pairs): "work:cyan personal:magenta alumni:green"
 ACCOUNT_LABEL=""
-if [ -n "$ACCT_EMAIL" ]; then
-    case "$ACCT_EMAIL" in
-        *@coram.ai)             ACCOUNT_LABEL="${cyan}${ACCT_EMAIL}${reset}" ;;
-        *@alumni.brown.edu)     ACCOUNT_LABEL="${green}${ACCT_EMAIL}${reset}" ;;
-        *@gmail.com)            ACCOUNT_LABEL="${magenta}${ACCT_EMAIL}${reset}" ;;
-        *)
-            case "$ACCT_TAG" in
-                work)     ACCOUNT_LABEL="${cyan}${ACCT_EMAIL}${reset}" ;;
-                personal) ACCOUNT_LABEL="${magenta}${ACCT_EMAIL}${reset}" ;;
-                *)        ACCOUNT_LABEL="${orange}${ACCT_EMAIL}${reset}" ;;
+_resolve_label_color() {
+    local tag="$1"
+    # Explicit config override
+    if [ -n "${LABEL_COLORS:-}" ]; then
+        for pair in $LABEL_COLORS; do
+            case "$pair" in
+                "${tag}:"*)
+                    local color_name="${pair#*:}"
+                    # shellcheck disable=SC2086
+                    eval "printf '%s' \"\${$color_name}\""
+                    return
+                    ;;
             esac
-            ;;
+        done
+    fi
+    # Built-in defaults
+    case "$tag" in
+        work)     printf '%s' "$cyan" ;;
+        personal) printf '%s' "$magenta" ;;
+        alumni)   printf '%s' "$green" ;;
+        *)        printf '%s' "$orange" ;;
     esac
+}
+if [ -n "$ACCT_EMAIL" ]; then
+    _label_color=$(_resolve_label_color "$ACCT_TAG")
+    ACCOUNT_LABEL="${_label_color}${ACCT_EMAIL}${reset}"
 elif [ -n "$ACCT_TAG" ]; then
-    case "$ACCT_TAG" in
-        work)     ACCOUNT_LABEL="${cyan}work${reset}" ;;
-        personal) ACCOUNT_LABEL="${magenta}personal${reset}" ;;
-        *)        ACCOUNT_LABEL="${orange}${ACCT_TAG}${reset}" ;;
-    esac
+    _label_color=$(_resolve_label_color "$ACCT_TAG")
+    ACCOUNT_LABEL="${_label_color}${ACCT_TAG}${reset}"
 fi
 
 # ── Build rate limit lines ─────────────────────────────
@@ -1178,16 +1215,45 @@ else
 fi
 
 # ── Branch name compression ──────────────────────────────
+# Long branches overflow the top row under Claude Code's status area (the
+# status area is narrower than the terminal). If the line overflows, the rest
+# of the statusline is hidden. We keep the most informative piece of the name
+# (typically a ticket id) and trim aggressively.
+#
+# Strategy:
+#   1. Strip an optional BRANCH_PREFIX_STRIP (e.g., your git username prefix).
+#   2. If the remainder looks like "<TICKET>/<slug>" (e.g. "AGI-427/foo-bar"),
+#      keep the ticket + a trimmed slug.
+#   3. Hard-cap at MAX_BRANCH chars with an ellipsis on the end.
 SHORT_GIT_INFO="$GIT_INFO"
 TINY_GIT_INFO=""
 if [ -n "$BRANCH" ]; then
     SHORT_BRANCH="$BRANCH"
-    [[ "$BRANCH" == */* ]] && SHORT_BRANCH="${BRANCH##*/}"
+    # Optional user-configured prefix strip (e.g. "andrew/" -> "").
+    if [ -n "${BRANCH_PREFIX_STRIP:-}" ]; then
+        case "$SHORT_BRANCH" in
+            "$BRANCH_PREFIX_STRIP"*) SHORT_BRANCH="${SHORT_BRANCH#$BRANCH_PREFIX_STRIP}" ;;
+        esac
+    fi
+    # If still prefixed (e.g. "feat/AGI-123/foo"), strip everything before the
+    # last slash EXCEPT when the part before the last slash looks like a ticket
+    # id (e.g. "AGI-123"). In that case keep "<ticket>/<slug>".
+    if [[ "$SHORT_BRANCH" == */* ]]; then
+        lead="${SHORT_BRANCH%/*}"
+        tail="${SHORT_BRANCH##*/}"
+        # detect ticket-like leading segment: LETTERS-DIGITS
+        if [[ "${lead##*/}" =~ ^[A-Za-z]+-[0-9]+$ ]]; then
+            SHORT_BRANCH="${lead##*/}/${tail}"
+        else
+            SHORT_BRANCH="$tail"
+        fi
+    fi
 
-    MAX_BRANCH=20
+    MAX_BRANCH="${MAX_BRANCH:-24}"
     CAPPED_BRANCH="$SHORT_BRANCH"
     if [ "${#SHORT_BRANCH}" -gt "$MAX_BRANCH" ]; then
         CAPPED_BRANCH="${SHORT_BRANCH:0:$((MAX_BRANCH-1))}…"
+        SHORT_BRANCH="$CAPPED_BRANCH"
     fi
 
     DIRTY=""
