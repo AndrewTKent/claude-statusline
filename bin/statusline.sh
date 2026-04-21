@@ -893,13 +893,28 @@ fi
 usage_data=""
 [ -f "$cache_file" ] && usage_data=$(cat "$cache_file" 2>/dev/null)
 
-# ── Account label (colorize ACCT_TAG resolved earlier) ──
+# ── Account display — show full email with a color chosen by domain/tag ──
+# ACCT_EMAIL is the authenticated email; ACCT_TAG is the resolved label (for ledgers).
+# Color priority: explicit domain match → tag fallback → default (cyan).
 ACCOUNT_LABEL=""
-if [ -n "$ACCT_TAG" ]; then
+if [ -n "$ACCT_EMAIL" ]; then
+    case "$ACCT_EMAIL" in
+        *@coram.ai)             ACCOUNT_LABEL="${cyan}${ACCT_EMAIL}${reset}" ;;
+        *@alumni.brown.edu)     ACCOUNT_LABEL="${green}${ACCT_EMAIL}${reset}" ;;
+        *@gmail.com)            ACCOUNT_LABEL="${magenta}${ACCT_EMAIL}${reset}" ;;
+        *)
+            case "$ACCT_TAG" in
+                work)     ACCOUNT_LABEL="${cyan}${ACCT_EMAIL}${reset}" ;;
+                personal) ACCOUNT_LABEL="${magenta}${ACCT_EMAIL}${reset}" ;;
+                *)        ACCOUNT_LABEL="${orange}${ACCT_EMAIL}${reset}" ;;
+            esac
+            ;;
+    esac
+elif [ -n "$ACCT_TAG" ]; then
     case "$ACCT_TAG" in
         work)     ACCOUNT_LABEL="${cyan}work${reset}" ;;
         personal) ACCOUNT_LABEL="${magenta}personal${reset}" ;;
-        *)        ACCOUNT_LABEL="${dim}${ACCT_TAG}${reset}" ;;
+        *)        ACCOUNT_LABEL="${orange}${ACCT_TAG}${reset}" ;;
     esac
 fi
 
