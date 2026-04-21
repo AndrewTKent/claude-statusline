@@ -10,5 +10,51 @@
 # Render format: default | sigil | sparkline | iterm2 | rprompt
 # FORMAT=default
 
-# Account labels: map email patterns to short names
-# ACCOUNT_LABELS="work:*@yourcompany.com personal:you@gmail.com"
+# ─── Branch display ────────────────────────────────────────────────────────
+# Long branch names overflow the status area on narrow terminals and hide
+# subsequent statusline rows. Tunable cap + optional prefix strip.
+
+# Strip a known prefix from branch names (e.g. "andrew/" or "feat/"). Leave
+# blank to disable. Applied literally (no regex).
+# BRANCH_PREFIX_STRIP="andrew/"
+
+# Max visible branch chars (including "/slug" and ellipsis). Default: 24.
+# MAX_BRANCH=24
+
+# ─── Account labels ────────────────────────────────────────────────────────
+# Map email patterns to short tag names (used by ledgers + statusline coloring).
+# Space-separated pairs. First match wins.
+# ACCOUNT_LABELS="work:*@yourcompany.com personal:you@gmail.com alumni:*@alumni.example.edu"
+
+# Tag → color mapping for the top-row email label. Tag names come from
+# ACCOUNT_LABELS. Supported colors: cyan, magenta, green, orange, yellow, blue,
+# red, white. Unmapped tags default to orange.
+# LABEL_COLORS="work:cyan personal:magenta alumni:green"
+
+# Map full email addresses → payer labels for the "payer" dimension in
+# scan-tokens.py. This shows "which plan paid" independently of "what work."
+# Tokens from emails not in this map fall into "unknown".
+# EMAIL_PAYER_MAP="work:andrew@company.com personal:me@gmail.com alumni:me@alumni.example.edu"
+
+# ─── Token classifier (optional; for scan-tokens.py) ───────────────────────
+# Classify each token request as work / personal / unknown. Independent of
+# EMAIL_PAYER_MAP — email is about payment, work-type is about what you did.
+
+# Comma-separated path substrings that signal WORK vs PERSONAL when found in
+# either the session file path or any cwd/file path used during the session.
+# Lowercase substring match.
+# WORK_PATHS="/work/company/,company-app,company-backend"
+# PERSONAL_PATHS="/personal/,/side-projects/,/trips"
+
+# Comma-separated keywords in user prompts that signal work vs personal.
+# Keyword hits weigh 3× path hits in the tie-breaker.
+# WORK_KEYWORDS="standup,eng update,customer ticket,my team"
+# PERSONAL_KEYWORDS="garmin,strava,vacation,hobby"
+
+# ─── Optional: bounty / challenge tracker ──────────────────────────────────
+# Enables a "→<target>M" ETA line in the statusline and a bounty block in the
+# summary file. Set CHALLENGE_START and BOUNTY_TARGET_TOKENS together.
+# CHALLENGE_START="2026-03-23"
+# BOUNTY_TARGET_TOKENS=40000000
+# BOUNTY_LOOKBACK_DAYS=3
+# BOUNTY_SESSION_GAP_MIN=30
