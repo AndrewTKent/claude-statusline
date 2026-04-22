@@ -909,6 +909,30 @@ if $needs_refresh || $needs_profile_refresh; then
                                     "seven_day_pct":   ($u.seven_day.utilization // 0),
                                     "last_seen":       $ts
                                 }' "$ledger_file" > "$tmp_ledger" 2>/dev/null && mv "$tmp_ledger" "$ledger_file" || rm -f "$tmp_ledger"
+
+                            # Append to history log — one JSON line per poll.
+                            # This is the dataset we'll regress (util, token_spend)
+                            # pairs against to derive the hidden per-account cap.
+                            # Cheap (~120 bytes/line, ~60 polls/hr → ~7KB/hr).
+                            # Rotate if file exceeds ~5MB (keep last ~half).
+                            hist_file="$HOME/.claude/utilization-history.jsonl"
+                            jq -c --arg e "$ledger_email" --argjson ts "$ledger_now" --argjson u "$response" -n \
+                                '{
+                                    ts: $ts,
+                                    email: $e,
+                                    five_hour_pct:   ($u.five_hour.utilization // 0),
+                                    five_hour_reset: ($u.five_hour.resets_at // null),
+                                    seven_day_pct:   ($u.seven_day.utilization // 0),
+                                    seven_day_reset: ($u.seven_day.resets_at // null),
+                                    extra_used:      ($u.extra_usage.used_credits // 0),
+                                    extra_pct:       ($u.extra_usage.utilization // 0)
+                                }' >> "$hist_file" 2>/dev/null
+                            if [ -f "$hist_file" ]; then
+                                hist_size=$(stat -f %z "$hist_file" 2>/dev/null || stat -c %s "$hist_file" 2>/dev/null || echo 0)
+                                if [ "$hist_size" -gt 5000000 ] 2>/dev/null; then
+                                    tail -c 2500000 "$hist_file" > "${hist_file}.tmp" && mv "${hist_file}.tmp" "$hist_file"
+                                fi
+                            fi
                         fi
                     fi
                 fi
