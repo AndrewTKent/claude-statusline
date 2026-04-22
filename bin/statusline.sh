@@ -1321,8 +1321,17 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 # Soonest-to-reset marker
                 marker=" "
                 [ -n "$ep" ] && [ "$ep" = "$soonest_epoch" ] && marker="${cyan}→${reset}"
-                # Utilization color
-                pct_int=$(printf "%.0f" "$pct" 2>/dev/null || echo 0)
+                # Utilization: for the CURRENT account, use the interpolated
+                # value already computed by the rate-limit block (matches the
+                # "current" row exactly). For other accounts, fall back to
+                # the ledger value (no interpolation possible — we're not
+                # logged into them).
+                if [ "$em" = "$ACCT_EMAIL" ] && [ -n "${five_hour_pct_display:-}" ]; then
+                    pct_disp="$five_hour_pct_display"
+                else
+                    pct_disp="$pct"
+                fi
+                pct_int=$(printf "%.0f" "$pct_disp" 2>/dev/null || echo 0)
                 pct_color=$(color_for_pct "$pct_int")
 
                 # Optional cap / remaining tokens estimate from derive-cap.py.

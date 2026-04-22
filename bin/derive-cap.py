@@ -161,52 +161,67 @@ def scan_window_spend(window_start: datetime, window_end: datetime,
     return dict(out)
 
 
-# Candidate formulas: (name, fn(inp, out, cr, cc))
-FORMULAS = [
-    ("in+out",          lambda i, o, cr, cc: i + o),
-    ("in+out+cr",       lambda i, o, cr, cc: i + o + cr),
-    ("in+out+cr/10",    lambda i, o, cr, cc: i + o + cr / 10),
-    ("in+out+cr+cc",    lambda i, o, cr, cc: i + o + cr + cc),
-    ("out+cr/10",       lambda i, o, cr, cc: o + cr / 10),
-    ("out+cc+cr/10",    lambda i, o, cr, cc: o + cc + cr / 10),
-    ("out*5+cr/10",     lambda i, o, cr, cc: o * 5 + cr / 10),
-]
+import numpy as np
 
 
-def fit_cap(samples: list[tuple[float, float]]) -> tuple[float, float]:
-    """samples = [(delta_util_pct, delta_effective_tokens), ...].
+def fit_linear_model(samples: list[tuple[float, int, int, int, int]]
+                     ) -> tuple[np.ndarray | None, float, int]:
+    """Fit Δutil = a·Δin + b·Δout + c·Δcr + d·Δcc via non-negative least squares.
 
-    Model: delta_util / 100 = delta_tokens / cap
-        → cap = delta_tokens / (delta_util / 100)
+    samples = [(delta_util_pct, d_inp, d_out, d_cr, d_cc), ...]
 
-    Do weighted least-squares regression through origin. Weights = delta_util
-    (larger deltas are less affected by integer-quantization noise).
+    Non-negativity constraint: token weights can't be negative (adding tokens
+    can't decrease utilization). Without this constraint, noise lets negative
+    weights absorb residuals and produce absurd caps.
 
-    Returns (cap, r_squared).
+    Returns (weights_array, r_squared, n_samples) or (None, 0, 0) if under-determined.
+    Weights are in units of %util per raw token (scale: ~1e-8 to 1e-6).
     """
-    if not samples:
-        return 0.0, 0.0
-    # y = x / cap_fraction; cap_fraction = delta_util/100 per token.
-    # Better: regress delta_tokens = cap * (delta_util/100)
-    # Let X = delta_util/100, Y = delta_tokens. Slope = cap.
-    X = [du / 100.0 for du, _ in samples]
-    Y = [dt for _, dt in samples]
-    W = [du for du, _ in samples]  # weight by util delta
+    # Need at least 4 samples for 4 unknowns. Prefer 8+ for stability.
+    if len(samples) < 4:
+        return None, 0.0, len(samples)
 
-    sum_w = sum(W)
-    if sum_w == 0:
-        return 0.0, 0.0
-    sum_wxy = sum(w * x * y for w, x, y in zip(W, X, Y))
-    sum_wxx = sum(w * x * x for w, x in zip(W, X))
-    if sum_wxx == 0:
-        return 0.0, 0.0
-    cap = sum_wxy / sum_wxx  # slope through origin (weighted)
+    Y = np.array([s[0] for s in samples], dtype=float)             # Δutil %
+    X = np.array([[s[1], s[2], s[3], s[4]] for s in samples], dtype=float)  # Δtoken counts
 
-    # R² through origin: 1 - SS_res / SS_tot_origin
-    ss_res = sum(w * (y - cap * x) ** 2 for w, x, y in zip(W, X, Y))
-    ss_tot = sum(w * y * y for w, y in zip(W, Y))
-    r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
-    return cap, max(0.0, min(1.0, r2))
+    # NNLS (non-negative least squares): scipy.optimize.nnls. If scipy isn't
+    # available, fall back to OLS and clip.
+    try:
+        from scipy.optimize import nnls
+        weights, _ = nnls(X, Y)
+    except ImportError:
+        weights, *_ = np.linalg.lstsq(X, Y, rcond=None)
+        weights = np.clip(weights, 0, None)
+
+    # R² vs the mean (not through origin — util has nonzero mean across windows)
+    pred = X @ weights
+    ss_res = float(np.sum((Y - pred) ** 2))
+    ss_tot = float(np.sum((Y - Y.mean()) ** 2))
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    return weights, max(0.0, min(1.0, r2)), len(samples)
+
+
+def cap_from_weights(weights: np.ndarray) -> tuple[int, dict]:
+    """Given weights (%util per token type), return cap + normalized formula.
+
+    Model: util_pct = sum(w_i × tokens_i); cap_i = 100 / w_i for each token type.
+    Cap is multi-dimensional. Report a "mixed cap" in each token-type dimension:
+      - at this weight, spending ONLY input tokens gives cap 100/w_in
+      - same for output, cr, cc
+
+    For a single user-friendly number, report the cap in the DOMINANT
+    observed token type — the one that contributed most to historical spend.
+    For most Claude Code users that's cache_read.
+    """
+    w_in, w_out, w_cr, w_cc = weights
+    caps = {}
+    formula_parts = []
+    for name, w in [("in", w_in), ("out", w_out), ("cr", w_cr), ("cc", w_cc)]:
+        if w > 0:
+            caps[name] = int(100.0 / w)
+            # Express as "X × type" where X is the relative weight vs output
+            formula_parts.append((name, float(w)))
+    return caps, formula_parts
 
 
 def bucket_window_tokens_by_ts(window_start: datetime, window_end: datetime
@@ -305,9 +320,10 @@ def derive_per_account() -> dict[str, dict]:
             if rdt:
                 window_reset_dt[(email, key)] = rdt
 
-    # For each window: walk consecutive poll pairs, emit (Δutil, Δtokens) per
-    # candidate formula. Skip pairs with Δutil ≤ 0 (saturated / same integer).
-    samples_per_formula: dict[str, dict[str, list[tuple[float, float]]]] = defaultdict(lambda: defaultdict(list))
+    # For each window: walk consecutive poll pairs, emit a raw
+    # (Δutil, Δin, Δout, Δcr, Δcc) observation. These become rows in a
+    # multivariate regression per email.
+    samples_per_email: dict[str, list[tuple[float, int, int, int, int]]] = defaultdict(list)
 
     for key, points in window_map.items():
         email, _ = key
@@ -321,71 +337,108 @@ def derive_per_account() -> dict[str, dict]:
             continue
 
         pts = sorted(points, key=lambda p: p[0])
-        # Walk consecutive polls
         for (t0, u0), (t1, u1) in zip(pts, pts[1:]):
             du = u1 - u0
-            if du <= 0:
-                continue
+            # Keep zero-delta pairs too — they're valid observations that
+            # token spend in that interval produced <0.5% util change. This
+            # helps pin down small weights.
             inp, out, cr, cc = tokens_in_range(events, float(t0), float(t1))
-            if inp + out + cr + cc == 0:
-                continue
-            for name, fn in FORMULAS:
-                eff = fn(inp, out, cr, cc)
-                if eff <= 0:
-                    continue
-                samples_per_formula[email][name].append((du, eff))
+            if inp + out + cr + cc == 0 and du == 0:
+                continue  # no signal at all
+            samples_per_email[email].append((du, inp, out, cr, cc))
 
-    # Require at least N=4 samples per email before emitting a cap (avoids
-    # overfitting on single-window/single-poll noise). Pick formula by R².
     MIN_SAMPLES = 4
     out = {}
-    for email, by_formula in samples_per_formula.items():
-        candidates = []
-        for name, samples in by_formula.items():
-            if len(samples) < MIN_SAMPLES:
-                continue
-            cap, r2 = fit_cap(samples)
-            if cap <= 0:
-                continue
-            candidates.append((name, cap, r2, len(samples)))
-        if not candidates:
-            # Emit a "pending" stub showing how much data we've got so far
-            for name, samples in by_formula.items():
-                cap, _ = fit_cap(samples)
-                out[email] = {
-                    "status": "insufficient_data",
-                    "n_points": len(samples),
-                    "min_required": MIN_SAMPLES,
-                    "last_updated": int(datetime.now().timestamp()),
-                }
-                break
+    for email, samples in samples_per_email.items():
+        if len(samples) < MIN_SAMPLES:
+            out[email] = {
+                "status": "insufficient_data",
+                "n_points": len(samples),
+                "min_required": MIN_SAMPLES,
+                "last_updated": int(datetime.now().timestamp()),
+            }
             continue
-        # Pick highest R²; tie-break by sample size
-        candidates.sort(key=lambda c: (c[2], c[3]), reverse=True)
-        name, cap, r2, n = candidates[0]
+
+        weights, r2, n = fit_linear_model(samples)
+        if weights is None or not np.any(weights > 0):
+            out[email] = {
+                "status": "insufficient_data",
+                "n_points": n,
+                "min_required": MIN_SAMPLES,
+                "last_updated": int(datetime.now().timestamp()),
+            }
+            continue
+
+        caps, formula = cap_from_weights(weights)
+        # Normalize weights relative to the smallest non-zero weight so the
+        # "formula" readout is interpretable (e.g., "1×in + 1×out + 0.1×cr").
+        nonzero = [w for _, w in formula if w > 0]
+        if nonzero:
+            base = min(nonzero)
+            formula_norm = {name: round(w / base, 3) for name, w in formula}
+        else:
+            formula_norm = {}
+
         out[email] = {
             "status": "ok",
-            "formula": name,
-            "cap_tokens": int(cap),
+            "weights": {
+                "in": float(weights[0]),
+                "out": float(weights[1]),
+                "cr": float(weights[2]),
+                "cc": float(weights[3]),
+            },
+            "formula_ratios": formula_norm,
+            "caps_by_token_type": caps,
             "r_squared": round(r2, 3),
             "n_points": n,
             "last_updated": int(datetime.now().timestamp()),
         }
 
-    # Enrich with "remaining" = cap × (1 - current_util / 100) where we have a cap.
+    # Enrich with current util and per-token-type remaining estimates.
+    # For each token type that has a positive weight, we know cap = 100/w.
+    # "Remaining" in that type = cap × (1 - util/100). The most informative
+    # single number to surface is the DOMINANT type (where your usage skews).
     if RESETS_FILE.exists():
         try:
             resets = json.loads(RESETS_FILE.read_text())
-            for email, rec in out.items():
-                cur = resets.get(email)
-                if not cur:
-                    continue
-                util = cur.get("five_hour_pct") or 0
-                rec["current_util"] = util
-                if rec.get("status") == "ok" and rec.get("cap_tokens"):
-                    rec["remaining_tokens_est"] = max(0, int(rec["cap_tokens"] * (1 - util / 100)))
         except (OSError, json.JSONDecodeError):
-            pass
+            resets = {}
+        for email, rec in out.items():
+            cur = resets.get(email)
+            if not cur:
+                continue
+            util = cur.get("five_hour_pct") or 0
+            rec["current_util"] = util
+            if rec.get("status") != "ok":
+                continue
+            caps = rec.get("caps_by_token_type", {})
+            rem = {}
+            for name, cap in caps.items():
+                rem[name] = max(0, int(cap * (1 - util / 100)))
+            rec["remaining_by_token_type"] = rem
+
+            # Pick "dominant" type = the one with the most weight × typical spend.
+            # Use the account's historical per-token-type spend (sum across all
+            # observations for this email) to weight importance.
+            type_totals = {"in": 0, "out": 0, "cr": 0, "cc": 0}
+            for _, i, o, r, c in samples_per_email.get(email, []):
+                type_totals["in"] += i
+                type_totals["out"] += o
+                type_totals["cr"] += r
+                type_totals["cc"] += c
+            # Dominant = argmax of (weight × observed_spend). That's the type
+            # most likely to be the binding constraint for this user.
+            dominant = None
+            best_score = -1
+            w = rec["weights"]
+            for name, total in type_totals.items():
+                score = w.get(name, 0) * total
+                if score > best_score:
+                    best_score = score
+                    dominant = name
+            rec["dominant_type"] = dominant
+            if dominant and rem.get(dominant):
+                rec["remaining_tokens_est"] = rem[dominant]
 
     return out
 
@@ -402,19 +455,27 @@ def main():
     tmp.write_text(json.dumps(caps, indent=2, sort_keys=True))
     tmp.replace(CAPS_FILE)
 
+    def fmt(n: int) -> str:
+        if n >= 1e9: return f"{n/1e9:.2f}B"
+        if n >= 1e6: return f"{n/1e6:.1f}M"
+        if n >= 1e3: return f"{n/1e3:.0f}K"
+        return str(n)
+
     if "--quiet" not in sys.argv:
         for email, rec in caps.items():
             if rec.get("status") != "ok":
                 print(f"{email:<35} (pending: {rec.get('n_points', 0)}/{rec.get('min_required', '?')} samples)")
                 continue
-            cap = rec["cap_tokens"]
-            cap_s = f"{cap/1e9:.2f}B" if cap >= 1e9 else (
-                    f"{cap/1e6:.1f}M" if cap >= 1e6 else f"{cap/1e3:.0f}K")
+            dom = rec.get("dominant_type") or "?"
             rem = rec.get("remaining_tokens_est", 0)
-            rem_s = f"{rem/1e9:.2f}B" if rem >= 1e9 else (
-                    f"{rem/1e6:.1f}M" if rem >= 1e6 else f"{rem/1e3:.0f}K")
-            print(f"{email:<35} cap≈{cap_s:>6}  remaining≈{rem_s:>6}  "
-                  f"({rec['formula']}, r²={rec['r_squared']}, n={rec['n_points']})")
+            caps_by = rec.get("caps_by_token_type", {})
+            ratios = rec.get("formula_ratios", {})
+            formula_str = " + ".join(f"{r}×{k}" for k, r in ratios.items() if r > 0)
+            caps_str = " ".join(f"{k}={fmt(v)}" for k, v in caps_by.items() if v)
+            print(f"{email:<35} remaining≈{fmt(rem):>6} {dom:<3} "
+                  f"caps: {caps_str}")
+            print(f"{'':<35}   util={rec.get('current_util','?')}%  "
+                  f"formula ~ {formula_str}  (r²={rec['r_squared']}, n={rec['n_points']})")
 
 
 if __name__ == "__main__":
