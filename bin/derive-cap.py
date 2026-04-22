@@ -108,11 +108,24 @@ def load_history() -> list[dict]:
 
 
 def window_key(reset_iso: str) -> str:
-    """Round reset ISO to the hour so microsecond jitter doesn't split windows."""
+    """Snap reset ISO to the nearest 5-hour slot so near-hour-boundary jitter
+    doesn't split a single 5h window into two keys.
+
+    The 5h reset time is fixed once a window starts, but Anthropic reports it
+    with microsecond precision that drifts by up to a second across polls.
+    When the drift crosses an hour boundary (e.g. 10:59:59.7 vs 11:00:00.1),
+    naive hour-rounding splits samples from the SAME window into two keys —
+    which cuts Δutil pairs in half and hurts the regression fit.
+
+    Solution: divide the reset epoch by 5h and round to the nearest 5h slot,
+    giving us a stable window key immune to sub-minute jitter.
+    """
     dt = parse_iso(reset_iso)
     if not dt:
         return reset_iso
-    return dt.strftime("%Y-%m-%dT%H:00")
+    slot = round(dt.timestamp() / (5 * 3600)) * (5 * 3600)
+    slot_dt = datetime.fromtimestamp(slot, tz=timezone.utc)
+    return slot_dt.strftime("%Y-%m-%dT%H:00")
 
 
 # ---------------------------------------------------------------------------
