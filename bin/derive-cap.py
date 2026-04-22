@@ -1,61 +1,83 @@
 #!/usr/bin/env python3
-"""Derive per-account 5-hour token caps from observed (util, token_spend) pairs.
+"""Derive a plan-agnostic "work unit" measure from utilization history.
 
+Model
+-----
+Anthropic's 5-hour utilization follows a single linear formula across all
+plan tiers (Pro / Max / Max-5×). Only the denominator (cap) changes by
+plan; the numerator weights on token types are universal.
+
+    util_pct = 100 × (w_in·in + w_out·out + w_cr·cr + w_cc·cc) / cap_plan
+
+So a *plan-agnostic* "work unit" is:
+
+    1 wu ≡ (1 / w_out) of the weighted numerator
+         = an output-token-equivalent
+
+We fit weights ONCE from whichever account has the most / best data
+(typically the heavy-use account), then apply those same weights to ALL
+accounts to compute per-account work-unit spend. Each account's cap in
+work units = 100 / (w_out × plan_cap_seen).
+
+Why fit once
+------------
+The weights describe Anthropic's billing formula — they don't depend on
+which account you're logged into. Fitting per account would waste light
+accounts' data (too collinear for stable NNLS), so we take the best-fit
+weights and apply them universally. Each account still gets its own cap,
+computed from its own observed (util, spend) pairs once the weights are
+known.
+
+Files
+-----
 Reads:
-  ~/.claude/utilization-history.jsonl   (appended by statusline.sh per poll)
-  ~/.claude/projects/**/*.jsonl         (for per-window token sums)
+    ~/.claude/utilization-history.jsonl
+    ~/.claude/projects/**/*.jsonl
+    ~/.claude/account-resets.json        (current util per account)
+    ~/.claude/session-accounts.json      (per-session email span)
 
 Writes:
-  ~/.claude/account-caps.json  — {email: {cap, confidence, n_points, formula, ...}}
+    ~/.claude/work-unit-weights.json     (fit weights + provenance)
+    ~/.claude/account-caps.json          (per-account work-unit caps + current spend)
 
-Method
-------
-For each account, group history entries by 5h window (keyed by five_hour_reset).
-Within a window, utilization is strictly increasing (monotonic) until reset.
-Each (util_delta, token_delta) pair between consecutive polls gives one
-observation of "Δutil for Δtokens," which is linear in the cap:
-
-    Δutil / 100 = Δtokens_effective / cap
-
-We don't yet know which tokens count — Anthropic weights input/output/cache_read
-differently. So we regress Δutil against multiple candidate "effective token"
-formulas and pick the one with the tightest fit (lowest relative residual).
-
-The OAuth utilization value is INTEGER % — ±0.5% quantization. We weight each
-observation by its Δutil (larger deltas = less quantization noise) and skip
-observations with Δutil == 0.
-
-Output
-------
-Per account:
-  {
-    "cap_tokens": int,              # best-fit 5h cap in effective tokens
-    "formula": "in+out+cr",         # which candidate won
-    "r_squared": 0.87,              # fit quality
-    "n_points": 42,                 # regression sample size
-    "remaining_tokens_est": 98_000_000,  # cap × (1 - current_util/100)
-    "last_updated": 1776838571
-  }
+Quality gates
+-------------
+- Weights marked "calibrating" until R² ≥ 0.85 and n ≥ 30.
+- Per-account caps marked "calibrating" until the source weights are "ok" AND
+  at least one window has been observed to >60% utilization on that account.
 """
 from __future__ import annotations
 
 import json
 import os
 import sys
-import math
 from pathlib import Path
 from datetime import datetime, timezone
 from collections import defaultdict
 
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_DIR", str(Path.home() / ".claude")))
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 HISTORY_FILE = CLAUDE_DIR / "utilization-history.jsonl"
+WEIGHTS_FILE = CLAUDE_DIR / "work-unit-weights.json"
 CAPS_FILE = CLAUDE_DIR / "account-caps.json"
 RESETS_FILE = CLAUDE_DIR / "account-resets.json"
 SESSION_ACCOUNTS_FILE = CLAUDE_DIR / "session-accounts.json"
 
+# Quality gates
+MIN_WEIGHT_SAMPLES = 30
+MIN_WEIGHT_R2 = 0.85
+MIN_CAP_WINDOW_UTIL = 60.0  # need a window observed near-capacity
 
-def parse_iso(s: str) -> datetime | None:
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def parse_iso(s: str | None) -> datetime | None:
     if not s:
         return None
     try:
@@ -64,10 +86,18 @@ def parse_iso(s: str) -> datetime | None:
         return None
 
 
+def fmt(n: int | float) -> str:
+    n = float(n)
+    if n >= 1e9: return f"{n/1e9:.2f}B"
+    if n >= 1e6: return f"{n/1e6:.1f}M"
+    if n >= 1e3: return f"{n/1e3:.0f}K"
+    return f"{n:.0f}"
+
+
 def load_history() -> list[dict]:
-    rows = []
     if not HISTORY_FILE.exists():
-        return rows
+        return []
+    rows = []
     with open(HISTORY_FILE) as f:
         for line in f:
             try:
@@ -77,164 +107,23 @@ def load_history() -> list[dict]:
     return rows
 
 
-def load_session_email_map() -> dict[str, list[tuple[str, str, str]]]:
-    """session-accounts.json → {sid: [(from_ts, to_ts, email), ...]}."""
-    if not SESSION_ACCOUNTS_FILE.exists():
-        return {}
-    try:
-        raw = json.loads(SESSION_ACCOUNTS_FILE.read_text())
-    except (OSError, json.JSONDecodeError):
-        return {}
-    result = {}
-    for sid, info in raw.items():
-        if not isinstance(info, dict):
-            continue
-        spans = []
-        for span in info.get("spans") or []:
-            if not isinstance(span, dict):
-                continue
-            email = (span.get("email") or "").lower()
-            spans.append((span.get("from"), span.get("to"), email))
-        if spans:
-            spans.sort(key=lambda s: s[0] or "")
-            result[sid] = spans
-    return result
+def window_key(reset_iso: str) -> str:
+    """Round reset ISO to the hour so microsecond jitter doesn't split windows."""
+    dt = parse_iso(reset_iso)
+    if not dt:
+        return reset_iso
+    return dt.strftime("%Y-%m-%dT%H:00")
 
 
-def email_for(spans: list, ts: str) -> str | None:
-    for frm, to, email in spans:
-        if frm and ts < frm:
-            continue
-        if to and ts > to:
-            continue
-        return email
-    return None
-
-
-def scan_window_spend(window_start: datetime, window_end: datetime,
-                      email_spans: dict) -> dict[str, dict[str, int]]:
-    """Walk JSONLs; return {email: {inp,out,cr,cc,reqs}} for the window."""
-    out = defaultdict(lambda: {"inp": 0, "out": 0, "cr": 0, "cc": 0, "reqs": 0})
-    start_ts = window_start.timestamp()
-    end_ts = window_end.timestamp()
-    seen = set()
-    for jf in PROJECTS_DIR.rglob("*.jsonl"):
-        try:
-            st = jf.stat()
-        except OSError:
-            continue
-        # Skip files clearly outside window (allow 1h buffer for clock skew)
-        if st.st_mtime < start_ts - 3600:
-            continue
-        sid = jf.stem
-        spans = email_spans.get(sid, [])
-        try:
-            with open(jf) as f:
-                for line in f:
-                    try:
-                        j = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    ts_str = j.get("timestamp")
-                    if not isinstance(ts_str, str):
-                        continue
-                    tsv = parse_iso(ts_str)
-                    if not tsv or not (window_start <= tsv <= window_end):
-                        continue
-                    msg = j.get("message") or {}
-                    usage = msg.get("usage") if isinstance(msg, dict) else None
-                    if not usage:
-                        continue
-                    rid = j.get("requestId") or msg.get("id")
-                    if not rid or rid in seen:
-                        continue
-                    seen.add(rid)
-                    email = email_for(spans, ts_str) or "unknown"
-                    bucket = out[email]
-                    bucket["inp"] += usage.get("input_tokens", 0) or 0
-                    bucket["out"] += usage.get("output_tokens", 0) or 0
-                    bucket["cr"] += usage.get("cache_read_input_tokens", 0) or 0
-                    bucket["cc"] += usage.get("cache_creation_input_tokens", 0) or 0
-                    bucket["reqs"] += 1
-        except OSError:
-            continue
-    return dict(out)
-
-
-import numpy as np
-
-
-def fit_linear_model(samples: list[tuple[float, int, int, int, int]]
-                     ) -> tuple[np.ndarray | None, float, int]:
-    """Fit Δutil = a·Δin + b·Δout + c·Δcr + d·Δcc via non-negative least squares.
-
-    samples = [(delta_util_pct, d_inp, d_out, d_cr, d_cc), ...]
-
-    Non-negativity constraint: token weights can't be negative (adding tokens
-    can't decrease utilization). Without this constraint, noise lets negative
-    weights absorb residuals and produce absurd caps.
-
-    Returns (weights_array, r_squared, n_samples) or (None, 0, 0) if under-determined.
-    Weights are in units of %util per raw token (scale: ~1e-8 to 1e-6).
-    """
-    # Need at least 4 samples for 4 unknowns. Prefer 8+ for stability.
-    if len(samples) < 4:
-        return None, 0.0, len(samples)
-
-    Y = np.array([s[0] for s in samples], dtype=float)             # Δutil %
-    X = np.array([[s[1], s[2], s[3], s[4]] for s in samples], dtype=float)  # Δtoken counts
-
-    # NNLS (non-negative least squares): scipy.optimize.nnls. If scipy isn't
-    # available, fall back to OLS and clip.
-    try:
-        from scipy.optimize import nnls
-        weights, _ = nnls(X, Y)
-    except ImportError:
-        weights, *_ = np.linalg.lstsq(X, Y, rcond=None)
-        weights = np.clip(weights, 0, None)
-
-    # R² vs the mean (not through origin — util has nonzero mean across windows)
-    pred = X @ weights
-    ss_res = float(np.sum((Y - pred) ** 2))
-    ss_tot = float(np.sum((Y - Y.mean()) ** 2))
-    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
-    return weights, max(0.0, min(1.0, r2)), len(samples)
-
-
-def cap_from_weights(weights: np.ndarray) -> tuple[int, dict]:
-    """Given weights (%util per token type), return cap + normalized formula.
-
-    Model: util_pct = sum(w_i × tokens_i); cap_i = 100 / w_i for each token type.
-    Cap is multi-dimensional. Report a "mixed cap" in each token-type dimension:
-      - at this weight, spending ONLY input tokens gives cap 100/w_in
-      - same for output, cr, cc
-
-    For a single user-friendly number, report the cap in the DOMINANT
-    observed token type — the one that contributed most to historical spend.
-    For most Claude Code users that's cache_read.
-    """
-    w_in, w_out, w_cr, w_cc = weights
-    caps = {}
-    formula_parts = []
-    for name, w in [("in", w_in), ("out", w_out), ("cr", w_cr), ("cc", w_cc)]:
-        if w > 0:
-            caps[name] = int(100.0 / w)
-            # Express as "X × type" where X is the relative weight vs output
-            formula_parts.append((name, float(w)))
-    return caps, formula_parts
-
-
-def bucket_window_tokens_by_ts(window_start: datetime, window_end: datetime
-                               ) -> list[tuple[float, int, int, int, int]]:
-    """Return per-request (ts_epoch, inp, out, cr, cc) in the window, sorted by ts.
-
-    This lets us compute exact (inp, out, cr, cc) sums between any two poll
-    timestamps — crucial for the Δutil / Δtokens regression within a window.
-    """
+# ---------------------------------------------------------------------------
+# Per-window token enumeration (flat event list sorted by ts)
+# ---------------------------------------------------------------------------
+def bucket_window_events(window_start: datetime, window_end: datetime
+                         ) -> list[tuple[float, int, int, int, int]]:
+    """Return (ts_epoch, inp, out, cr, cc) for every dedup'd request in window."""
     seen = set()
     events = []
     start_ts = window_start.timestamp()
-    end_ts = window_end.timestamp()
     for jf in PROJECTS_DIR.rglob("*.jsonl"):
         try:
             st = jf.stat()
@@ -287,24 +176,13 @@ def tokens_in_range(events: list, t0: float, t1: float) -> tuple[int, int, int, 
     return inp, out, cr, cc
 
 
-def derive_per_account() -> dict[str, dict]:
-    history = load_history()
-    if not history:
-        return {}
-
-    # Group history by (email, five_hour_reset_rounded_to_minute) → sorted
-    # [(ts, util)]. The reset ISO has microsecond jitter per poll that
-    # would otherwise split every poll into its own "window."
-    def window_key(reset_iso: str) -> str:
-        dt = parse_iso(reset_iso)
-        if not dt:
-            return reset_iso
-        # Round to the nearest 5-minute boundary (resets are clocked at the
-        # top of the hour ± a few seconds).
-        return dt.strftime("%Y-%m-%dT%H:00")
-
+# ---------------------------------------------------------------------------
+# Weight fit (once, across all accounts' observations)
+# ---------------------------------------------------------------------------
+def collect_samples(history: list[dict]) -> dict[str, list[tuple[float, int, int, int, int]]]:
+    """Return {email: [(Δutil, Δin, Δout, Δcr, Δcc), ...]}."""
     window_map: dict[tuple[str, str], list[tuple[int, float]]] = defaultdict(list)
-    window_reset_dt: dict[tuple[str, str], datetime] = {}
+    window_reset: dict[tuple[str, str], datetime] = {}
     for row in history:
         email = row.get("email")
         reset_iso = row.get("five_hour_reset")
@@ -312,170 +190,290 @@ def derive_per_account() -> dict[str, dict]:
         util = row.get("five_hour_pct")
         if not (email and reset_iso and ts is not None and util is not None):
             continue
-        key = window_key(reset_iso)
-        window_map[(email, key)].append((int(ts), float(util)))
-        # Track the actual reset datetime for this window (any row's is fine)
-        if (email, key) not in window_reset_dt:
-            rdt = parse_iso(reset_iso)
-            if rdt:
-                window_reset_dt[(email, key)] = rdt
+        key = (email, window_key(reset_iso))
+        window_map[key].append((int(ts), float(util)))
+        if key not in window_reset:
+            dt = parse_iso(reset_iso)
+            if dt:
+                window_reset[key] = dt
 
-    # For each window: walk consecutive poll pairs, emit a raw
-    # (Δutil, Δin, Δout, Δcr, Δcc) observation. These become rows in a
-    # multivariate regression per email.
-    samples_per_email: dict[str, list[tuple[float, int, int, int, int]]] = defaultdict(list)
-
+    samples: dict[str, list] = defaultdict(list)
     for key, points in window_map.items():
-        email, _ = key
-        reset_dt = window_reset_dt.get(key)
+        email = key[0]
+        reset_dt = window_reset.get(key)
         if not reset_dt:
             continue
-        window_start = datetime.fromtimestamp(reset_dt.timestamp() - 5 * 3600, tz=timezone.utc)
-        window_end = reset_dt
-        events = bucket_window_tokens_by_ts(window_start, window_end)
+        start = datetime.fromtimestamp(reset_dt.timestamp() - 5*3600, tz=timezone.utc)
+        events = bucket_window_events(start, reset_dt)
         if not events:
             continue
-
-        pts = sorted(points, key=lambda p: p[0])
+        pts = sorted(points)
         for (t0, u0), (t1, u1) in zip(pts, pts[1:]):
             du = u1 - u0
-            # Keep zero-delta pairs too — they're valid observations that
-            # token spend in that interval produced <0.5% util change. This
-            # helps pin down small weights.
             inp, out, cr, cc = tokens_in_range(events, float(t0), float(t1))
-            if inp + out + cr + cc == 0 and du == 0:
-                continue  # no signal at all
-            samples_per_email[email].append((du, inp, out, cr, cc))
+            if du == 0 and (inp + out + cr + cc) == 0:
+                continue  # idle poll, no signal
+            samples[email].append((du, inp, out, cr, cc))
+    return dict(samples)
 
-    MIN_SAMPLES = 4
-    out = {}
-    for email, samples in samples_per_email.items():
-        if len(samples) < MIN_SAMPLES:
-            out[email] = {
-                "status": "insufficient_data",
-                "n_points": len(samples),
-                "min_required": MIN_SAMPLES,
-                "last_updated": int(datetime.now().timestamp()),
-            }
-            continue
 
-        weights, r2, n = fit_linear_model(samples)
-        if weights is None or not np.any(weights > 0):
-            out[email] = {
-                "status": "insufficient_data",
-                "n_points": n,
-                "min_required": MIN_SAMPLES,
-                "last_updated": int(datetime.now().timestamp()),
-            }
-            continue
+def fit_weights(samples_by_email: dict) -> dict:
+    """Fit Δutil = Σ w_i · Δtokens_i via NNLS across ALL accounts' samples.
 
-        caps, formula = cap_from_weights(weights)
-        # Normalize weights relative to the smallest non-zero weight so the
-        # "formula" readout is interpretable (e.g., "1×in + 1×out + 0.1×cr").
-        nonzero = [w for _, w in formula if w > 0]
-        if nonzero:
-            base = min(nonzero)
-            formula_norm = {name: round(w / base, 3) for name, w in formula}
-        else:
-            formula_norm = {}
+    Anthropic's formula is universal — combining accounts' samples only
+    improves the fit, never hurts it.
+    """
+    all_samples = []
+    for email, rows in samples_by_email.items():
+        all_samples.extend(rows)
 
-        out[email] = {
-            "status": "ok",
-            "weights": {
-                "in": float(weights[0]),
-                "out": float(weights[1]),
-                "cr": float(weights[2]),
-                "cc": float(weights[3]),
-            },
-            "formula_ratios": formula_norm,
-            "caps_by_token_type": caps,
-            "r_squared": round(r2, 3),
-            "n_points": n,
+    if len(all_samples) < 4:
+        return {
+            "status": "calibrating",
+            "n_samples": len(all_samples),
+            "min_required": MIN_WEIGHT_SAMPLES,
             "last_updated": int(datetime.now().timestamp()),
         }
 
-    # Enrich with current util and per-token-type remaining estimates.
-    # For each token type that has a positive weight, we know cap = 100/w.
-    # "Remaining" in that type = cap × (1 - util/100). The most informative
-    # single number to surface is the DOMINANT type (where your usage skews).
+    Y = np.array([s[0] for s in all_samples], dtype=float)
+    X = np.array([[s[1], s[2], s[3], s[4]] for s in all_samples], dtype=float)
+
+    try:
+        from scipy.optimize import nnls
+        w, _ = nnls(X, Y)
+    except ImportError:
+        w, *_ = np.linalg.lstsq(X, Y, rcond=None)
+        w = np.clip(w, 0, None)
+
+    pred = X @ w
+    ss_res = float(np.sum((Y - pred) ** 2))
+    ss_tot = float(np.sum((Y - Y.mean()) ** 2))
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    r2 = max(0.0, min(1.0, r2))
+
+    status = "ok" if (r2 >= MIN_WEIGHT_R2 and len(all_samples) >= MIN_WEIGHT_SAMPLES) else "calibrating"
+
+    return {
+        "status": status,
+        "weights": {
+            "in": float(w[0]),
+            "out": float(w[1]),
+            "cr": float(w[2]),
+            "cc": float(w[3]),
+        },
+        "r_squared": round(r2, 3),
+        "n_samples": len(all_samples),
+        "min_samples": MIN_WEIGHT_SAMPLES,
+        "min_r_squared": MIN_WEIGHT_R2,
+        "last_updated": int(datetime.now().timestamp()),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Work-unit conversion + per-account caps
+# ---------------------------------------------------------------------------
+def work_units(inp: int, out: int, cr: int, cc: int, w: dict) -> float:
+    """Convert raw tokens to output-token-equivalents (work units).
+
+    wu = (w_in·in + w_out·out + w_cr·cr + w_cc·cc) / w_out
+       = in·(w_in/w_out) + out + cr·(w_cr/w_out) + cc·(w_cc/w_out)
+    """
+    w_out = w.get("out", 0) or 0
+    if w_out <= 0:
+        # If output weight is zero, anchor to the largest nonzero weight
+        anchor = max(w.get("in", 0), w.get("cr", 0), w.get("cc", 0))
+        if anchor <= 0:
+            return 0.0
+        w_out = anchor
+    return (
+        inp * (w.get("in", 0) or 0) +
+        out * w_out +
+        cr  * (w.get("cr", 0) or 0) +
+        cc  * (w.get("cc", 0) or 0)
+    ) / w_out
+
+
+def current_window_spend(email: str, reset_iso: str) -> tuple[int, int, int, int]:
+    """Sum tokens in the current 5h window for this email.
+
+    We assume all spend in the window attributes to the logged-in account
+    (same assumption the original statusline-history writer makes).
+    session-accounts.json could refine this but isn't required for MVP.
+    """
+    reset_dt = parse_iso(reset_iso)
+    if not reset_dt:
+        return 0, 0, 0, 0
+    start = datetime.fromtimestamp(reset_dt.timestamp() - 5*3600, tz=timezone.utc)
+    events = bucket_window_events(start, reset_dt)
+    total = [0, 0, 0, 0]
+    for _, i, o, r, c in events:
+        total[0] += i; total[1] += o; total[2] += r; total[3] += c
+    return tuple(total)
+
+
+def build_account_caps(weights_rec: dict, samples: dict) -> dict:
+    """For each account: compute current window wu spend and cap in wu.
+
+    Cap in wu = observed_wu_at_observed_util × (100 / observed_util).
+    Take the max-util observation per account as the anchor.
+    """
+    out: dict[str, dict] = {}
+    if not weights_rec or "weights" not in weights_rec:
+        return out
+    w = weights_rec["weights"]
+    weights_ok = weights_rec.get("status") == "ok"
+
+    # Load current resets file for live util
+    resets = {}
     if RESETS_FILE.exists():
         try:
             resets = json.loads(RESETS_FILE.read_text())
         except (OSError, json.JSONDecodeError):
-            resets = {}
-        for email, rec in out.items():
-            cur = resets.get(email)
-            if not cur:
-                continue
-            util = cur.get("five_hour_pct") or 0
-            rec["current_util"] = util
-            if rec.get("status") != "ok":
-                continue
-            caps = rec.get("caps_by_token_type", {})
-            rem = {}
-            for name, cap in caps.items():
-                rem[name] = max(0, int(cap * (1 - util / 100)))
-            rec["remaining_by_token_type"] = rem
+            pass
 
-            # Pick "dominant" type = the one with the most weight × typical spend.
-            # Use the account's historical per-token-type spend (sum across all
-            # observations for this email) to weight importance.
-            type_totals = {"in": 0, "out": 0, "cr": 0, "cc": 0}
-            for _, i, o, r, c in samples_per_email.get(email, []):
-                type_totals["in"] += i
-                type_totals["out"] += o
-                type_totals["cr"] += r
-                type_totals["cc"] += c
-            # Dominant = argmax of (weight × observed_spend). That's the type
-            # most likely to be the binding constraint for this user.
-            dominant = None
-            best_score = -1
-            w = rec["weights"]
-            for name, total in type_totals.items():
-                score = w.get(name, 0) * total
-                if score > best_score:
-                    best_score = score
-                    dominant = name
-            rec["dominant_type"] = dominant
-            if dominant and rem.get(dominant):
-                rec["remaining_tokens_est"] = rem[dominant]
+    # For cap anchor, walk samples per account and compute cumulative wu
+    # per window, pairing with observed util at end of that window.
+    history = load_history()
+    anchor_by_email: dict[str, tuple[float, float]] = {}  # email -> (util, wu)
+    window_map: dict[tuple[str, str], list[tuple[int, float]]] = defaultdict(list)
+    window_reset: dict[tuple[str, str], datetime] = {}
+    for row in history:
+        email = row.get("email")
+        reset_iso = row.get("five_hour_reset")
+        ts = row.get("ts")
+        util = row.get("five_hour_pct")
+        if not (email and reset_iso and ts is not None and util is not None):
+            continue
+        key = (email, window_key(reset_iso))
+        window_map[key].append((int(ts), float(util)))
+        if key not in window_reset:
+            dt = parse_iso(reset_iso)
+            if dt:
+                window_reset[key] = dt
+
+    for key, points in window_map.items():
+        email = key[0]
+        reset_dt = window_reset.get(key)
+        if not reset_dt:
+            continue
+        start = datetime.fromtimestamp(reset_dt.timestamp() - 5*3600, tz=timezone.utc)
+        events = bucket_window_events(start, reset_dt)
+        if not events:
+            continue
+        inp = sum(e[1] for e in events)
+        o = sum(e[2] for e in events)
+        cr = sum(e[3] for e in events)
+        cc = sum(e[4] for e in events)
+        wu = work_units(inp, o, cr, cc, w)
+        # Anchor util = max observed util in the window
+        max_util = max(u for _, u in points)
+        if max_util <= 0:
+            continue
+        cur = anchor_by_email.get(email)
+        if not cur or max_util > cur[0]:
+            anchor_by_email[email] = (max_util, wu)
+
+    # Build per-account caps
+    for email, cur in resets.items():
+        util_now = cur.get("five_hour_pct") or 0
+        reset_iso = cur.get("five_hour_reset")
+        inp, outv, cr, cc = current_window_spend(email, reset_iso) if reset_iso else (0, 0, 0, 0)
+        wu_now = work_units(inp, outv, cr, cc, w)
+
+        anchor = anchor_by_email.get(email)
+        cap_wu = None
+        if anchor and anchor[0] >= MIN_CAP_WINDOW_UTIL:
+            # cap × (util/100) = wu_at_util  →  cap = wu / (util/100)
+            cap_wu = anchor[1] / (anchor[0] / 100.0)
+
+        rec: dict = {
+            "current_util": util_now,
+            "current_wu": round(wu_now, 1),
+            "weights_status": weights_rec.get("status", "calibrating"),
+            "last_updated": int(datetime.now().timestamp()),
+        }
+        if cap_wu and weights_ok:
+            rec["status"] = "ok"
+            rec["cap_wu"] = round(cap_wu, 1)
+            rec["remaining_wu"] = max(0.0, round(cap_wu - wu_now, 1))
+            rec["anchor_util"] = anchor[0]
+            rec["anchor_wu"] = round(anchor[1], 1)
+        else:
+            rec["status"] = "calibrating"
+            if anchor:
+                rec["best_observed_util"] = anchor[0]
+                rec["best_observed_wu"] = round(anchor[1], 1)
+        out[email] = rec
+
+    # Also include accounts with samples but no current-resets record
+    for email in samples:
+        if email in out:
+            continue
+        anchor = anchor_by_email.get(email)
+        rec = {
+            "current_util": None,
+            "current_wu": None,
+            "weights_status": weights_rec.get("status", "calibrating"),
+            "status": "calibrating",
+            "last_updated": int(datetime.now().timestamp()),
+        }
+        if anchor:
+            rec["best_observed_util"] = anchor[0]
+            rec["best_observed_wu"] = round(anchor[1], 1)
+        out[email] = rec
 
     return out
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 def main():
-    caps = derive_per_account()
-    if not caps:
-        # Don't clobber an existing file with empty data.
-        if not CAPS_FILE.exists():
-            CAPS_FILE.write_text("{}")
-        sys.exit(0)
+    history = load_history()
+    samples = collect_samples(history)
+    weights_rec = fit_weights(samples)
 
-    tmp = CAPS_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(caps, indent=2, sort_keys=True))
-    tmp.replace(CAPS_FILE)
+    # Persist weights
+    WEIGHTS_FILE.write_text(json.dumps(weights_rec, indent=2, sort_keys=True))
 
-    def fmt(n: int) -> str:
-        if n >= 1e9: return f"{n/1e9:.2f}B"
-        if n >= 1e6: return f"{n/1e6:.1f}M"
-        if n >= 1e3: return f"{n/1e3:.0f}K"
-        return str(n)
+    caps = build_account_caps(weights_rec, samples)
+    CAPS_FILE.write_text(json.dumps(caps, indent=2, sort_keys=True))
 
-    if "--quiet" not in sys.argv:
-        for email, rec in caps.items():
-            if rec.get("status") != "ok":
-                print(f"{email:<35} (pending: {rec.get('n_points', 0)}/{rec.get('min_required', '?')} samples)")
-                continue
-            dom = rec.get("dominant_type") or "?"
-            rem = rec.get("remaining_tokens_est", 0)
-            caps_by = rec.get("caps_by_token_type", {})
-            ratios = rec.get("formula_ratios", {})
-            formula_str = " + ".join(f"{r}×{k}" for k, r in ratios.items() if r > 0)
-            caps_str = " ".join(f"{k}={fmt(v)}" for k, v in caps_by.items() if v)
-            print(f"{email:<35} remaining≈{fmt(rem):>6} {dom:<3} "
-                  f"caps: {caps_str}")
-            print(f"{'':<35}   util={rec.get('current_util','?')}%  "
-                  f"formula ~ {formula_str}  (r²={rec['r_squared']}, n={rec['n_points']})")
+    if "--quiet" in sys.argv:
+        return
+
+    # Human-readable summary
+    status = weights_rec.get("status", "unknown")
+    r2 = weights_rec.get("r_squared")
+    n = weights_rec.get("n_samples", 0)
+    if status == "ok":
+        w = weights_rec["weights"]
+        w_out = w["out"] or 1
+        print(f"weights OK  (r²={r2}, n={n})")
+        print(f"  1 wu = 1 output-token-equivalent")
+        print(f"    in  = {w['in']/w_out:.4f} wu each")
+        print(f"    out = 1.0000 wu each")
+        print(f"    cr  = {w['cr']/w_out:.4f} wu each  ({w_out/w['cr'] if w['cr']>0 else float('inf'):.0f}× less than out)")
+        print(f"    cc  = {w['cc']/w_out:.4f} wu each")
+    else:
+        print(f"weights calibrating  (r²={r2}, n={n}/{MIN_WEIGHT_SAMPLES})")
+
+    print()
+    for email, rec in caps.items():
+        util = rec.get("current_util")
+        util_s = f"{util:.0f}%" if isinstance(util, (int, float)) else "?"
+        cur_wu = rec.get("current_wu", 0) or 0
+        if rec.get("status") == "ok":
+            cap = rec.get("cap_wu", 0)
+            rem = rec.get("remaining_wu", 0)
+            print(f"  {email:<35} {util_s:>5} util  {cur_wu:.0f}wu / {cap:.0f}wu cap  ({rem:.0f}wu left)")
+        else:
+            bow = rec.get("best_observed_wu")
+            bou = rec.get("best_observed_util")
+            tail = ""
+            if bow is not None and bou is not None:
+                tail = f"  (best seen: {bow:.0f}wu @ {bou:.0f}%)"
+            print(f"  {email:<35} {util_s:>5} util  {cur_wu:.0f}wu  [calibrating]{tail}")
 
 
 if __name__ == "__main__":

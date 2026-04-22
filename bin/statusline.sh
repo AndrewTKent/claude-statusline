@@ -1341,34 +1341,49 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     pct_show=$(printf "%d%%" "$pct_int")
                 fi
 
-                # Optional cap / remaining tokens estimate from derive-cap.py.
-                # Shows "~Xm left" when a cap fit exists, or "·" when still
-                # collecting samples, or nothing when the caps file is absent.
+                # Work-unit display from derive-cap.py. "wu" is a plan-agnostic
+                # unit defined as "1 output-token-equivalent" — it's consistent
+                # across accounts regardless of Pro/Max/Max-5× tier.
+                #   status=ok       → "(Xwu/Ywu)"
+                #   status=calibrating with current_wu → "(Xwu · calibrating)"
+                #   otherwise omitted
                 cap_suffix=""
                 if [ -f "$caps_file" ]; then
                     cap_info=$(jq -r --arg e "$em" '.[$e] // empty |
-                        if .status == "ok" and .remaining_tokens_est then
-                          "ok|" + (.remaining_tokens_est|tostring) + "|" + (.r_squared|tostring)
-                        elif .n_points then
-                          "pending|" + (.n_points|tostring) + "|" + (.min_required|tostring)
+                        if .status == "ok" and .cap_wu then
+                          "ok|" + (.current_wu|tostring) + "|" + (.cap_wu|tostring)
+                        elif .current_wu then
+                          "cal|" + (.current_wu|tostring) + "|" + ((.best_observed_wu // 0)|tostring)
                         else "" end' "$caps_file" 2>/dev/null)
                     if [ -n "$cap_info" ]; then
-                        IFS='|' read -r ci_status ci_a ci_b <<< "$cap_info"
+                        IFS='|' read -r ci_status ci_cur ci_cap <<< "$cap_info"
+                        _wu_fmt() {
+                            awk -v n="$1" 'BEGIN {
+                                if (n>=1e9) printf "%.1fB", n/1e9;
+                                else if (n>=1e6) printf "%.1fM", n/1e6;
+                                else if (n>=1e3) printf "%.0fK", n/1e3;
+                                else printf "%.0f", n
+                            }'
+                        }
+                        cur_fmt=$(_wu_fmt "$ci_cur")
                         if [ "$ci_status" = "ok" ]; then
-                            # ci_a = remaining tokens, ci_b = r²
-                            rem_fmt=$(awk "BEGIN {
-                                n=$ci_a;
-                                if (n>=1e9) printf \"%.1fB\", n/1e9;
-                                else if (n>=1e6) printf \"%.0fM\", n/1e6;
-                                else if (n>=1e3) printf \"%.0fK\", n/1e3;
-                                else printf \"%d\", n
-                            }")
-                            # Low r² = dim the number (low confidence)
-                            rem_color="$white"
-                            awk_below=$(awk "BEGIN {print ($ci_b < 0.5) ? 1 : 0}")
-                            [ "$awk_below" = "1" ] && rem_color="$dim"
-                            cap_suffix=" ${dim}(${rem_color}~${rem_fmt} left${dim})${reset}"
-                        elif [ "$ci_status" = "pending" ]; then
+                            cap_fmt=$(_wu_fmt "$ci_cap")
+                            cap_suffix=" ${dim}(${reset}${white}${cur_fmt}wu${dim}/${white}${cap_fmt}wu${dim})${reset}"
+                        elif [ "$ci_status" = "cal" ]; then
+                            cap_suffix=" ${dim}(${reset}${dim}${cur_fmt}wu · calibrating${dim})${reset}"
+                        fi
+                    fi
+                fi
+
+                # Legacy pending-samples fallback (no wu data yet at all)
+                if [ -z "$cap_suffix" ] && [ -f "$caps_file" ]; then
+                    legacy=$(jq -r --arg e "$em" '.[$e] // empty |
+                        if .n_points then
+                          "pending|" + (.n_points|tostring) + "|" + ((.min_required // 30)|tostring)
+                        else "" end' "$caps_file" 2>/dev/null)
+                    if [ -n "$legacy" ]; then
+                        IFS='|' read -r ci_status ci_a ci_b <<< "$legacy"
+                        if [ "$ci_status" = "pending" ]; then
                             cap_suffix=" ${dim}(${ci_a}/${ci_b} samples)${reset}"
                         fi
                     fi
