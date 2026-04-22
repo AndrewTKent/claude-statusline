@@ -393,12 +393,14 @@ def scan(prev_cache: dict) -> dict:
         acct = classify_path(filepath)
         prev = prev_files.get(filepath)
         if prev and prev.get("mtime") == mtime_int and "requests" in prev:
-            requests = prev["requests"]
+            # Cache may contain historical 6-tuples [rid,ts,in,out,cr,completed]
+            # from an older schema. Normalize to 4-tuples used by ingest().
+            requests = [[r[0], r[1], r[2], r[3]] for r in prev["requests"]]
             if acct is None:
                 acct = prev.get("acct") or "unknown"
         else:
             cwds, paths, user_text, raw_reqs = extract_session_signals(filepath)
-            requests = [[r, t, i, o] for (r, t, i, o) in raw_reqs]
+            requests = [[r[0], r[1], r[2], r[3]] for r in raw_reqs]
             if acct is None:
                 acct = classify_by_content(cwds, paths, user_text)
             files_rescanned += 1
@@ -438,10 +440,11 @@ def scan(prev_cache: dict) -> dict:
 
         prev = prev_files.get(filepath)
         if prev and prev.get("mtime") == mtime_int and "requests" in prev:
-            requests = prev["requests"]
+            # Normalize any historical 6-tuples in the cache to 4-tuples.
+            requests = [[r[0], r[1], r[2], r[3]] for r in prev["requests"]]
         else:
             _, _, _, raw_reqs = extract_session_signals(filepath)
-            requests = [[r, t, i, o] for (r, t, i, o) in raw_reqs]
+            requests = [[r[0], r[1], r[2], r[3]] for r in raw_reqs]
             files_rescanned += 1
 
         new_files[filepath] = {"mtime": mtime_int, "acct": acct, "requests": requests}
