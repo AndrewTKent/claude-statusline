@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Fallback polling scan: runs scan-tokens.py every 60s. Belt-and-suspenders
+     for the fswatch-based watcher (com.claude-scan-tokens-watch.plist); if
+     the watcher crashes or misses an event, this guarantees the summary is
+     never more than 60s stale.
+
+     Install:
+       1. Edit the paths below to match your checkout location.
+       2. Copy to ~/Library/LaunchAgents/com.claude-scan-tokens.plist
+       3. launchctl load ~/Library/LaunchAgents/com.claude-scan-tokens.plist
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.claude-scan-tokens</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <!-- Edit path to point at your checkout. -->
+        <string>set -a; [ -f "$HOME/.claude/statusline.conf" ] &amp;&amp; source "$HOME/.claude/statusline.conf"; set +a; exec /opt/homebrew/bin/python3 "/PATH/TO/claude-statusline/bin/scan-tokens.py" --quiet</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>60</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/claude-scan-tokens.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/claude-scan-tokens.stderr.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Edit HOME to your username. -->
+        <key>HOME</key>
+        <string>/Users/YOURUSER</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>
