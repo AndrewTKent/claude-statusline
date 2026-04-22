@@ -1333,6 +1333,13 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 fi
                 pct_int=$(printf "%.0f" "$pct_disp" 2>/dev/null || echo 0)
                 pct_color=$(color_for_pct "$pct_int")
+                # Display fractional util for the current account (matches the
+                # "current" row); other accounts only have integer ledger data.
+                if [ "$em" = "$ACCT_EMAIL" ]; then
+                    pct_show=$(fmt_pct "$pct_disp")
+                else
+                    pct_show=$(printf "%d%%" "$pct_int")
+                fi
 
                 # Optional cap / remaining tokens estimate from derive-cap.py.
                 # Shows "~Xm left" when a cap fit exists, or "·" when still
@@ -1367,7 +1374,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     fi
                 fi
 
-                rendered+="${marker}${seg} ${white}${tdisp}${reset} ${pct_color}$(printf "%2d" "$pct_int")%${reset}${cap_suffix}   "
+                rendered+="${marker}${seg} ${white}${tdisp}${reset} ${pct_color}${pct_show}${reset}${cap_suffix}   "
             done <<< "$parsed"
             [ -n "$rendered" ] && ACCOUNT_RESETS_DISPLAY="$rendered"
         fi
