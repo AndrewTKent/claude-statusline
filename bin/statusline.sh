@@ -1400,8 +1400,41 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 fi
 
                 rendered+="${marker}${seg} ${white}${tdisp}${reset} ${pct_color}${pct_show}${reset}${cap_suffix}   "
+
+                # Track best-next-account candidate: highest headroom among
+                # non-current accounts. We emit a hint after the resets row
+                # telling the user where to hop when their current account caps.
+                # Skip candidates that are already at/near cap or whose reset
+                # is imminent (they'll refill themselves — save them for after).
+                _headroom=$(( 100 - pct_int ))
+                if [ "$em" != "$ACCT_EMAIL" ] && [ "$_headroom" -ge 20 ]; then
+                    # Score = headroom × proximity penalty (accounts resetting
+                    # soon score lower, since using them now wastes their reset).
+                    _now_ep=$(date +%s)
+                    if [ -n "$ep" ]; then
+                        _hrs=$(( (ep - _now_ep) / 3600 ))
+                        [ "$_hrs" -lt 1 ] && _hrs=1
+                        [ "$_hrs" -gt 5 ] && _hrs=5
+                        _score=$(( _headroom * _hrs / 5 ))
+                    else
+                        _score=$_headroom
+                    fi
+                    if [ "$_score" -gt "${_best_score:-0}" ]; then
+                        _best_score=$_score
+                        _best_tag=$tag
+                        _best_headroom=$_headroom
+                    fi
+                fi
             done <<< "$parsed"
             [ -n "$rendered" ] && ACCOUNT_RESETS_DISPLAY="$rendered"
+
+            # Emit a "next best" hint only if the current account is near cap
+            # (≥70%). Otherwise the current account is fine — no nag.
+            ACCOUNT_NEXT_DISPLAY=""
+            if [ -n "${_best_tag:-}" ] && [ "${five_hour_pct:-0}" -ge 70 ] 2>/dev/null; then
+                _best_color=$(_resolve_label_color "$_best_tag")
+                ACCOUNT_NEXT_DISPLAY="${cyan}→${reset} ${_best_color}${_best_tag}${reset} ${dim}(${_best_headroom}% headroom)${reset}"
+            fi
         fi
     fi
 fi
@@ -1522,6 +1555,7 @@ render_default() {
     printf "\n%b" "$ctx_line"
     [ -n "$rate_lines" ] && printf "\n%b" "$rate_lines"
     [ -n "$ACCOUNT_RESETS_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "resets")${reset} %b" "$ACCOUNT_RESETS_DISPLAY"
+    [ -n "$ACCOUNT_NEXT_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "hop")${reset} %b" "$ACCOUNT_NEXT_DISPLAY"
     [ -n "$BUDGET_DISPLAY" ] && printf "\n%b" "$BUDGET_DISPLAY"
     [ -n "$TOKEN_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "tokens")${reset} %b" "$TOKEN_DISPLAY"
     [ -n "$CHALLENGE_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "$CHALLENGE_LABEL")${reset} %b" "$CHALLENGE_DISPLAY"
