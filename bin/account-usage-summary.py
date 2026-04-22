@@ -181,8 +181,42 @@ def cmd_hourly(args: argparse.Namespace) -> int:
     return 0
 
 
+def _latest_extra(email: str) -> tuple[float, float]:
+    """Return (extra_used_credits, extra_pct) from the most recent poll for this email.
+
+    Extra-usage credits are a per-account paid bucket that kicks in once the
+    5h window caps. extra_pct=100 means the bucket is fully spent — so hitting
+    the 5h cap on that account is a hard wall until it resets.
+    """
+    latest = None
+    for rec in iter_history():
+        if rec.get("email") != email:
+            continue
+        if latest is None or rec["ts"] > latest["ts"]:
+            latest = rec
+    if not latest:
+        return 0.0, 0.0
+    return float(latest.get("extra_used", 0) or 0), float(latest.get("extra_pct", 0) or 0)
+
+
 def cmd_plan(args: argparse.Namespace) -> int:
-    """Right-now recommendation: which account has the most headroom for next N hours."""
+    """Right-now recommendation with paid-credit awareness.
+
+    Scoring model (for the next N hours):
+
+        effective_headroom =
+            5h_window_free_pct                           # primary capacity
+          + paid_credit_headroom                         # post-cap fallback
+          + reset_windfall_if_reset_within_window        # soon-to-refill bonus
+          - hard_wall_penalty_if_extra_exhausted         # nothing left post-cap
+
+    This fixes two bugs in the naive model:
+      1. An account that resets in 30min was penalized as "no headroom" —
+         wrong, it's about to have 100% headroom within the planning window.
+      2. An account at 6% 5h-headroom but ZERO paid credits left was ranked
+         above an account at 0% 5h-headroom with $500 of credits — wrong,
+         the first hits a wall, the second keeps working.
+    """
     now = datetime.now(timezone.utc)
     if not RESETS_FILE.exists():
         print(f"Need {RESETS_FILE} — run statusline a few times first.")
@@ -190,7 +224,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
     with RESETS_FILE.open() as fh:
         resets = json.load(fh)
 
-    # Build per-account state: pct, reset, projected reset (in 5h increments)
+    plan_hours = args.hours
     plan_rows = []
     for email, info in resets.items():
         pct = info.get("five_hour_pct", 0) or 0
@@ -204,51 +238,94 @@ def cmd_plan(args: argparse.Namespace) -> int:
             except ValueError:
                 pass
         hrs_to_reset = (reset_dt - now).total_seconds() / 3600.0 if reset_dt else None
-        headroom_pct = max(0, 100 - pct)
+
+        window_headroom = max(0.0, 100.0 - pct)
+        extra_used, extra_pct = _latest_extra(email)
+        extra_headroom = max(0.0, 100.0 - extra_pct)  # 0..100 of paid bucket remaining
+
+        # Reset windfall: if the 5h window resets within the planning horizon,
+        # we effectively recover 100% of window capacity for the remainder.
+        # Scale by how much of the window falls after the reset.
+        reset_windfall = 0.0
+        if hrs_to_reset is not None and 0 <= hrs_to_reset < plan_hours:
+            # Fraction of the plan window that lands AFTER the reset
+            post_reset_frac = (plan_hours - hrs_to_reset) / plan_hours
+            reset_windfall = 100.0 * post_reset_frac
+
+        # Hard-wall penalty: if paid credits are fully spent AND 5h window is
+        # near cap, this account is about to stop working entirely. Heavy weight.
+        hard_wall = 0.0
+        if extra_pct >= 99 and pct >= 90 and (hrs_to_reset is None or hrs_to_reset > 1.0):
+            hard_wall = 100.0  # zero this account out
+
+        # Composite score, normalized to 0..100 scale (roughly).
+        score = window_headroom + 0.5 * extra_headroom + reset_windfall - hard_wall
+
         plan_rows.append(
             {
                 "email": email,
                 "tag": short_email(email),
                 "pct": pct,
-                "headroom": headroom_pct,
+                "headroom": window_headroom,
+                "extra_pct": extra_pct,
+                "extra_headroom": extra_headroom,
                 "hrs_to_reset": hrs_to_reset,
-                "reset_dt": reset_dt,
+                "reset_windfall": reset_windfall,
+                "hard_wall": hard_wall > 0,
+                "score": max(0.0, score),
             }
         )
 
-    # Score: prefer high headroom, but penalize accounts close to reset
-    # (a reset soon means your "headroom" is about to refill anyway — use the
-    # other account first, save this one for after its reset).
-    for r in plan_rows:
-        r["score"] = r["headroom"] * (
-            1.0 if r["hrs_to_reset"] is None else max(0.1, min(1.0, r["hrs_to_reset"] / 5.0))
-        )
     plan_rows.sort(key=lambda r: -r["score"])
 
-    print(f"Right-now plan (for the next ~{args.hours}h)")
+    print(f"Right-now plan (for the next ~{plan_hours}h)")
     print(f"  time: {now.astimezone().strftime('%a %H:%M %Z')}\n")
-    hdr = f"  {'rank':>4}  {'account':<10} {'util':>6} {'headroom':>9} {'resets in':>10}  score"
+    hdr = (
+        f"  {'rank':>4}  {'account':<10} {'5h-util':>7} {'extra':>7}"
+        f" {'resets in':>10} {'windfall':>9}  score  note"
+    )
     print(hdr)
     print("  " + "-" * (len(hdr) - 2))
     for i, r in enumerate(plan_rows, 1):
         reset_s = f"{r['hrs_to_reset']:.1f}h" if r["hrs_to_reset"] is not None else "—"
+        wind_s = f"+{r['reset_windfall']:.0f}%" if r["reset_windfall"] > 0 else "—"
+        note = "⚠ hard wall" if r["hard_wall"] else ""
         print(
-            f"  {i:>4}  {r['tag']:<10} {r['pct']:>5.0f}% {r['headroom']:>8.0f}%"
-            f" {reset_s:>10}   {r['score']:>5.1f}"
+            f"  {i:>4}  {r['tag']:<10} {r['pct']:>6.0f}% {r['extra_pct']:>6.0f}%"
+            f" {reset_s:>10} {wind_s:>9}   {r['score']:>5.1f}  {note}"
         )
 
     best = plan_rows[0] if plan_rows else None
     if best:
         print()
-        if best["headroom"] >= 20:
-            print(
-                f"  → Use **{best['tag']}** next (headroom {best['headroom']:.0f}%, resets in"
-                f" {best['hrs_to_reset']:.1f}h)." if best['hrs_to_reset'] is not None
-                else f"  → Use **{best['tag']}** next (headroom {best['headroom']:.0f}%)."
-            )
+        parts = []
+        if best["headroom"] > 0:
+            parts.append(f"{best['headroom']:.0f}% 5h-headroom")
+        if best["reset_windfall"] > 0:
+            parts.append(f"resets in {best['hrs_to_reset']:.1f}h")
+        if best["extra_headroom"] > 0 and best["extra_pct"] > 0:
+            parts.append(f"{best['extra_headroom']:.0f}% extra credits left")
+        detail = ", ".join(parts) or "no capacity signal"
+        if best["score"] >= 20:
+            print(f"  → Use **{best['tag']}** next ({detail}).")
         else:
-            print(f"  ⚠ All accounts near cap. Soonest reset: {plan_rows[0]['tag']}"
-                  f" in {plan_rows[0]['hrs_to_reset']:.1f}h")
+            soonest = min(
+                (r for r in plan_rows if r["hrs_to_reset"] is not None),
+                key=lambda r: r["hrs_to_reset"],
+                default=None,
+            )
+            if soonest:
+                print(
+                    f"  ⚠ All accounts constrained. Soonest reset: {soonest['tag']} "
+                    f"in {soonest['hrs_to_reset']:.1f}h"
+                )
+            else:
+                print("  ⚠ All accounts constrained and no reset times known.")
+    print()
+    print("  5h-util  = current 5-hour window utilization (100% = capped)")
+    print("  extra    = paid extra-usage credits spent (100% = bucket exhausted)")
+    print("  windfall = headroom recovered within this plan window via 5h reset")
+    print("  hard wall= at 5h cap AND paid credits exhausted → stops working")
     return 0
 
 
