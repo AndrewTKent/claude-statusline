@@ -1323,7 +1323,6 @@ render_default() {
     [ -n "$TOKEN_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "tokens")${reset} %b" "$TOKEN_DISPLAY"
     [ -n "$CHALLENGE_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "$CHALLENGE_LABEL")${reset} %b" "$CHALLENGE_DISPLAY"
     [ -n "$BOUNTY_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "bounty")${reset} %b" "$BOUNTY_DISPLAY"
-    [ -n "$REDACT_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "redact")${reset} %b" "$REDACT_DISPLAY"
 }
 
 # ── Render: sigil (single dense line) ─────────────────────
