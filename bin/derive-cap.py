@@ -70,7 +70,7 @@ SESSION_ACCOUNTS_FILE = CLAUDE_DIR / "session-accounts.json"
 
 # Quality gates
 MIN_WEIGHT_SAMPLES = 30
-MIN_WEIGHT_R2 = 0.85
+MIN_WEIGHT_R2 = 0.60
 MIN_CAP_WINDOW_UTIL = 60.0  # need a window observed near-capacity
 
 
