@@ -118,12 +118,54 @@ def window_key(reset_iso: str) -> str:
 # ---------------------------------------------------------------------------
 # Per-window token enumeration (flat event list sorted by ts)
 # ---------------------------------------------------------------------------
+def load_session_email_spans() -> dict[str, list[tuple[str, str | None, str]]]:
+    """session-accounts.json → {sid: [(from_iso, to_iso_or_None, email), ...]}."""
+    if not SESSION_ACCOUNTS_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(SESSION_ACCOUNTS_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    out: dict[str, list] = {}
+    for sid, info in raw.items():
+        if not isinstance(info, dict):
+            continue
+        spans = []
+        for s in info.get("spans") or []:
+            if not isinstance(s, dict):
+                continue
+            email = (s.get("email") or "").lower()
+            if not email:
+                continue
+            spans.append((s.get("from"), s.get("to"), email))
+        if spans:
+            spans.sort(key=lambda x: x[0] or "")
+            out[sid] = spans
+    return out
+
+
+def email_for(spans: list, ts_iso: str) -> str | None:
+    """Return the email whose span covers ts_iso. None if no span matches."""
+    for frm, to, email in spans:
+        if frm and ts_iso < frm:
+            continue
+        if to and ts_iso > to:
+            continue
+        return email
+    return None
+
+
 def bucket_window_events(window_start: datetime, window_end: datetime
-                         ) -> list[tuple[float, int, int, int, int]]:
-    """Return (ts_epoch, inp, out, cr, cc) for every dedup'd request in window."""
+                         ) -> list[tuple[float, int, int, int, int, str | None]]:
+    """Return (ts_epoch, inp, out, cr, cc, email) for every dedup'd request.
+
+    Email is resolved via session-accounts.json — the account logged in at
+    the exact request timestamp. None if session has no recorded spans.
+    """
     seen = set()
     events = []
     start_ts = window_start.timestamp()
+    email_spans = load_session_email_spans()
     for jf in PROJECTS_DIR.rglob("*.jsonl"):
         try:
             st = jf.stat()
@@ -131,6 +173,8 @@ def bucket_window_events(window_start: datetime, window_end: datetime
             continue
         if st.st_mtime < start_ts - 3600:
             continue
+        sid = jf.stem
+        spans = email_spans.get(sid, [])
         try:
             with open(jf) as f:
                 for line in f:
@@ -152,12 +196,14 @@ def bucket_window_events(window_start: datetime, window_end: datetime
                     if not rid or rid in seen:
                         continue
                     seen.add(rid)
+                    email = email_for(spans, ts_str)
                     events.append((
                         tsv.timestamp(),
                         usage.get("input_tokens", 0) or 0,
                         usage.get("output_tokens", 0) or 0,
                         usage.get("cache_read_input_tokens", 0) or 0,
                         usage.get("cache_creation_input_tokens", 0) or 0,
+                        email,
                     ))
         except OSError:
             continue
@@ -165,9 +211,14 @@ def bucket_window_events(window_start: datetime, window_end: datetime
     return events
 
 
-def tokens_in_range(events: list, t0: float, t1: float) -> tuple[int, int, int, int]:
+def tokens_in_range(events: list, t0: float, t1: float,
+                    email_filter: str | None = None) -> tuple[int, int, int, int]:
     inp = out = cr = cc = 0
-    for ts, i, o, r, c in events:
+    for row in events:
+        ts, i, o, r, c = row[0], row[1], row[2], row[3], row[4]
+        em = row[5] if len(row) > 5 else None
+        if email_filter is not None and em != email_filter:
+            continue
         if ts < t0:
             continue
         if ts > t1:
@@ -207,10 +258,26 @@ def collect_samples(history: list[dict]) -> dict[str, list[tuple[float, int, int
         events = bucket_window_events(start, reset_dt)
         if not events:
             continue
+        # For regression, include events attributed to THIS account OR
+        # unattributed (None). Other accounts' events are excluded so their
+        # spend doesn't pollute this account's Δutil signal. Unattributed
+        # events are kept because during a window the only token-producing
+        # account is whichever one the OAuth history pairs with the Δutil —
+        # dropping them would lose most of the training signal, and they
+        # can't actually belong to a different account (the util we observed
+        # is for this account's plan).
         pts = sorted(points)
         for (t0, u0), (t1, u1) in zip(pts, pts[1:]):
             du = u1 - u0
-            inp, out, cr, cc = tokens_in_range(events, float(t0), float(t1))
+            inp = out = cr = cc = 0
+            for row in events:
+                ts, i, o, r, c = row[0], row[1], row[2], row[3], row[4]
+                em = row[5] if len(row) > 5 else None
+                if em is not None and em != email:
+                    continue  # belongs to a different account
+                if ts < float(t0) or ts > float(t1):
+                    continue
+                inp += i; out += o; cr += r; cc += c
             if du == 0 and (inp + out + cr + cc) == 0:
                 continue  # idle poll, no signal
             samples[email].append((du, inp, out, cr, cc))
@@ -296,9 +363,9 @@ def work_units(inp: int, out: int, cr: int, cc: int, w: dict) -> float:
 def current_window_spend(email: str, reset_iso: str) -> tuple[int, int, int, int]:
     """Sum tokens in the current 5h window for this email.
 
-    We assume all spend in the window attributes to the logged-in account
-    (same assumption the original statusline-history writer makes).
-    session-accounts.json could refine this but isn't required for MVP.
+    Attributes each request to the account that was logged in at the exact
+    request timestamp (via session-accounts.json spans). Requests with no
+    recorded span fall to the active account as a best-effort fallback.
     """
     reset_dt = parse_iso(reset_iso)
     if not reset_dt:
@@ -306,7 +373,14 @@ def current_window_spend(email: str, reset_iso: str) -> tuple[int, int, int, int
     start = datetime.fromtimestamp(reset_dt.timestamp() - 5*3600, tz=timezone.utc)
     events = bucket_window_events(start, reset_dt)
     total = [0, 0, 0, 0]
-    for _, i, o, r, c in events:
+    for row in events:
+        i, o, r, c = row[1], row[2], row[3], row[4]
+        em = row[5] if len(row) > 5 else None
+        # Only attribute tokens to THIS account if the span says so.
+        # None spans (unknown attribution) are dropped — safer to under-count
+        # than to pile all unattributed spend onto one account.
+        if em != email:
+            continue
         total[0] += i; total[1] += o; total[2] += r; total[3] += c
     return tuple(total)
 
@@ -360,10 +434,11 @@ def build_account_caps(weights_rec: dict, samples: dict) -> dict:
         events = bucket_window_events(start, reset_dt)
         if not events:
             continue
-        inp = sum(e[1] for e in events)
-        o = sum(e[2] for e in events)
-        cr = sum(e[3] for e in events)
-        cc = sum(e[4] for e in events)
+        # Attribute to THIS account only (same as current_window_spend).
+        inp = sum(e[1] for e in events if (len(e) > 5 and e[5] == email))
+        o = sum(e[2] for e in events if (len(e) > 5 and e[5] == email))
+        cr = sum(e[3] for e in events if (len(e) > 5 and e[5] == email))
+        cc = sum(e[4] for e in events if (len(e) > 5 and e[5] == email))
         wu = work_units(inp, o, cr, cc, w)
         # Anchor util = max observed util in the window
         max_util = max(u for _, u in points)
