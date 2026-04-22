@@ -1263,6 +1263,7 @@ fi
 ACCOUNT_RESETS_DISPLAY=""
 if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
     ledger_file="$HOME/.claude/account-resets.json"
+    caps_file="$HOME/.claude/account-caps.json"
     if [ -f "$ledger_file" ] && [ -n "$ACCT_EMAIL" ]; then
         # Collect entries: email|tag|reset_epoch|pct per line. Project past
         # reset times forward in 5h increments (18000s).
@@ -1323,7 +1324,41 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 # Utilization color
                 pct_int=$(printf "%.0f" "$pct" 2>/dev/null || echo 0)
                 pct_color=$(color_for_pct "$pct_int")
-                rendered+="${marker}${seg} ${white}${tdisp}${reset} ${pct_color}$(printf "%2d" "$pct_int")%${reset}   "
+
+                # Optional cap / remaining tokens estimate from derive-cap.py.
+                # Shows "~Xm left" when a cap fit exists, or "·" when still
+                # collecting samples, or nothing when the caps file is absent.
+                cap_suffix=""
+                if [ -f "$caps_file" ]; then
+                    cap_info=$(jq -r --arg e "$em" '.[$e] // empty |
+                        if .status == "ok" and .remaining_tokens_est then
+                          "ok|" + (.remaining_tokens_est|tostring) + "|" + (.r_squared|tostring)
+                        elif .n_points then
+                          "pending|" + (.n_points|tostring) + "|" + (.min_required|tostring)
+                        else "" end' "$caps_file" 2>/dev/null)
+                    if [ -n "$cap_info" ]; then
+                        IFS='|' read -r ci_status ci_a ci_b <<< "$cap_info"
+                        if [ "$ci_status" = "ok" ]; then
+                            # ci_a = remaining tokens, ci_b = r²
+                            rem_fmt=$(awk "BEGIN {
+                                n=$ci_a;
+                                if (n>=1e9) printf \"%.1fB\", n/1e9;
+                                else if (n>=1e6) printf \"%.0fM\", n/1e6;
+                                else if (n>=1e3) printf \"%.0fK\", n/1e3;
+                                else printf \"%d\", n
+                            }")
+                            # Low r² = dim the number (low confidence)
+                            rem_color="$white"
+                            awk_below=$(awk "BEGIN {print ($ci_b < 0.5) ? 1 : 0}")
+                            [ "$awk_below" = "1" ] && rem_color="$dim"
+                            cap_suffix=" ${dim}(${rem_color}~${rem_fmt} left${dim})${reset}"
+                        elif [ "$ci_status" = "pending" ]; then
+                            cap_suffix=" ${dim}(${ci_a}/${ci_b} samples)${reset}"
+                        fi
+                    fi
+                fi
+
+                rendered+="${marker}${seg} ${white}${tdisp}${reset} ${pct_color}$(printf "%2d" "$pct_int")%${reset}${cap_suffix}   "
             done <<< "$parsed"
             [ -n "$rendered" ] && ACCOUNT_RESETS_DISPLAY="$rendered"
         fi
