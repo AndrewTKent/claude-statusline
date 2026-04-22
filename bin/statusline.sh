@@ -888,6 +888,28 @@ if $needs_refresh || $needs_profile_refresh; then
                             printf '{"ts":%s,"five_hour":%s,"seven_day":%s,"extra_used":%s}' "$prev_ts" "${prev_5h:-0}" "${prev_7d:-0}" "${prev_extra:-0}" > "/tmp/claude/statusline-usage-prev.json"
                         fi
                         echo "$response" > "$cache_file"
+
+                        # Cross-account reset ledger: record the active account's
+                        # 5h/7d reset times + utilization so other sessions can
+                        # render "when does X reset" even when not logged in.
+                        # Keyed by email. Eventually consistent — only the
+                        # active account is updated per poll.
+                        ledger_email=""
+                        [ -f "$profile_cache_file" ] && ledger_email=$(jq -r '.account.email // empty' "$profile_cache_file" 2>/dev/null)
+                        if [ -n "$ledger_email" ]; then
+                            ledger_file="$HOME/.claude/account-resets.json"
+                            ledger_now=$(date +%s)
+                            [ -f "$ledger_file" ] || echo '{}' > "$ledger_file"
+                            tmp_ledger=$(mktemp "/tmp/claude/acct-resets.XXXXXX")
+                            jq --arg e "$ledger_email" --argjson ts "$ledger_now" --argjson u "$response" \
+                                '.[$e] = {
+                                    "five_hour_reset": ($u.five_hour.resets_at // null),
+                                    "five_hour_pct":   ($u.five_hour.utilization // 0),
+                                    "seven_day_reset": ($u.seven_day.resets_at // null),
+                                    "seven_day_pct":   ($u.seven_day.utilization // 0),
+                                    "last_seen":       $ts
+                                }' "$ledger_file" > "$tmp_ledger" 2>/dev/null && mv "$tmp_ledger" "$ledger_file" || rm -f "$tmp_ledger"
+                        fi
                     fi
                 fi
                 if $needs_profile_refresh; then
@@ -1204,6 +1226,86 @@ if [ "$DAILY_BUDGET" -gt 0 ] 2>/dev/null; then
     BUDGET_DISPLAY="${white}$(printf "%-7s" "budget")${reset} ${budget_bar} ${budget_color}$(printf "%3d" "$budget_pct")%${reset} ${white}\$${DAILY_FMT}${dim}/${reset}${white}\$${DAILY_BUDGET}${reset}"
 fi
 
+# ── Multi-account reset ledger line ────────────────────
+# Shows each tracked account's next 5-hour reset + current utilization, so
+# you know which login has headroom at a glance. Opt-in via SHOW_ACCOUNT_RESETS=1
+# in ~/.claude/statusline.conf. Data is written per-account during usage polls
+# (see background refresh block above) and keyed by email.
+#
+# The current account's entry is highlighted; the soonest-to-reset gets a
+# "→" marker. Reset times in the past are projected forward in 5h increments
+# (matches existing format_reset_time behavior) to handle accounts you
+# haven't touched in a while.
+ACCOUNT_RESETS_DISPLAY=""
+if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
+    ledger_file="$HOME/.claude/account-resets.json"
+    if [ -f "$ledger_file" ] && [ -n "$ACCT_EMAIL" ]; then
+        # Collect entries: email|tag|reset_epoch|pct per line. Project past
+        # reset times forward in 5h increments (18000s).
+        now_ar=$(date +%s)
+        entries=$(jq -r --argjson now "$now_ar" '
+            to_entries[] |
+            [.key, (.value.five_hour_reset // ""), (.value.five_hour_pct // 0)] |
+            @tsv' "$ledger_file" 2>/dev/null)
+        if [ -n "$entries" ]; then
+            # Parse + compute projected epochs, find soonest
+            parsed=""
+            soonest_epoch=""
+            while IFS=$'\t' read -r em iso pct; do
+                [ -z "$em" ] && continue
+                ep=""
+                if [ -n "$iso" ] && [ "$iso" != "null" ]; then
+                    ep=$(iso_to_epoch "$iso")
+                    if [ -n "$ep" ]; then
+                        while [ "$ep" -le "$now_ar" ]; do
+                            ep=$((ep + 18000))
+                        done
+                    fi
+                fi
+                tag=$(resolve_account_label "$em")
+                parsed+="${em}|${tag}|${ep}|${pct}"$'\n'
+                if [ -n "$ep" ]; then
+                    if [ -z "$soonest_epoch" ] || [ "$ep" -lt "$soonest_epoch" ] 2>/dev/null; then
+                        soonest_epoch="$ep"
+                    fi
+                fi
+            done <<< "$entries"
+
+            # Sort by projected reset epoch (soonest first). Entries with no
+            # epoch sort to the end.
+            parsed=$(printf '%s' "$parsed" | awk -F'|' 'NF>=4 { key=($3==""?"9999999999":$3); print key"\t"$0 }' | sort -n | cut -f2-)
+
+            rendered=""
+            while IFS='|' read -r em tag ep pct; do
+                [ -z "$em" ] && continue
+                # Display time (respects the projected epoch)
+                if [ -n "$ep" ]; then
+                    tdisp=$(date -j -r "$ep" +"%l:%M%p" 2>/dev/null | sed 's/^ //; s/\.//g' | tr '[:upper:]' '[:lower:]') || \
+                        tdisp=$(date -d "@$ep" +"%l:%M%P" 2>/dev/null | sed 's/^ //; s/\.//g')
+                else
+                    tdisp="—"
+                fi
+                # Label colour by tag, dim when not the current account
+                tag_color=$(_resolve_label_color "$tag")
+                label="${tag:-$em}"
+                if [ "$em" = "$ACCT_EMAIL" ]; then
+                    seg="${tag_color}${label}${reset}"
+                else
+                    seg="${dim}${label}${reset}"
+                fi
+                # Soonest-to-reset marker
+                marker=" "
+                [ -n "$ep" ] && [ "$ep" = "$soonest_epoch" ] && marker="${cyan}→${reset}"
+                # Utilization color
+                pct_int=$(printf "%.0f" "$pct" 2>/dev/null || echo 0)
+                pct_color=$(color_for_pct "$pct_int")
+                rendered+="${marker}${seg} ${white}${tdisp}${reset} ${pct_color}$(printf "%2d" "$pct_int")%${reset}   "
+            done <<< "$parsed"
+            [ -n "$rendered" ] && ACCOUNT_RESETS_DISPLAY="$rendered"
+        fi
+    fi
+fi
+
 # ── Terminal width detection ──────────────────────────────
 # Under Claude Code the statusline runs in a non-TTY subprocess; tput cols
 # returns a misleading default of 80 regardless of the real terminal width.
@@ -1319,6 +1421,7 @@ render_default() {
     ctx_line="${white}$(printf "%-7s" "context")${reset} ${CTX_BAR} ${CTX_COLOR}$(printf "%3d" "$CONTEXT_INT")%${reset}"
     printf "\n%b" "$ctx_line"
     [ -n "$rate_lines" ] && printf "\n%b" "$rate_lines"
+    [ -n "$ACCOUNT_RESETS_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "resets")${reset} %b" "$ACCOUNT_RESETS_DISPLAY"
     [ -n "$BUDGET_DISPLAY" ] && printf "\n%b" "$BUDGET_DISPLAY"
     [ -n "$TOKEN_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "tokens")${reset} %b" "$TOKEN_DISPLAY"
     [ -n "$CHALLENGE_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "$CHALLENGE_LABEL")${reset} %b" "$CHALLENGE_DISPLAY"
