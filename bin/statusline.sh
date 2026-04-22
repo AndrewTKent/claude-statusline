@@ -1250,37 +1250,65 @@ if [ "$DAILY_BUDGET" -gt 0 ] 2>/dev/null; then
     BUDGET_DISPLAY="${white}$(printf "%-7s" "budget")${reset} ${budget_bar} ${budget_color}$(printf "%3d" "$budget_pct")%${reset} ${white}\$${DAILY_FMT}${dim}/${reset}${white}\$${DAILY_BUDGET}${reset}"
 fi
 
-# ── Multi-account reset ledger line ────────────────────
-# Shows each tracked account's next 5-hour reset + current utilization, so
-# you know which login has headroom at a glance. Opt-in via SHOW_ACCOUNT_RESETS=1
-# in ~/.claude/statusline.conf. Data is written per-account during usage polls
-# (see background refresh block above) and keyed by email.
+# ── Multi-account block (opt-in: SHOW_ACCOUNT_RESETS=1) ─────────────────
+# Builds a per-account "account" block that REPLACES the default
+# current/weekly/extra rows. Layout:
 #
-# The current account's entry is highlighted; the soonest-to-reset gets a
-# "→" marker. Reset times in the past are projected forward in 5h increments
-# (matches existing format_reset_time behavior) to handle accounts you
-# haven't touched in a while.
-ACCOUNT_RESETS_DISPLAY=""
+#   account  ✦ work     92.3%  3:00am   397Kwu     →full 6m · extra 100% $500
+#            · alumni   12.9%  4:00am   23Kwu
+#            · personal   —      —       —
+#   weekly   59% work · 29% alumni · — personal
+#            — caps calibrating (12/30 samples)             (dim footer)
+#
+# - Active account marked ✦ (colored), others dim ·.
+# - Active account shows burn-down + extra inline.
+# - Rows sorted by projected 5h reset (soonest first).
+# - When caps ok → "(Xwu/Ywu)"; calibrating → "Xwu"; unknown → "—".
+ACCOUNT_BLOCK_ACTIVE=0  # set to 1 when we render the new block (so default
+                        # rate_lines/extra rows get suppressed in render_default)
+ACCOUNT_BLOCK=""
+ACCOUNT_BLOCK_FOOTER=""
+ACCOUNT_WEEKLY_LINE=""
+
 if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
     ledger_file="$HOME/.claude/account-resets.json"
     caps_file="$HOME/.claude/account-caps.json"
+    weights_file="$HOME/.claude/work-unit-weights.json"
+
     if [ -f "$ledger_file" ] && [ -n "$ACCT_EMAIL" ]; then
-        # Collect entries: email|tag|reset_epoch|pct per line. Project past
-        # reset times forward in 5h increments (18000s).
         now_ar=$(date +%s)
+        # Pull all ledger fields we need in one jq call
         entries=$(jq -r --argjson now "$now_ar" '
             to_entries[] |
-            [.key, (.value.five_hour_reset // ""), (.value.five_hour_pct // 0)] |
-            @tsv' "$ledger_file" 2>/dev/null)
+            [.key,
+             (.value.five_hour_reset // ""),
+             (.value.five_hour_pct // 0),
+             (.value.seven_day_reset // ""),
+             (.value.seven_day_pct // 0)
+            ] | @tsv' "$ledger_file" 2>/dev/null)
+
         if [ -n "$entries" ]; then
-            # Parse + compute projected epochs, find soonest
+            ACCOUNT_BLOCK_ACTIVE=1
+
+            # Helper: format token count as 123Kwu / 1.2Mwu / …
+            _wu_fmt() {
+                awk -v n="$1" 'BEGIN {
+                    if (n=="" || n+0==0) { print "—"; exit }
+                    if (n>=1e9) printf "%.1fB", n/1e9;
+                    else if (n>=1e6) printf "%.1fM", n/1e6;
+                    else if (n>=1e3) printf "%.0fK", n/1e3;
+                    else printf "%.0f", n
+                }'
+            }
+
+            # Parse entries, project past reset times forward in 5h increments.
             parsed=""
             soonest_epoch=""
-            while IFS=$'\t' read -r em iso pct; do
+            while IFS=$'\t' read -r em iso_5h pct_5h iso_7d pct_7d; do
                 [ -z "$em" ] && continue
                 ep=""
-                if [ -n "$iso" ] && [ "$iso" != "null" ]; then
-                    ep=$(iso_to_epoch "$iso")
+                if [ -n "$iso_5h" ] && [ "$iso_5h" != "null" ]; then
+                    ep=$(iso_to_epoch "$iso_5h")
                     if [ -n "$ep" ]; then
                         while [ "$ep" -le "$now_ar" ]; do
                             ep=$((ep + 18000))
@@ -1288,7 +1316,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     fi
                 fi
                 tag=$(resolve_account_label "$em")
-                parsed+="${em}|${tag}|${ep}|${pct}"$'\n'
+                parsed+="${em}|${tag}|${ep}|${pct_5h}|${pct_7d}|${iso_7d}"$'\n'
                 if [ -n "$ep" ]; then
                     if [ -z "$soonest_epoch" ] || [ "$ep" -lt "$soonest_epoch" ] 2>/dev/null; then
                         soonest_epoch="$ep"
@@ -1296,102 +1324,145 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 fi
             done <<< "$entries"
 
-            # Sort by projected reset epoch (soonest first). Entries with no
-            # epoch sort to the end.
+            # Sort by projected 5h reset (soonest first)
             parsed=$(printf '%s' "$parsed" | awk -F'|' 'NF>=4 { key=($3==""?"9999999999":$3); print key"\t"$0 }' | sort -n | cut -f2-)
 
-            rendered=""
-            while IFS='|' read -r em tag ep pct; do
+            # Render one row per account. First row gets "account " label,
+            # subsequent rows get blank padding so numbers align.
+            row_num=0
+            weekly_parts=""
+            while IFS='|' read -r em tag ep pct_5h pct_7d iso_7d; do
                 [ -z "$em" ] && continue
-                # Display time (respects the projected epoch)
+                is_active=0
+                [ "$em" = "$ACCT_EMAIL" ] && is_active=1
+
+                # Reset time display
                 if [ -n "$ep" ]; then
                     tdisp=$(date -j -r "$ep" +"%l:%M%p" 2>/dev/null | sed 's/^ //; s/\.//g' | tr '[:upper:]' '[:lower:]') || \
                         tdisp=$(date -d "@$ep" +"%l:%M%P" 2>/dev/null | sed 's/^ //; s/\.//g')
                 else
                     tdisp="—"
                 fi
-                # Label colour by tag, dim when not the current account
-                tag_color=$(_resolve_label_color "$tag")
+
+                # Label: colored + marked for active, dim for others
                 label="${tag:-$em}"
-                if [ "$em" = "$ACCT_EMAIL" ]; then
-                    seg="${tag_color}${label}${reset}"
+                name_col=$(_resolve_label_color "$tag")
+                if [ "$is_active" = 1 ]; then
+                    marker="${name_col}✦${reset}"
+                    label_seg="${name_col}$(printf "%-9s" "$label")${reset}"
                 else
-                    seg="${dim}${label}${reset}"
-                fi
-                # Soonest-to-reset marker
-                marker=" "
-                [ -n "$ep" ] && [ "$ep" = "$soonest_epoch" ] && marker="${cyan}→${reset}"
-                # Utilization: for the CURRENT account, use the interpolated
-                # value already computed by the rate-limit block (matches the
-                # "current" row exactly). For other accounts, fall back to
-                # the ledger value (no interpolation possible — we're not
-                # logged into them).
-                if [ "$em" = "$ACCT_EMAIL" ] && [ -n "${five_hour_pct_display:-}" ]; then
-                    pct_disp="$five_hour_pct_display"
-                else
-                    pct_disp="$pct"
-                fi
-                pct_int=$(printf "%.0f" "$pct_disp" 2>/dev/null || echo 0)
-                pct_color=$(color_for_pct "$pct_int")
-                # Display fractional util for the current account (matches the
-                # "current" row); other accounts only have integer ledger data.
-                if [ "$em" = "$ACCT_EMAIL" ]; then
-                    pct_show=$(fmt_pct "$pct_disp")
-                else
-                    pct_show=$(printf "%d%%" "$pct_int")
+                    marker="${dim}·${reset}"
+                    label_seg="${dim}$(printf "%-9s" "$label")${reset}"
                 fi
 
-                # Work-unit display from derive-cap.py. "wu" is a plan-agnostic
-                # unit defined as "1 output-token-equivalent" — it's consistent
-                # across accounts regardless of Pro/Max/Max-5× tier.
-                #   status=ok       → "(Xwu/Ywu)"
-                #   status=calibrating with current_wu → "(Xwu · calibrating)"
-                #   otherwise omitted
-                cap_suffix=""
+                # Utilization: interpolated for active, integer ledger for others
+                if [ "$is_active" = 1 ] && [ -n "${five_hour_pct_display:-}" ]; then
+                    pct_disp="$five_hour_pct_display"
+                    pct_show=$(fmt_pct "$pct_disp")
+                    pct_int=$(printf "%.0f" "$pct_disp" 2>/dev/null || echo 0)
+                else
+                    pct_disp="$pct_5h"
+                    pct_int=$(printf "%.0f" "$pct_disp" 2>/dev/null || echo 0)
+                    pct_show=$(printf "%d%%" "$pct_int")
+                fi
+                pct_color=$(color_for_pct "$pct_int")
+
+                # Work units: "Xwu/Ywu" (ok), "Xwu" (cal), "—" (no data)
+                wu_seg="—"
                 if [ -f "$caps_file" ]; then
                     cap_info=$(jq -r --arg e "$em" '.[$e] // empty |
                         if .status == "ok" and .cap_wu then
                           "ok|" + (.current_wu|tostring) + "|" + (.cap_wu|tostring)
                         elif .current_wu then
-                          "cal|" + (.current_wu|tostring) + "|" + ((.best_observed_wu // 0)|tostring)
+                          "cal|" + (.current_wu|tostring) + "|"
                         else "" end' "$caps_file" 2>/dev/null)
                     if [ -n "$cap_info" ]; then
                         IFS='|' read -r ci_status ci_cur ci_cap <<< "$cap_info"
-                        _wu_fmt() {
-                            awk -v n="$1" 'BEGIN {
-                                if (n>=1e9) printf "%.1fB", n/1e9;
-                                else if (n>=1e6) printf "%.1fM", n/1e6;
-                                else if (n>=1e3) printf "%.0fK", n/1e3;
-                                else printf "%.0f", n
-                            }'
-                        }
                         cur_fmt=$(_wu_fmt "$ci_cur")
                         if [ "$ci_status" = "ok" ]; then
                             cap_fmt=$(_wu_fmt "$ci_cap")
-                            cap_suffix=" ${dim}(${reset}${white}${cur_fmt}wu${dim}/${white}${cap_fmt}wu${dim})${reset}"
-                        elif [ "$ci_status" = "cal" ]; then
-                            cap_suffix=" ${dim}(${reset}${dim}${cur_fmt}wu · calibrating${dim})${reset}"
+                            wu_seg="${white}${cur_fmt}wu${dim}/${white}${cap_fmt}wu${reset}"
+                        else
+                            wu_seg="${white}${cur_fmt}wu${reset}"
                         fi
                     fi
                 fi
 
-                # Legacy pending-samples fallback (no wu data yet at all)
-                if [ -z "$cap_suffix" ] && [ -f "$caps_file" ]; then
-                    legacy=$(jq -r --arg e "$em" '.[$e] // empty |
-                        if .n_points then
-                          "pending|" + (.n_points|tostring) + "|" + ((.min_required // 30)|tostring)
-                        else "" end' "$caps_file" 2>/dev/null)
-                    if [ -n "$legacy" ]; then
-                        IFS='|' read -r ci_status ci_a ci_b <<< "$legacy"
-                        if [ "$ci_status" = "pending" ]; then
-                            cap_suffix=" ${dim}(${ci_a}/${ci_b} samples)${reset}"
-                        fi
+                # Active row trailer: →full + extra (from existing rate-limit vars)
+                trailer=""
+                if [ "$is_active" = 1 ]; then
+                    trailer_parts=""
+                    # →full projection (from rate-limit block — already colored)
+                    if [ -n "${mins_to_full:-}" ] && [ "${mins_to_full}" -gt 0 ] 2>/dev/null && [ "${mins_to_full}" -lt 6000 ] 2>/dev/null; then
+                        full_disp=$(fmt_duration_m "$mins_to_full")
+                        bd_color="$green"
+                        [ "$mins_to_full" -le 60 ] && bd_color="$orange"
+                        [ "$mins_to_full" -le 30 ] && bd_color="$yellow"
+                        [ "$mins_to_full" -le 15 ] && bd_color="$red"
+                        trailer_parts="${bd_color}→full ~${full_disp}${reset}"
                     fi
+                    # Extra usage inline (only when enabled)
+                    if [ "${extra_enabled:-false}" = "true" ] && [ -n "${extra_used_raw:-}" ]; then
+                        extra_used_fmt=$(awk "BEGIN {printf \"\$%.0f\", $extra_used_raw / 100}" 2>/dev/null)
+                        extra_pct_int=$(printf "%.0f" "${extra_pct_raw:-0}" 2>/dev/null || echo 0)
+                        extra_pct_col=$(color_for_pct "$extra_pct_int")
+                        if [ -n "$trailer_parts" ]; then
+                            trailer_parts+=" ${dim}·${reset} "
+                        fi
+                        trailer_parts+="${extra_pct_col}extra ${extra_pct_int}%${reset} ${dim}${extra_used_fmt}${reset}"
+                    fi
+                    [ -n "$trailer_parts" ] && trailer="   ${trailer_parts}"
                 fi
 
-                rendered+="${marker}${seg} ${white}${tdisp}${reset} ${pct_color}${pct_show}${reset}${cap_suffix}   "
+                # Leading label: "account" on first row, blank pad on others
+                if [ "$row_num" = 0 ]; then
+                    lead="${white}$(printf "%-7s" "account")${reset}"
+                else
+                    lead="$(printf '%7s' '')"
+                fi
+
+                # Assemble row
+                row="${lead} ${marker} ${label_seg} ${pct_color}$(printf "%-7s" "$pct_show")${reset} ${white}$(printf "%-8s" "$tdisp")${reset} $(printf "%-14s" "${wu_seg}")${trailer}"
+                if [ -z "$ACCOUNT_BLOCK" ]; then
+                    ACCOUNT_BLOCK="$row"
+                else
+                    ACCOUNT_BLOCK+=$'\n'"$row"
+                fi
+
+                # Accumulate weekly segment for this account
+                pct_7d_int=$(printf "%.0f" "$pct_7d" 2>/dev/null || echo 0)
+                pct_7d_col=$(color_for_pct "$pct_7d_int")
+                if [ "$is_active" = 1 ]; then
+                    w_seg="${pct_7d_col}${pct_7d_int}%${reset} ${name_col}${label}${reset}"
+                else
+                    w_seg="${pct_7d_col}${pct_7d_int}%${reset} ${dim}${label}${reset}"
+                fi
+                if [ -z "$weekly_parts" ]; then
+                    weekly_parts="$w_seg"
+                else
+                    weekly_parts+=" ${dim}·${reset} $w_seg"
+                fi
+
+                row_num=$((row_num + 1))
             done <<< "$parsed"
-            [ -n "$rendered" ] && ACCOUNT_RESETS_DISPLAY="$rendered"
+
+            ACCOUNT_WEEKLY_LINE="${white}$(printf "%-7s" "weekly")${reset} ${weekly_parts}"
+
+            # Footer: weights calibration status (dim)
+            if [ -f "$weights_file" ]; then
+                wfoot=$(jq -r '
+                    if .status == "ok" then
+                        "ok|" + (.r_squared|tostring) + "|" + (.n_samples|tostring)
+                    else
+                        "cal|" + (.n_samples|tostring) + "|" + ((.min_samples // 30)|tostring) + "|" + ((.r_squared // 0)|tostring)
+                    end' "$weights_file" 2>/dev/null)
+                if [ -n "$wfoot" ]; then
+                    IFS='|' read -r f_stat a b c <<< "$wfoot"
+                    if [ "$f_stat" = "cal" ]; then
+                        ACCOUNT_BLOCK_FOOTER="$(printf '%7s' '') ${dim}— caps calibrating (${a}/${b} samples, r²=${c})${reset}"
+                    fi
+                fi
+            fi
         fi
     fi
 fi
@@ -1510,8 +1581,15 @@ render_default() {
     # Detail lines (dimmer for visual hierarchy)
     ctx_line="${white}$(printf "%-7s" "context")${reset} ${CTX_BAR} ${CTX_COLOR}$(printf "%3d" "$CONTEXT_INT")%${reset}"
     printf "\n%b" "$ctx_line"
-    [ -n "$rate_lines" ] && printf "\n%b" "$rate_lines"
-    [ -n "$ACCOUNT_RESETS_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "resets")${reset} %b" "$ACCOUNT_RESETS_DISPLAY"
+    # When the multi-account block is active, it REPLACES the default
+    # current/weekly/extra rows (they're already folded into the block).
+    if [ "${ACCOUNT_BLOCK_ACTIVE:-0}" = "1" ] && [ -n "$ACCOUNT_BLOCK" ]; then
+        printf "\n%b" "$ACCOUNT_BLOCK"
+        [ -n "$ACCOUNT_WEEKLY_LINE" ] && printf "\n%b" "$ACCOUNT_WEEKLY_LINE"
+        [ -n "$ACCOUNT_BLOCK_FOOTER" ] && printf "\n%b" "$ACCOUNT_BLOCK_FOOTER"
+    else
+        [ -n "$rate_lines" ] && printf "\n%b" "$rate_lines"
+    fi
     [ -n "$BUDGET_DISPLAY" ] && printf "\n%b" "$BUDGET_DISPLAY"
     [ -n "$TOKEN_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "tokens")${reset} %b" "$TOKEN_DISPLAY"
     [ -n "$CHALLENGE_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "$CHALLENGE_LABEL")${reset} %b" "$CHALLENGE_DISPLAY"
