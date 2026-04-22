@@ -298,10 +298,28 @@ def collect_samples(history: list[dict]) -> dict[str, list[tuple[float, int, int
 
 
 def fit_weights(samples_by_email: dict) -> dict:
-    """Fit Δutil = Σ w_i · Δtokens_i via NNLS across ALL accounts' samples.
+    """Fit utilization via a constrained 2-parameter model to sidestep collinearity.
 
-    Anthropic's formula is universal — combining accounts' samples only
-    improves the fit, never hurts it.
+    Problem with full 4-variable NNLS: in/out/cr/cc move together per request
+    (cache_read and output_tokens had correlation 0.82 on real data), so NNLS
+    can't distinguish their individual weights. It arbitrarily dumps all the
+    credit on one variable.
+
+    Solution: physically constrain the model by assuming a known coupling
+    between output and cache_read — Anthropic's billing almost certainly uses
+    a fixed cache-read discount ratio k, i.e. effective_tokens = out + cr/k.
+    Input and cache_creation are absorbed into k (they're small anyway).
+
+        util = a × (out + cr/k)     (2 unknowns)
+
+    Fit procedure:
+      1. Grid-search k ∈ {1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000}
+      2. For each k, solve for a via weighted least-squares through origin
+      3. Pick (a, k) with best R²
+
+    This trades 2 degrees of freedom for 4, stabilizing under collinearity at
+    the cost of a small bias if Anthropic's real formula isn't purely out+cr/k.
+    In practice it tends to produce interpretable, stable numbers.
     """
     all_samples = []
     for email, rows in samples_by_email.items():
@@ -315,33 +333,62 @@ def fit_weights(samples_by_email: dict) -> dict:
             "last_updated": int(datetime.now().timestamp()),
         }
 
-    Y = np.array([s[0] for s in all_samples], dtype=float)
-    X = np.array([[s[1], s[2], s[3], s[4]] for s in all_samples], dtype=float)
+    Y = np.array([s[0] for s in all_samples], dtype=float)     # Δutil
+    OUT = np.array([s[2] for s in all_samples], dtype=float)   # Δ output
+    CR = np.array([s[3] for s in all_samples], dtype=float)    # Δ cache_read
+    # in + cc are small and noisy — fold cc into the cr/k bucket, drop in entirely.
+    CC = np.array([s[4] for s in all_samples], dtype=float)
 
-    try:
-        from scipy.optimize import nnls
-        w, _ = nnls(X, Y)
-    except ImportError:
-        w, *_ = np.linalg.lstsq(X, Y, rcond=None)
-        w = np.clip(w, 0, None)
+    # Grid of candidate cache discount ratios
+    k_grid = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000,
+              10000, 20000, 50000, 100000, float('inf')]
 
-    pred = X @ w
-    ss_res = float(np.sum((Y - pred) ** 2))
-    ss_tot = float(np.sum((Y - Y.mean()) ** 2))
-    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
-    r2 = max(0.0, min(1.0, r2))
+    best = None  # (k, a, r2)
+    for k in k_grid:
+        # Effective tokens: out + cr/k  (fold cc into cr since it's also cache-ish)
+        Xeff = OUT + (CR + CC) / k
+        # Weighted least-squares through origin: a = Σ(y·x) / Σ(x²)
+        sum_xy = float(np.sum(Y * Xeff))
+        sum_xx = float(np.sum(Xeff * Xeff))
+        if sum_xx <= 0:
+            continue
+        a = sum_xy / sum_xx
+        if a <= 0:
+            continue
+        pred = a * Xeff
+        ss_res = float(np.sum((Y - pred) ** 2))
+        ss_tot = float(np.sum((Y - Y.mean()) ** 2))
+        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+        r2 = max(0.0, min(1.0, r2))
+        if best is None or r2 > best[2]:
+            best = (k, a, r2)
 
-    status = "ok" if (r2 >= MIN_WEIGHT_R2 and len(all_samples) >= MIN_WEIGHT_SAMPLES) else "calibrating"
+    if best is None:
+        return {
+            "status": "calibrating",
+            "n_samples": len(all_samples),
+            "min_required": MIN_WEIGHT_SAMPLES,
+            "last_updated": int(datetime.now().timestamp()),
+        }
+
+    k_best, a_best, r2_best = best
+    # Convert the 2-param model back to the 4-weight schema the rest of the
+    # code expects. "in" weight is absorbed into cc (small effect either way).
+    weights = {
+        "in": 0.0,                  # dropped from the model
+        "out": float(a_best),       # primary weight
+        "cr": float(a_best / k_best),
+        "cc": float(a_best / k_best),  # folded into cache bucket
+    }
+
+    status = "ok" if (r2_best >= MIN_WEIGHT_R2 and len(all_samples) >= MIN_WEIGHT_SAMPLES) else "calibrating"
 
     return {
         "status": status,
-        "weights": {
-            "in": float(w[0]),
-            "out": float(w[1]),
-            "cr": float(w[2]),
-            "cc": float(w[3]),
-        },
-        "r_squared": round(r2, 3),
+        "weights": weights,
+        "model": "constrained-2param",
+        "cache_discount_k": float(k_best),
+        "r_squared": round(r2_best, 3),
         "n_samples": len(all_samples),
         "min_samples": MIN_WEIGHT_SAMPLES,
         "min_r_squared": MIN_WEIGHT_R2,
