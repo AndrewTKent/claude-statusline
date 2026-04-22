@@ -1414,11 +1414,14 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     [ -n "$trailer_parts" ] && trailer="   ${trailer_parts}"
                 fi
 
-                # Leading label: "account" on first row, blank pad on others
+                # Leading label: "account" on first row, 7 literal spaces
+                # on subsequent rows so the ✦/· markers line up. We use a
+                # literal string (not printf) because %b interpretation in
+                # the final render doesn't preserve printf's padding.
                 if [ "$row_num" = 0 ]; then
-                    lead="${white}$(printf "%-7s" "account")${reset}"
+                    lead="${white}account${reset}"
                 else
-                    lead="$(printf '%7s' '')"
+                    lead="       "
                 fi
 
                 # Assemble row
@@ -1459,7 +1462,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 if [ -n "$wfoot" ]; then
                     IFS='|' read -r f_stat a b c <<< "$wfoot"
                     if [ "$f_stat" = "cal" ]; then
-                        ACCOUNT_BLOCK_FOOTER="$(printf '%7s' '') ${dim}— caps calibrating (${a}/${b} samples, r²=${c})${reset}"
+                        ACCOUNT_BLOCK_FOOTER="        ${dim}— caps calibrating (${a}/${b} samples, r²=${c})${reset}"
                     fi
                 fi
             fi
