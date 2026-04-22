@@ -1303,6 +1303,9 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
             rendered=""
             while IFS='|' read -r em tag ep pct; do
                 [ -z "$em" ] && continue
+                # Reset per-iteration cap vars so stale values don't leak across
+                # accounts when jq returns empty for this email.
+                ci_status="" ci_cur="0" ci_cap=""
                 # Display time (respects the projected epoch)
                 if [ -n "$ep" ]; then
                     tdisp=$(date -j -r "$ep" +"%l:%M%p" 2>/dev/null | sed 's/^ //; s/\.//g' | tr '[:upper:]' '[:lower:]') || \
@@ -1370,7 +1373,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                             cap_fmt=$(_wu_fmt "$ci_cap")
                             cap_suffix=" ${dim}(${reset}${white}${cur_fmt}wu${dim}/${white}${cap_fmt}wu${dim})${reset}"
                         elif [ "$ci_status" = "cal" ]; then
-                            cap_suffix=" ${dim}(${reset}${dim}${cur_fmt}wu · calibrating${dim})${reset}"
+                            cap_suffix=" ${dim}(${cur_fmt}wu)${reset}"
                         fi
                     fi
                 fi
@@ -1387,6 +1390,13 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                             cap_suffix=" ${dim}(${ci_a}/${ci_b} samples)${reset}"
                         fi
                     fi
+                fi
+
+                # Skip dead-weight rows: non-current accounts with no usage
+                # signal (0% and no observed wu). These just bloat the line
+                # past Claude Code's status-panel width budget and cause collapse.
+                if [ "$em" != "$ACCT_EMAIL" ] && [ "$pct_int" = "0" ] && { [ -z "$cap_suffix" ] || [ "${ci_cur:-0}" = "0" ]; }; then
+                    continue
                 fi
 
                 rendered+="${marker}${seg} ${white}${tdisp}${reset} ${pct_color}${pct_show}${reset}${cap_suffix}   "
