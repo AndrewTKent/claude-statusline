@@ -1660,17 +1660,25 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
 
                 # Stash the row so we can emit after we know the best_em.
                 tdisp_padded=$(_pad_to_cols "$tdisp" 8)
-                if [ -n "$_hrs_to_reset" ]; then
-                    hrs_col="${_hrs_to_reset}h"
+
+                # Trailing column: extra-usage reset date (1st of next month
+                # local — matches Anthropic's monthly rollover policy and the
+                # dashboard's "Resets May 1"). Only shown when the account has
+                # extra usage enabled; otherwise a dash. Replaces the
+                # redundant "hours to 5h reset" — tdisp already shows that
+                # moment as a local time.
+                if [ -n "$extra_pct" ] && [ -n "$extra_limit_cents" ] && awk "BEGIN{exit !(${extra_limit_cents:-0} > 0)}"; then
+                    # First of next month, in local TZ.
+                    extra_reset_col=$(date -v1d -v+1m +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]' || \
+                                      date -d "$(date +%Y-%m-01) +1 month" +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]')
                 else
-                    hrs_col="—"
+                    extra_reset_col="—"
                 fi
-                # right-justify hrs to 5 cols
-                hrs_n=${#hrs_col}
-                hrs_pad=$(( 5 - hrs_n ))
-                [ "$hrs_pad" -lt 0 ] && hrs_pad=0
-                hrs_col=$(printf '%*s%s' "$hrs_pad" '' "$hrs_col")
-                row_line="${marker}${white}$(_pad_to_cols "$display_name" 8)${reset} ${white}${tdisp_padded}${reset}${pct_color}$(printf '%4s' "${pct_int}%")${reset}  ${extra_seg}  ${dim}${hrs_col}${reset}"
+                reset_n=${#extra_reset_col}
+                reset_pad=$(( 6 - reset_n ))
+                [ "$reset_pad" -lt 0 ] && reset_pad=0
+                extra_reset_col=$(printf '%*s%s' "$reset_pad" '' "$extra_reset_col")
+                row_line="${marker}${white}$(_pad_to_cols "$display_name" 8)${reset} ${white}${tdisp_padded}${reset}${pct_color}$(printf '%4s' "${pct_int}%")${reset}  ${extra_seg}  ${dim}${extra_reset_col}${reset}"
                 # Annotate with hard-wall warning when applicable. (Windfall
                 # is implicit from the hrs_col — no extra note needed.)
                 if [ "$has_wall" = "1" ]; then
