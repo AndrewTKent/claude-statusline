@@ -1261,9 +1261,21 @@ fi
 # (matches existing format_reset_time behavior) to handle accounts you
 # haven't touched in a while.
 ACCOUNT_RESETS_DISPLAY=""
+ACCOUNT_ROWS=""  # per-account stacked rows (new layout); each row starts with \n
 if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
     ledger_file="$HOME/.claude/account-resets.json"
     caps_file="$HOME/.claude/account-caps.json"
+    hist_file="$HOME/.claude/utilization-history.jsonl"
+    # Build email -> latest extra_pct map from the history log's tail.
+    # Bash 3.2 on macOS has no assoc arrays, so store as a newline-delimited
+    # "email<TAB>pct" string and grep it for lookup. Read only the tail to keep
+    # it cheap. awk keeps the most recent value per email.
+    EXTRA_PCT_LOOKUP=""
+    if [ -f "$hist_file" ]; then
+        EXTRA_PCT_LOOKUP=$(tail -c 200000 "$hist_file" 2>/dev/null | \
+            jq -r 'select(.email) | [.email, (.extra_pct // 0)] | @tsv' 2>/dev/null | \
+            awk -F'\t' '{by[$1]=$2} END{for(k in by) print k"\t"by[k]}')
+    fi
     if [ -f "$ledger_file" ] && [ -n "$ACCT_EMAIL" ]; then
         # Collect entries: email|tag|reset_epoch|pct per line. Project past
         # reset times forward in 5h increments (18000s).
@@ -1401,40 +1413,116 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
 
                 rendered+="${marker}${seg} ${white}${tdisp}${reset} ${pct_color}${pct_show}${reset}${cap_suffix}   "
 
-                # Track best-next-account candidate: highest headroom among
-                # non-current accounts. We emit a hint after the resets row
-                # telling the user where to hop when their current account caps.
-                # Skip candidates that are already at/near cap or whose reset
-                # is imminent (they'll refill themselves — save them for after).
-                _headroom=$(( 100 - pct_int ))
-                if [ "$em" != "$ACCT_EMAIL" ] && [ "$_headroom" -ge 20 ]; then
-                    # Score = headroom × proximity penalty (accounts resetting
-                    # soon score lower, since using them now wastes their reset).
-                    _now_ep=$(date +%s)
-                    if [ -n "$ep" ]; then
-                        _hrs=$(( (ep - _now_ep) / 3600 ))
-                        [ "$_hrs" -lt 1 ] && _hrs=1
-                        [ "$_hrs" -gt 5 ] && _hrs=5
-                        _score=$(( _headroom * _hrs / 5 ))
-                    else
-                        _score=$_headroom
-                    fi
-                    if [ "$_score" -gt "${_best_score:-0}" ]; then
-                        _best_score=$_score
-                        _best_tag=$tag
-                        _best_headroom=$_headroom
+                # ── Per-account row (new stacked layout) ──
+                # Pull this account's latest extra-credit % from the lookup
+                # string we built above. "—" when no history yet.
+                extra_pct=""
+                if [ -n "$EXTRA_PCT_LOOKUP" ]; then
+                    extra_pct=$(printf '%s\n' "$EXTRA_PCT_LOOKUP" | awk -F'\t' -v e="$em" '$1==e {print $2; exit}')
+                fi
+                if [ -n "$extra_pct" ]; then
+                    extra_int=$(printf "%.0f" "$extra_pct" 2>/dev/null || echo 0)
+                    extra_color=$(color_for_pct "$extra_int")
+                    extra_seg="${dim}extra${reset} ${extra_color}$(printf "%3d%%" "$extra_int")${reset}"
+                else
+                    extra_int=0
+                    extra_seg="${dim}extra   —${reset}"
+                fi
+
+                # Hours-to-reset (computed from ep above, if known).
+                _now_ep=$(date +%s)
+                if [ -n "$ep" ]; then
+                    _secs_to_reset=$(( ep - _now_ep ))
+                    _hrs_to_reset=$(awk -v s="$_secs_to_reset" 'BEGIN { printf "%.1f", s/3600 }')
+                else
+                    _hrs_to_reset=""
+                fi
+
+                # Row note: one of (in priority order)
+                #   ⚠ hard wall  — 5h≥90% AND extra≥99% AND not resetting soon
+                #   ✓ use now    — best non-current candidate under the same
+                #                  scoring model as plan CLI
+                #   → resets Xh  — a reset lands within 2h (windfall)
+                #   (blank)      — unremarkable
+                note=""
+                headroom=$(( 100 - pct_int ))
+                extra_headroom=$(( 100 - extra_int ))
+                has_wall=0
+                if [ "$pct_int" -ge 90 ] 2>/dev/null && [ "$extra_int" -ge 99 ] 2>/dev/null; then
+                    if [ -z "$_hrs_to_reset" ] || awk "BEGIN{exit !($_hrs_to_reset > 1.0)}"; then
+                        note="${red}⚠ hard wall${reset}"
+                        has_wall=1
                     fi
                 fi
+
+                # Compute planning score (for later pick of best non-current).
+                # Matches the python plan model: window_headroom + 0.5×extra
+                # + reset_windfall_if_within_2h − hard_wall_penalty.
+                windfall=0
+                if [ -n "$_hrs_to_reset" ]; then
+                    # Bonus scaled by fraction of a 2h plan horizon that lands
+                    # AFTER the reset.
+                    windfall=$(awk -v h="$_hrs_to_reset" 'BEGIN {
+                        if (h < 0 || h >= 2) print 0; else printf "%d", 100*(2-h)/2
+                    }')
+                fi
+                score=$(( headroom + extra_headroom / 2 + windfall ))
+                [ "$has_wall" = "1" ] && score=0
+
+                # Track best non-current account for the "✓ use now" marker.
+                if [ "$em" != "$ACCT_EMAIL" ] && [ "$score" -gt "${_best_score:-0}" ]; then
+                    _best_score=$score
+                    _best_em=$em
+                fi
+
+                # Stash the row so we can emit after we know the best_em.
+                # printf's %-Ns counts BYTES not display columns, which
+                # misaligns UTF-8 chars like "—" (3 bytes, 1 column). Pad
+                # manually based on character count so the grid stays clean.
+                _pad_to_cols() {
+                    local s=$1 want=$2
+                    local n=${#s}
+                    local pad=$(( want - n ))
+                    if [ "$pad" -gt 0 ]; then
+                        printf '%s' "$s"
+                        printf '%*s' "$pad" ''
+                    else
+                        printf '%s' "$s"
+                    fi
+                }
+                tdisp_padded=$(_pad_to_cols "$tdisp" 8)
+                if [ -n "$_hrs_to_reset" ]; then
+                    hrs_col="${_hrs_to_reset}h"
+                else
+                    hrs_col="—"
+                fi
+                # right-justify hrs to 5 cols
+                hrs_n=${#hrs_col}
+                hrs_pad=$(( 5 - hrs_n ))
+                [ "$hrs_pad" -lt 0 ] && hrs_pad=0
+                hrs_col=$(printf '%*s%s' "$hrs_pad" '' "$hrs_col")
+                row_line="${marker}$(_pad_to_cols "$tag" 9) ${white}${tdisp_padded}${reset}${pct_color}$(printf '%4s' "${pct_int}%")${reset}  ${extra_seg}  ${dim}${hrs_col}${reset}"
+                # Annotate with hard-wall warning when applicable. (Windfall
+                # is implicit from the hrs_col — no extra note needed.)
+                if [ "$has_wall" = "1" ]; then
+                    row_line+="  ${red}⚠ hard wall${reset}"
+                fi
+                ACCOUNT_ROWS+="|${em}:${row_line}"
             done <<< "$parsed"
             [ -n "$rendered" ] && ACCOUNT_RESETS_DISPLAY="$rendered"
 
-            # Emit a "next best" hint only if the current account is near cap
-            # (≥70%). Otherwise the current account is fine — no nag.
-            ACCOUNT_NEXT_DISPLAY=""
-            if [ -n "${_best_tag:-}" ] && [ "${five_hour_pct:-0}" -ge 70 ] 2>/dev/null; then
-                _best_color=$(_resolve_label_color "$_best_tag")
-                ACCOUNT_NEXT_DISPLAY="${cyan}→${reset} ${_best_color}${_best_tag}${reset} ${dim}(${_best_headroom}% headroom)${reset}"
-            fi
+            # Second pass: annotate the "✓ best next" row and assemble final output.
+            FINAL_ACCOUNT_ROWS=""
+            IFS='|' read -ra _rows <<< "$ACCOUNT_ROWS"
+            for r in "${_rows[@]}"; do
+                [ -z "$r" ] && continue
+                row_em="${r%%:*}"
+                row_body="${r#*:}"
+                if [ -n "${_best_em:-}" ] && [ "$row_em" = "$_best_em" ] && [ "${five_hour_pct:-0}" -ge 70 ] 2>/dev/null; then
+                    row_body+="   ${green}✓ best next ~2h${reset}"
+                fi
+                FINAL_ACCOUNT_ROWS+=$'\n'"  ${row_body}"
+            done
         fi
     fi
 fi
@@ -1554,8 +1642,9 @@ render_default() {
     ctx_line="${white}$(printf "%-7s" "context")${reset} ${CTX_BAR} ${CTX_COLOR}$(printf "%3d" "$CONTEXT_INT")%${reset}"
     printf "\n%b" "$ctx_line"
     [ -n "$rate_lines" ] && printf "\n%b" "$rate_lines"
-    [ -n "$ACCOUNT_RESETS_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "resets")${reset} %b" "$ACCOUNT_RESETS_DISPLAY"
-    [ -n "$ACCOUNT_NEXT_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "hop")${reset} %b" "$ACCOUNT_NEXT_DISPLAY"
+    if [ -n "$FINAL_ACCOUNT_ROWS" ]; then
+        printf "\n${white}$(printf "%-7s" "resets")${reset}%b" "$FINAL_ACCOUNT_ROWS"
+    fi
     [ -n "$BUDGET_DISPLAY" ] && printf "\n%b" "$BUDGET_DISPLAY"
     [ -n "$TOKEN_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "tokens")${reset} %b" "$TOKEN_DISPLAY"
     [ -n "$CHALLENGE_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "$CHALLENGE_LABEL")${reset} %b" "$CHALLENGE_DISPLAY"
