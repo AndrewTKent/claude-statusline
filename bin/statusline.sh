@@ -1711,18 +1711,19 @@ fi
 render_default() {
     line1b=""
     if [ "$COLS" -ge 100 ]; then
-        # Row 1: identity (model, account, dir+git, ctx badge, focus).
+        # Row 1: model + session timer (what you're running, how long).
         line1="${blue}${MODEL}${reset}${EFFORT}${FAST_MODE}"
-        [ -n "$ACCOUNT_LABEL" ] && line1+="${sep}${ACCOUNT_LABEL}"
-        line1+="${sep}${cyan}${DIR_NAME}${reset}${SHORT_GIT_INFO}${FOCUS}"
-        # Row 2: just the session timer + idle indicator. Cost/burn/billable
-        # dropped — this isn't a consulting dashboard.
-        [ -n "$SESSION_TIME" ] && line1b="${dim}⏱${reset} ${white}${SESSION_TIME}${reset}${IDLE_DISPLAY}"
+        [ -n "$SESSION_TIME" ] && line1+="${sep}${dim}⏱${reset} ${white}${SESSION_TIME}${reset}${IDLE_DISPLAY}"
+        # Row 2: account + where you are (email, dir, git, focus).
+        line1b=""
+        [ -n "$ACCOUNT_LABEL" ] && line1b+="${ACCOUNT_LABEL}${sep}"
+        line1b+="${cyan}${DIR_NAME}${reset}${SHORT_GIT_INFO}${FOCUS}"
     else
         line1="${blue}${MODEL}${reset}${EFFORT}${FAST_MODE}"
-        [ -n "$ACCOUNT_LABEL" ] && line1+="${sep}${ACCOUNT_LABEL}"
-        [ -n "$TINY_GIT_INFO" ] && line1+="${sep}${TINY_GIT_INFO}"
-        line1+="${sep}${FOCUS}"
+        [ -n "$SESSION_TIME" ] && line1+="${sep}${dim}⏱${reset} ${white}${SESSION_TIME}${reset}"
+        line1b=""
+        [ -n "$ACCOUNT_LABEL" ] && line1b+="${ACCOUNT_LABEL}${sep}"
+        [ -n "$TINY_GIT_INFO" ] && line1b+="${TINY_GIT_INFO# }"
     fi
 
     printf "%b\n" "$line1"
