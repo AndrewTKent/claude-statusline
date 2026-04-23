@@ -1349,17 +1349,16 @@ fi
 # Bar length is full-minutes/total-window-minutes so the filled portion
 # represents how much of the 5h window your current pace covers.
 if [ -n "${CUR_FULL_DISPLAY:-}" ]; then
-    # Compute bar fill from mins_to_full (computed above) vs the 5h window
-    # (300 min). Clamped 0..100.
-    _survive_pct=$(awk -v m="${mins_to_full:-0}" 'BEGIN {
+    # Burn bar: % of 5h window you'll CONSUME at current pace (the inverse
+    # of "% covered"). Fills up as you burn faster. High = cap early = bad.
+    _burn_pct=$(awk -v m="${mins_to_full:-0}" 'BEGIN {
         p = m * 100 / 300;
         if (p > 100) p = 100;
         if (p < 0)   p = 0;
-        printf "%d", p
+        printf "%d", 100 - p
     }')
-    # low-bad: % of 5h covered at current pace. Low = cap hit early = bad.
-    _survive_bar=$(build_bar "$_survive_pct" 15 "low-bad")
-    SURVIVE_BAR_LINE="${white}$(printf "%-7s" "survive")${reset} ${_survive_bar} "
+    _burn_bar=$(build_bar "$_burn_pct" 15)
+    SURVIVE_BAR_LINE="${white}$(printf "%-7s" "burn")${reset} ${_burn_bar} "
     if [ -n "${CUR_SURVIVE_DISPLAY:-}" ]; then
         SURVIVE_BAR_LINE+="${CUR_SURVIVE_COLOR}${CUR_SURVIVE_DISPLAY}${reset} "
     fi
@@ -1794,13 +1793,17 @@ render_default() {
     # Headroom bar for the current 5h window — how much you've got LEFT.
     # Uses interpolated five_hour_pct from the rate-limit block above.
     if [ -n "${five_hour_pct:-}" ]; then
-        headroom_int=$(( 100 - ${five_hour_pct%.*} ))
-        [ "$headroom_int" -lt 0 ] && headroom_int=0
-        # low-bad: headroom IS the metric (0% = nothing left = red).
-        headroom_bar=$(build_bar "$headroom_int" 15 "low-bad")
-        headroom_color=$(color_for_pct "$headroom_int" "low-bad")
-        headroom_line="${white}$(printf "%-7s" "left")${reset} ${headroom_bar} ${headroom_color}$(printf "%3d" "$headroom_int")%${reset}"
-        printf "\n%b" "$headroom_line"
+        # Show 5h window as "used" — fills up as you consume. Strip decimals
+        # so integer comparisons in color_for_pct work (the sibling bug that
+        # made the old 'left' row silently green — see git blame on this
+        # block for the fallthrough story).
+        used_int="${five_hour_pct%.*}"
+        [ "$used_int" -lt 0 ] 2>/dev/null && used_int=0
+        [ "$used_int" -gt 100 ] 2>/dev/null && used_int=100
+        used_bar=$(build_bar "$used_int" 15)
+        used_color=$(color_for_pct "$used_int")
+        used_line="${white}$(printf "%-7s" "used")${reset} ${used_bar} ${used_color}$(printf "%3d" "$used_int")%${reset}"
+        printf "\n%b" "$used_line"
     fi
     [ -n "$WEEKLY_BAR_LINE"  ] && printf "\n%b" "$WEEKLY_BAR_LINE"
     [ -n "$SURVIVE_BAR_LINE" ] && printf "\n%b" "$SURVIVE_BAR_LINE"
