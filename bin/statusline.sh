@@ -1646,9 +1646,7 @@ render_default() {
     [ -n "$TOKEN_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "tokens")${reset} %b" "$TOKEN_DISPLAY"
     [ -n "$CHALLENGE_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "$CHALLENGE_LABEL")${reset} %b" "$CHALLENGE_DISPLAY"
     [ -n "$BOUNTY_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "bounty")${reset} %b" "$BOUNTY_DISPLAY"
-    if [ -n "$FINAL_ACCOUNT_ROWS" ]; then
-        printf "\n${white}$(printf "%-7s" "resets")${reset}%b" "$FINAL_ACCOUNT_ROWS"
-    fi
+    [ -n "$FINAL_ACCOUNT_ROWS" ] && printf "%b" "$FINAL_ACCOUNT_ROWS"
 }
 
 # ── Render: sigil (single dense line) ─────────────────────
