@@ -1715,19 +1715,14 @@ render_default() {
         line1="${blue}${MODEL}${reset}${EFFORT}${FAST_MODE}"
         [ -n "$ACCOUNT_LABEL" ] && line1+="${sep}${ACCOUNT_LABEL}"
         line1+="${sep}${cyan}${DIR_NAME}${reset}${SHORT_GIT_INFO}${FOCUS}"
-        # Row 2: state (cost + burn + billable + timer + idle). Split so the
-        # header doesn't get truncated by Claude Code's status area width.
-        # Each segment is pipe-separated; vars have a leading space we strip.
-        line1b="${magenta}\$${COST_FMT}${reset}"
-        [ -n "$DAILY_SUFFIX" ] && line1b+="${sep}${DAILY_SUFFIX# }"
-        [ -n "$BURN_RATE" ] && line1b+="${sep}${BURN_RATE# }"
-        [ -n "$BILLABLE" ] && line1b+="${sep}${BILLABLE# }"
-        [ -n "$SESSION_TIME" ] && line1b+="${sep}${dim}⏱${reset} ${white}${SESSION_TIME}${reset}${IDLE_DISPLAY}"
+        # Row 2: just the session timer + idle indicator. Cost/burn/billable
+        # dropped — this isn't a consulting dashboard.
+        [ -n "$SESSION_TIME" ] && line1b="${dim}⏱${reset} ${white}${SESSION_TIME}${reset}${IDLE_DISPLAY}"
     else
         line1="${blue}${MODEL}${reset}${EFFORT}${FAST_MODE}"
         [ -n "$ACCOUNT_LABEL" ] && line1+="${sep}${ACCOUNT_LABEL}"
         [ -n "$TINY_GIT_INFO" ] && line1+="${sep}${TINY_GIT_INFO}"
-        line1+="${sep}${magenta}\$${COST_FMT}${reset}${DAILY_SUFFIX}${BILLABLE}${FOCUS}"
+        line1+="${sep}${FOCUS}"
     fi
 
     printf "%b\n" "$line1"
