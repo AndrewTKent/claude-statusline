@@ -554,6 +554,23 @@ if [ -n "$SESSION_ID" ]; then
         BOUNTY_DISPLAY="${cyan}→${bounty_target_m}M${reset} ${dim}~${reset}${BOUNTY_ETA_H}h ${dim}active (${reset}${bounty_gap_m}M left @ ${bounty_rate_kh}k/h${dim})${reset}"
     fi
 
+    # ── Unified usage line (replaces tokens/100m/bounty in default render) ──
+    # Shows today (since local midnight) · current session · lifetime total,
+    # each formatted human-readably. All three are already computed above.
+    USAGE_DISPLAY=""
+    _usage_fmt() {
+        awk -v t="$1" 'BEGIN {
+            if (t >= 1e9) printf "%.1fB", t/1e9;
+            else if (t >= 1e6) printf "%.1fM", t/1e6;
+            else if (t >= 1e3) printf "%.0fk", t/1e3;
+            else printf "%d", t
+        }'
+    }
+    _today_fmt=$(_usage_fmt "${DAILY_TOKENS:-0}")
+    _session_fmt=$(_usage_fmt "${SESSION_DELTA:-0}")
+    _lifetime_fmt=$(_usage_fmt "${G_TOTAL:-0}")
+    USAGE_DISPLAY="${dim}today${reset} ${white}${_today_fmt}${reset} ${dim}·${reset} ${dim}session${reset} ${magenta}${_session_fmt}${reset} ${dim}·${reset} ${dim}lifetime${reset} ${white}${_lifetime_fmt}${reset}"
+
     # ── Redaction indicator (only when ranges > 0) ──
     # Reminds to run scan-tokens-export.py before submission.
     REDACT_DISPLAY=""
@@ -1643,9 +1660,7 @@ render_default() {
     printf "\n%b" "$ctx_line"
     [ -n "$rate_lines" ] && printf "\n%b" "$rate_lines"
     [ -n "$BUDGET_DISPLAY" ] && printf "\n%b" "$BUDGET_DISPLAY"
-    [ -n "$TOKEN_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "tokens")${reset} %b" "$TOKEN_DISPLAY"
-    [ -n "$CHALLENGE_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "$CHALLENGE_LABEL")${reset} %b" "$CHALLENGE_DISPLAY"
-    [ -n "$BOUNTY_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "bounty")${reset} %b" "$BOUNTY_DISPLAY"
+    [ -n "$USAGE_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "usage")${reset} %b" "$USAGE_DISPLAY"
     [ -n "$FINAL_ACCOUNT_ROWS" ] && printf "%b" "$FINAL_ACCOUNT_ROWS"
 }
 
