@@ -1709,25 +1709,14 @@ fi
 
 # ── Render: default (multi-line) ──────────────────────────
 render_default() {
-    line1b=""
-    if [ "$COLS" -ge 100 ]; then
-        # Row 1: model + session timer (what you're running, how long).
-        line1="${blue}${MODEL}${reset}${EFFORT}${FAST_MODE}"
-        [ -n "$SESSION_TIME" ] && line1+="${sep}${dim}⏱${reset} ${white}${SESSION_TIME}${reset}${IDLE_DISPLAY}"
-        # Row 2: account + where you are (email, dir, git, focus).
-        line1b=""
-        [ -n "$ACCOUNT_LABEL" ] && line1b+="${ACCOUNT_LABEL}${sep}"
-        line1b+="${cyan}${DIR_NAME}${reset}${SHORT_GIT_INFO}${FOCUS}"
-    else
-        line1="${blue}${MODEL}${reset}${EFFORT}${FAST_MODE}"
-        [ -n "$SESSION_TIME" ] && line1+="${sep}${dim}⏱${reset} ${white}${SESSION_TIME}${reset}"
-        line1b=""
-        [ -n "$ACCOUNT_LABEL" ] && line1b+="${ACCOUNT_LABEL}${sep}"
-        [ -n "$TINY_GIT_INFO" ] && line1b+="${TINY_GIT_INFO# }"
-    fi
-
-    printf "%b\n" "$line1"
-    [ -n "$line1b" ] && printf "%b\n" "$line1b"
+    # Labeled identity block — one fact per row, consistent with
+    # context/left/usage rows below.
+    printf "${white}%-7s${reset} %b\n" "model"   "${blue}${MODEL}${reset}${EFFORT}${FAST_MODE}"
+    [ -n "$SESSION_TIME" ] && \
+        printf "${white}%-7s${reset} %b\n" "time"    "${dim}⏱${reset} ${white}${SESSION_TIME}${reset}${IDLE_DISPLAY}"
+    [ -n "$ACCT_EMAIL" ] && \
+        printf "${white}%-7s${reset} %b\n" "account" "${ACCOUNT_LABEL}"
+    printf  "${white}%-7s${reset} %b"   "repo"    "${cyan}${DIR_NAME}${reset}${SHORT_GIT_INFO}${FOCUS}"
 
     # Detail lines (dimmer for visual hierarchy)
     ctx_line="${white}$(printf "%-7s" "context")${reset} ${CTX_BAR} ${CTX_COLOR}$(printf "%3d" "$CONTEXT_INT")%${reset}"
