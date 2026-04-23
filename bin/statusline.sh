@@ -1596,10 +1596,13 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 if [ -n "$extra_pct" ] && [ -n "$extra_limit_cents" ] && awk "BEGIN{exit !(${extra_limit_cents:-0} > 0)}"; then
                     extra_int=$(printf "%.0f" "$extra_pct" 2>/dev/null || echo 0)
                     extra_color=$(color_for_pct "$extra_int")
-                    extra_left=$(awk -v u="${extra_cents:-0}" -v l="${extra_limit_cents:-0}" 'BEGIN { printf "%.0f", (l-u)/100 }')
+                    # Show spent/limit to match the dashboard ("$455.52 spent,
+                    # 46% used, $1000 cap") and the rest of the statusline's
+                    # fill-up-as-you-consume framing.
+                    extra_spent=$(awk -v u="${extra_cents:-0}" 'BEGIN { printf "%.0f", u/100 }')
                     extra_limit_dollars=$(awk -v l="${extra_limit_cents:-0}" 'BEGIN { printf "%.0f", l/100 }')
                     # left-padded 3 digits, right-padded 4 digits → "$  0/$1000" is 10.
-                    extra_inner=$(printf '$%3d/$%d' "$extra_left" "$extra_limit_dollars")
+                    extra_inner=$(printf '$%3d/$%d' "$extra_spent" "$extra_limit_dollars")
                     extra_inner_padded=$(_pad_to_cols "$extra_inner" 11)
                     # Color the whole inner segment by util (emitted at once so
                     # we don't have to handle partial coloring around the "/").
