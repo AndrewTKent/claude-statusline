@@ -1413,14 +1413,13 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 # distinguishes the current account (◉) from the others.
                 label="${display_name:-$em}"
                 seg="${white}${label}${reset}"
-                # Leading marker: * for current account, space for others.
-                # ASCII keeps the glyph at a guaranteed 1 display column —
-                # "◉" and similar emoji render 2-cols in some terminal fonts
-                # (emoji-width) and misalign every downstream column.
+                # Leading marker: * for current, · for others. Using a visible
+                # dim dot for non-current rows prevents Claude Code's status
+                # panel from trimming leading whitespace and shifting columns.
                 if [ "$em" = "$ACCT_EMAIL" ]; then
                     marker="${white}*${reset} "
                 else
-                    marker="  "
+                    marker="${dim}·${reset} "
                 fi
                 # Utilization: for the CURRENT account, use the interpolated
                 # value already computed by the rate-limit block (matches the
