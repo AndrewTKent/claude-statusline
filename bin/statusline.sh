@@ -1732,6 +1732,17 @@ render_default() {
     # Detail lines (dimmer for visual hierarchy)
     ctx_line="${white}$(printf "%-7s" "context")${reset} ${CTX_BAR} ${CTX_COLOR}$(printf "%3d" "$CONTEXT_INT")%${reset}"
     printf "\n%b" "$ctx_line"
+
+    # Headroom bar for the current 5h window — how much you've got LEFT.
+    # Uses interpolated five_hour_pct from the rate-limit block above.
+    if [ -n "${five_hour_pct:-}" ]; then
+        headroom_int=$(( 100 - ${five_hour_pct%.*} ))
+        [ "$headroom_int" -lt 0 ] && headroom_int=0
+        headroom_bar=$(build_bar "$headroom_int" 30)
+        headroom_color=$(color_for_pct "$five_hour_pct")
+        headroom_line="${white}$(printf "%-7s" "left")${reset} ${headroom_bar} ${headroom_color}$(printf "%3d" "$headroom_int")%${reset}"
+        printf "\n%b" "$headroom_line"
+    fi
     # NOTE: rate_lines intentionally not printed — its current/weekly rows
     # duplicated the current-account info already shown in the account block.
     # The projection tail (full ~Xh · ✗/✓ · 7d N%) now rides on the current
