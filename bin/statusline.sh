@@ -1642,13 +1642,13 @@ render_default() {
     ctx_line="${white}$(printf "%-7s" "context")${reset} ${CTX_BAR} ${CTX_COLOR}$(printf "%3d" "$CONTEXT_INT")%${reset}"
     printf "\n%b" "$ctx_line"
     [ -n "$rate_lines" ] && printf "\n%b" "$rate_lines"
-    if [ -n "$FINAL_ACCOUNT_ROWS" ]; then
-        printf "\n${white}$(printf "%-7s" "resets")${reset}%b" "$FINAL_ACCOUNT_ROWS"
-    fi
     [ -n "$BUDGET_DISPLAY" ] && printf "\n%b" "$BUDGET_DISPLAY"
     [ -n "$TOKEN_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "tokens")${reset} %b" "$TOKEN_DISPLAY"
     [ -n "$CHALLENGE_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "$CHALLENGE_LABEL")${reset} %b" "$CHALLENGE_DISPLAY"
     [ -n "$BOUNTY_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "bounty")${reset} %b" "$BOUNTY_DISPLAY"
+    if [ -n "$FINAL_ACCOUNT_ROWS" ]; then
+        printf "\n${white}$(printf "%-7s" "resets")${reset}%b" "$FINAL_ACCOUNT_ROWS"
+    fi
 }
 
 # ── Render: sigil (single dense line) ─────────────────────
