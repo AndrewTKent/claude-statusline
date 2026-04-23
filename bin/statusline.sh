@@ -362,6 +362,10 @@ format_reset_time() {
             date -j -r "$epoch" +"%b %-d, %l:%M%p" 2>/dev/null | sed 's/  / /g; s/^ //; s/\.//g' | tr '[:upper:]' '[:lower:]' || \
             date -d "@$epoch" +"%b %-d, %l:%M%P" 2>/dev/null | sed 's/  / /g; s/^ //; s/\.//g'
             ;;
+        date)
+            date -j -r "$epoch" +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]' || \
+            date -d "@$epoch" +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]'
+            ;;
     esac
 }
 
@@ -1133,6 +1137,9 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
                         full_display=$(fmt_duration_m "$mins_to_full")
                         # Pad "→full ~Xm" to 11 cols so "✗buf" lines up.
                         rate_lines+=" ${bd_color}$(pad_right "→full ~${full_display}" 14)${reset}"
+                        # Expose for the current-account row tail.
+                        CUR_FULL_DISPLAY="$full_display"
+                        CUR_FULL_COLOR="$bd_color"
 
                         # Survive indicator: buffer or downtime until window resets
                         mins_to_reset=$(( secs_to_reset / 60 ))
@@ -1140,9 +1147,13 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
                             if [ "$mins_to_full" -gt "$mins_to_reset" ] 2>/dev/null; then
                                 buf_display=$(fmt_duration_m $(( mins_to_full - mins_to_reset )))
                                 rate_lines+=" ${green}✓${buf_display}${reset}"
+                                CUR_SURVIVE_DISPLAY="✓${buf_display}"
+                                CUR_SURVIVE_COLOR="$green"
                             else
                                 dt_display=$(fmt_duration_m $(( mins_to_reset - mins_to_full )))
                                 rate_lines+=" ${red}✗${dt_display}${reset}"
+                                CUR_SURVIVE_DISPLAY="✗${dt_display}"
+                                CUR_SURVIVE_COLOR="$red"
                             fi
                         fi
                     fi
@@ -1155,6 +1166,14 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
     seven_day_reset=$(format_reset_time "$seven_day_reset_iso" "datetime")
     seven_day_bar=$(build_bar "$seven_day_pct" "$bar_width")
     seven_day_pct_color=$(color_for_pct "$seven_day_pct")
+    # Short weekly reset (date only, e.g. "apr 28") for the current-account tail.
+    WEEK_RESET_SHORT=$(format_reset_time "$seven_day_reset_iso" "date" 2>/dev/null || echo "")
+    if [ -z "$WEEK_RESET_SHORT" ]; then
+        # Fallback: pull just the "apr 28" chunk from the long form.
+        WEEK_RESET_SHORT=$(echo "$seven_day_reset" | awk -F',' '{print $1}')
+    fi
+    WEEK_PCT_DISPLAY="$seven_day_pct"
+    WEEK_PCT_COLOR="$seven_day_pct_color"
 
     rate_lines+="\n${white}$(printf "%-7s" "weekly")${reset} ${seven_day_bar} ${seven_day_pct_color}$(fmt_pct "$seven_day_pct_display")${reset}   "
     if [ -n "$seven_day_reset" ]; then
@@ -1258,6 +1277,24 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
     fi
 fi
 
+# ── Build the current-account rate-projection tail ──
+# Assembled here from vars computed by the rate-limit block above. Attached
+# to the current-account row in the per-account block, replacing the old
+# stand-alone "current" + "weekly" rows.
+CURRENT_RATE_TAIL=""
+if [ -n "${CUR_FULL_DISPLAY:-}" ]; then
+    CURRENT_RATE_TAIL="${CUR_FULL_COLOR}full ~${CUR_FULL_DISPLAY}${reset}"
+fi
+if [ -n "${CUR_SURVIVE_DISPLAY:-}" ]; then
+    [ -n "$CURRENT_RATE_TAIL" ] && CURRENT_RATE_TAIL+=" ${dim}·${reset} "
+    CURRENT_RATE_TAIL+="${CUR_SURVIVE_COLOR}${CUR_SURVIVE_DISPLAY}${reset}"
+fi
+if [ -n "${WEEK_PCT_DISPLAY:-}" ] && [ "${WEEK_PCT_DISPLAY:-0}" -gt 0 ] 2>/dev/null; then
+    [ -n "$CURRENT_RATE_TAIL" ] && CURRENT_RATE_TAIL+=" ${dim}·${reset} "
+    CURRENT_RATE_TAIL+="${dim}7d${reset} ${WEEK_PCT_COLOR}${WEEK_PCT_DISPLAY}%${reset}"
+    [ -n "${WEEK_RESET_SHORT:-}" ] && CURRENT_RATE_TAIL+=" ${dim}(${WEEK_RESET_SHORT})${reset}"
+fi
+
 # ── Daily budget line ──────────────────────────────────
 BUDGET_DISPLAY=""
 if [ "$DAILY_BUDGET" -gt 0 ] 2>/dev/null; then
@@ -1342,17 +1379,22 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 else
                     tdisp="—"
                 fi
-                # Label colour by tag, dim when not the current account
-                tag_color=$(_resolve_label_color "$tag")
+                # Label: white for all accounts (the leading marker carries
+                # "is this you" / "is this resetting first" semantics).
                 label="${tag:-$em}"
                 if [ "$em" = "$ACCT_EMAIL" ]; then
-                    seg="${tag_color}${label}${reset}"
+                    seg="${white}${label}${reset}"
                 else
                     seg="${dim}${label}${reset}"
                 fi
-                # Soonest-to-reset marker
+                # Leading marker: ◉ for current account, → for soonest-reset
+                # (falls through to → if the current account IS also soonest).
                 marker=" "
-                [ -n "$ep" ] && [ "$ep" = "$soonest_epoch" ] && marker="${cyan}→${reset}"
+                if [ "$em" = "$ACCT_EMAIL" ]; then
+                    marker="${white}◉${reset}"
+                elif [ -n "$ep" ] && [ "$ep" = "$soonest_epoch" ]; then
+                    marker="${white}→${reset}"
+                fi
                 # Utilization: for the CURRENT account, use the interpolated
                 # value already computed by the rate-limit block (matches the
                 # "current" row exactly). For other accounts, fall back to
@@ -1524,6 +1566,10 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 if [ "$has_wall" = "1" ]; then
                     row_line+="  ${red}⚠ hard wall${reset}"
                 fi
+                # Append projection tail to the current-account row only.
+                if [ "$em" = "$ACCT_EMAIL" ] && [ -n "$CURRENT_RATE_TAIL" ]; then
+                    row_line+="  ${CURRENT_RATE_TAIL}"
+                fi
                 ACCOUNT_ROWS+="|${em}:${row_line}"
             done <<< "$parsed"
             [ -n "$rendered" ] && ACCOUNT_RESETS_DISPLAY="$rendered"
@@ -1658,7 +1704,10 @@ render_default() {
     # Detail lines (dimmer for visual hierarchy)
     ctx_line="${white}$(printf "%-7s" "context")${reset} ${CTX_BAR} ${CTX_COLOR}$(printf "%3d" "$CONTEXT_INT")%${reset}"
     printf "\n%b" "$ctx_line"
-    [ -n "$rate_lines" ] && printf "\n%b" "$rate_lines"
+    # NOTE: rate_lines intentionally not printed — its current/weekly rows
+    # duplicated the current-account info already shown in the account block.
+    # The projection tail (full ~Xh · ✗/✓ · 7d N%) now rides on the current
+    # account row via CURRENT_RATE_TAIL.
     [ -n "$BUDGET_DISPLAY" ] && printf "\n%b" "$BUDGET_DISPLAY"
     [ -n "$USAGE_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "usage")${reset} %b" "$USAGE_DISPLAY"
     [ -n "$FINAL_ACCOUNT_ROWS" ] && printf "%b" "$FINAL_ACCOUNT_ROWS"
