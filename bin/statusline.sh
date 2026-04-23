@@ -1118,7 +1118,22 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
     fi
 
     # ── Burn-down projection ──────────────────────────
-    # Estimate minutes until 100% based on utilization velocity
+    # Estimate minutes until 100% based on utilization velocity.
+    #
+    # Rate preference (in order):
+    #   1. Recent-window rate: (pct - prev_5h) / (poll_ts - prev_ts).
+    #      Reflects actual current burn — idle time makes survive grow,
+    #      sprints make it shrink. Needs two consecutive polls.
+    #   2. Since-window-start average: pct / secs_elapsed. Coarse but
+    #      always available — used on first poll after a window reset
+    #      or when prev-poll data is missing.
+    #
+    # The old code used (2) exclusively. Because both "time to full"
+    # and "time to reset" shrink together under steady burn, the
+    # survive delta (difference between them) stayed nearly constant
+    # for hours — giving the impression the number was frozen. Using
+    # the recent-window rate makes survive actually respond to changes
+    # in behavior.
     if [ "$five_hour_pct" -gt 0 ] 2>/dev/null && [ -n "$five_hour_reset_iso" ] && [ "$five_hour_reset_iso" != "" ]; then
         reset_epoch=$(iso_to_epoch "$five_hour_reset_iso")
         if [ -n "$reset_epoch" ]; then
@@ -1134,9 +1149,25 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
             if [ "$secs_elapsed" -gt 0 ] && [ "$five_hour_pct" -gt 0 ] 2>/dev/null; then
                 remaining_pct=$(( 100 - five_hour_pct ))
                 if [ "$remaining_pct" -gt 0 ]; then
-                    # Minutes to full = remaining_pct / (pct / secs_elapsed) / 60
+                    # Minutes to full = remaining_pct / rate / 60. Prefer the
+                    # recent-poll delta when we have it; else fall back to the
+                    # since-window-start average.
                     mins_to_full=$(awk "BEGIN {
-                        rate = $five_hour_pct / $secs_elapsed;
+                        poll_interval = ${poll_interval:-0};
+                        prev_pct      = ${prev_5h:-0};
+                        cur_pct       = $five_hour_pct;
+                        delta_pct     = cur_pct - prev_pct;
+
+                        # Only trust the recent rate when the poll gap is
+                        # long enough to be informative (>30s) and utilization
+                        # actually moved up. Zero or negative deltas mean
+                        # no recent burn (or a reset) — fall through.
+                        if (poll_interval >= 30 && delta_pct > 0) {
+                            rate = delta_pct / poll_interval;
+                        } else {
+                            rate = cur_pct / $secs_elapsed;
+                        }
+
                         if (rate > 0) printf \"%.0f\", $remaining_pct / rate / 60;
                         else print 999
                     }")

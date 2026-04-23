@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template for the scan-tokens watcher launchd agent.
+
+  install-daemon.sh populates REPO_ROOT, HOME, and log paths, then copies
+  this file to ~/Library/LaunchAgents/ and loads it.
+
+  The watcher runs scan-tokens-watch.sh, which pipes fswatch events into
+  scan-tokens-daemon.py. One long-lived process per login; launchd restarts
+  it on crash with a 10s throttle so we don't hot-loop if something is wrong.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.claude-scan-tokens-watch</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__REPO_ROOT__/bin/scan-tokens-watch.sh</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- If the process exits for any reason, wait at least 10s before
+         restarting. Protects against crash loops if config is broken. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Don't restart more than once per minute under any circumstance. -->
+    <key>ExitTimeOut</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.claude/scan-tokens-watch-stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.claude/scan-tokens-watch-stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>
