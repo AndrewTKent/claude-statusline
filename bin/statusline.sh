@@ -1413,11 +1413,12 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 # distinguishes the current account (◉) from the others.
                 label="${display_name:-$em}"
                 seg="${white}${label}${reset}"
-                # Leading marker: ◉ for current account, blank for the rest.
-                # Always a 2-col slot so all tag columns start at the same
-                # position regardless of whether the row is current or not.
+                # Leading marker: * for current account, space for others.
+                # ASCII keeps the glyph at a guaranteed 1 display column —
+                # "◉" and similar emoji render 2-cols in some terminal fonts
+                # (emoji-width) and misalign every downstream column.
                 if [ "$em" = "$ACCT_EMAIL" ]; then
-                    marker="${white}◉${reset} "
+                    marker="${white}*${reset} "
                 else
                     marker="  "
                 fi
