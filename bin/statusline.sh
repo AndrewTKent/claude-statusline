@@ -1342,7 +1342,9 @@ WEEKLY_BAR_LINE=""
 SURVIVE_BAR_LINE=""
 if [ -n "${WEEK_PCT_DISPLAY:-}" ] && [ "${WEEK_PCT_DISPLAY:-0}" -gt 0 ] 2>/dev/null; then
     _wk_bar=$(build_bar "$WEEK_PCT_DISPLAY" 15)
-    WEEKLY_BAR_LINE="${white}$(printf "%-7s" "weekly")${reset} ${_wk_bar} ${WEEK_PCT_COLOR}$(printf "%3d" "$WEEK_PCT_DISPLAY")%${reset}"
+    # fmt_pct on the fractional display preserves interpolated sub-percent
+    # precision; the int WEEK_PCT_DISPLAY still drives bar fill + color.
+    WEEKLY_BAR_LINE="${white}$(printf "%-7s" "weekly")${reset} ${_wk_bar} ${WEEK_PCT_COLOR}$(fmt_pct "${seven_day_pct_display:-$WEEK_PCT_DISPLAY}")${reset}"
     [ -n "${WEEK_RESET_SHORT:-}" ] && WEEKLY_BAR_LINE+="  ${dim}resets ${WEEK_RESET_SHORT}${reset}"
 fi
 # Survive bar: shows buffer (finishes window) or downtime (caps early).
@@ -1351,14 +1353,20 @@ fi
 if [ -n "${CUR_FULL_DISPLAY:-}" ]; then
     # Burn bar: % of 5h window you'll CONSUME at current pace (the inverse
     # of "% covered"). Fills up as you burn faster. High = cap early = bad.
-    _burn_pct=$(awk -v m="${mins_to_full:-0}" 'BEGIN {
+    # Display gets 2-dec precision (derived from minute-granular mins_to_full);
+    # the integer form feeds the bar + color_for_pct which both need ints.
+    _burn_display=$(awk -v m="${mins_to_full:-0}" 'BEGIN {
         p = m * 100 / 300;
         if (p > 100) p = 100;
         if (p < 0)   p = 0;
-        printf "%d", 100 - p
+        printf "%.2f", 100 - p
     }')
+    _burn_pct="${_burn_display%.*}"
+    [ "$_burn_pct" -lt 0 ] 2>/dev/null && _burn_pct=0
+    [ "$_burn_pct" -gt 100 ] 2>/dev/null && _burn_pct=100
     _burn_bar=$(build_bar "$_burn_pct" 15)
-    SURVIVE_BAR_LINE="${white}$(printf "%-7s" "burn")${reset} ${_burn_bar} "
+    _burn_color=$(color_for_pct "$_burn_pct")
+    SURVIVE_BAR_LINE="${white}$(printf "%-7s" "burn")${reset} ${_burn_bar} ${_burn_color}$(fmt_pct "$_burn_display")${reset}  "
     if [ -n "${CUR_SURVIVE_DISPLAY:-}" ]; then
         SURVIVE_BAR_LINE+="${CUR_SURVIVE_COLOR}${CUR_SURVIVE_DISPLAY}${reset} "
     fi
@@ -1368,10 +1376,12 @@ fi
 # ── Daily budget line ──────────────────────────────────
 BUDGET_DISPLAY=""
 if [ "$DAILY_BUDGET" -gt 0 ] 2>/dev/null; then
-    budget_pct=$(awk "BEGIN {p=$DAILY_COST * 100 / $DAILY_BUDGET; printf \"%.0f\", (p > 100 ? 100 : p)}")
+    budget_display=$(awk "BEGIN {p=$DAILY_COST * 100 / $DAILY_BUDGET; printf \"%.2f\", (p > 100 ? 100 : p)}")
+    budget_pct="${budget_display%.*}"
+    [ "$budget_pct" -gt 100 ] 2>/dev/null && budget_pct=100
     budget_bar=$(build_bar "$budget_pct" 10)
     budget_color=$(color_for_pct "$budget_pct")
-    BUDGET_DISPLAY="${white}$(printf "%-7s" "budget")${reset} ${budget_bar} ${budget_color}$(printf "%3d" "$budget_pct")%${reset} ${white}\$${DAILY_FMT}${dim}/${reset}${white}\$${DAILY_BUDGET}${reset}"
+    BUDGET_DISPLAY="${white}$(printf "%-7s" "budget")${reset} ${budget_bar} ${budget_color}$(fmt_pct "$budget_display")${reset} ${white}\$${DAILY_FMT}${dim}/${reset}${white}\$${DAILY_BUDGET}${reset}"
 fi
 
 # ── Multi-account reset ledger line ────────────────────
@@ -1786,23 +1796,27 @@ render_default() {
         printf "${white}%-7s${reset} %b\n" "account" "${ACCOUNT_LABEL}"
     printf  "${white}%-7s${reset} %b"   "repo"    "${cyan}${DIR_NAME}${reset}${SHORT_GIT_INFO}${FOCUS}"
 
-    # Detail lines (dimmer for visual hierarchy)
-    ctx_line="${white}$(printf "%-7s" "context")${reset} ${CTX_BAR} ${CTX_COLOR}$(printf "%3d" "$CONTEXT_INT")%${reset}"
+    # Detail lines (dimmer for visual hierarchy). CONTEXT_PCT carries the
+    # API's sub-percent precision; CONTEXT_INT still drives bar + color.
+    ctx_line="${white}$(printf "%-7s" "context")${reset} ${CTX_BAR} ${CTX_COLOR}$(fmt_pct "${CONTEXT_PCT:-$CONTEXT_INT}")${reset}"
     printf "\n%b" "$ctx_line"
 
     # Headroom bar for the current 5h window — how much you've got LEFT.
     # Uses interpolated five_hour_pct from the rate-limit block above.
     if [ -n "${five_hour_pct:-}" ]; then
-        # Show 5h window as "used" — fills up as you consume. Strip decimals
-        # so integer comparisons in color_for_pct work (the sibling bug that
-        # made the old 'left' row silently green — see git blame on this
-        # block for the fallthrough story).
-        used_int="${five_hour_pct%.*}"
+        # Show 5h window as "used" — fills up as you consume. Uses interpolated
+        # five_hour_pct_display (sub-percent precision when poll delta is
+        # available; falls back to API integer otherwise). fmt_pct strips
+        # trailing zeros so "93%" stays short and "93.4%" shows real precision.
+        # used_int is an integer for the bar fill + color_for_pct (which needs
+        # integers — floats silently fall through to green).
+        used_display="${five_hour_pct_display:-$five_hour_pct}"
+        used_int="${used_display%.*}"
         [ "$used_int" -lt 0 ] 2>/dev/null && used_int=0
         [ "$used_int" -gt 100 ] 2>/dev/null && used_int=100
         used_bar=$(build_bar "$used_int" 15)
         used_color=$(color_for_pct "$used_int")
-        used_line="${white}$(printf "%-7s" "used")${reset} ${used_bar} ${used_color}$(printf "%3d" "$used_int")%${reset}"
+        used_line="${white}$(printf "%-7s" "used")${reset} ${used_bar} ${used_color}$(fmt_pct "$used_display")${reset}"
         printf "\n%b" "$used_line"
     fi
     [ -n "$WEEKLY_BAR_LINE"  ] && printf "\n%b" "$WEEKLY_BAR_LINE"
