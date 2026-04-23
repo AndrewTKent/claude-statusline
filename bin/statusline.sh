@@ -1820,6 +1820,9 @@ render_default() {
         used_bar=$(build_bar "$used_int" 15)
         used_color=$(color_for_pct "$used_int")
         used_line="${white}$(printf "%-7s" "used")${reset} ${used_bar} ${used_color}$(fmt_pct "$used_display")${reset}"
+        # Reset time (five_hour_reset set earlier via format_reset_time).
+        # Local TZ formatting verified against the dashboard ("8:00pm" etc).
+        [ -n "${five_hour_reset:-}" ] && used_line+="  ${dim}resets ${five_hour_reset}${reset}"
         printf "\n%b" "$used_line"
     fi
     [ -n "$WEEKLY_BAR_LINE"  ] && printf "\n%b" "$WEEKLY_BAR_LINE"
