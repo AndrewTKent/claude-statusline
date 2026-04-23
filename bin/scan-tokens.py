@@ -275,10 +275,14 @@ def extract_session_signals(filepath: str) -> tuple[set, set, str | None, list]:
                     rid = entry.get("requestId") or msg.get("id", "")
                     ts = entry.get("timestamp", "")
                     if rid and ts and usage:
+                        # 6-tuple: [rid, ts, inp, out, cache_read, cache_create]
+                        # Older caches stored 4-tuples; normalize on load.
                         requests.append([
                             rid, ts,
                             usage.get("input_tokens", 0) or 0,
                             usage.get("output_tokens", 0) or 0,
+                            usage.get("cache_read_input_tokens", 0) or 0,
+                            usage.get("cache_creation_input_tokens", 0) or 0,
                         ])
                     for block in msg.get("content", []) or []:
                         if not isinstance(block, dict):
@@ -344,11 +348,23 @@ def scan(prev_cache: dict) -> dict:
     overrides = load_overrides()
     payer_spans = load_session_payer_spans()
 
+    def _to_6tuple(r):
+        # Normalize cached request tuples to [rid, ts, inp, out, cr, cc].
+        # Old 4-tuples default cache fields to 0; gets corrected on next rescan
+        # of the underlying file.
+        return [r[0], r[1], r[2], r[3], r[4] if len(r) > 4 else 0, r[5] if len(r) > 5 else 0]
+
     session_classifications: dict[str, str] = {}  # sid -> work-type fallback
 
     # seen[rid] = (inp, out, work_type, payer)
     seen_global: dict[str, tuple] = {}
     seen_challenge: dict[str, tuple] = {}
+    # Today's total (local midnight). Summed per-request, deduped by rid.
+    import datetime as _dt
+    _today_start_iso = _dt.datetime.now().astimezone().replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).astimezone(_dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    seen_today: dict[str, tuple] = {}
     files_rescanned = 0
     new_files: dict = {}
 
@@ -365,7 +381,10 @@ def scan(prev_cache: dict) -> dict:
                 main_files.append(fp)
 
     def ingest(requests, base_acct, sid, spans_for_sid):
-        for rid, ts, inp, out in requests:
+        for row in requests:
+            rid, ts, inp, out = row[0], row[1], row[2], row[3]
+            cr = row[4] if len(row) > 4 else 0
+            cc = row[5] if len(row) > 5 else 0
             # Work-type (path+content+overrides — NEVER email)
             work_type = resolve_override(sid, ts, base_acct, overrides)
             if work_type not in ("work", "personal"):
@@ -373,6 +392,8 @@ def scan(prev_cache: dict) -> dict:
             # Payer (email span lookup)
             payer = payer_for(spans_for_sid, ts)
 
+            # Global / challenge track input+output (stable semantic; matches
+            # the 40M bounty / 100M challenge definitions).
             prev_seen = seen_global.get(rid)
             if prev_seen is None or out > prev_seen[1]:
                 seen_global[rid] = (inp, out, work_type, payer)
@@ -380,6 +401,11 @@ def scan(prev_cache: dict) -> dict:
                 prev_seen = seen_challenge.get(rid)
                 if prev_seen is None or out > prev_seen[1]:
                     seen_challenge[rid] = (inp, out, work_type, payer)
+            # "today" tracks input+output only — matches /stats semantics.
+            if ts >= _today_start_iso:
+                prev_seen = seen_today.get(rid)
+                if prev_seen is None or out > prev_seen[1]:
+                    seen_today[rid] = (inp, out, work_type, payer)
 
     # Main sessions
     for filepath in main_files:
@@ -393,14 +419,15 @@ def scan(prev_cache: dict) -> dict:
         acct = classify_path(filepath)
         prev = prev_files.get(filepath)
         if prev and prev.get("mtime") == mtime_int and "requests" in prev:
-            # Cache may contain historical 6-tuples [rid,ts,in,out,cr,completed]
-            # from an older schema. Normalize to 4-tuples used by ingest().
-            requests = [[r[0], r[1], r[2], r[3]] for r in prev["requests"]]
+            # Pad to 6-tuple [rid,ts,inp,out,cache_read,cache_create]. Older
+            # caches stored 4-tuples; default the cache fields to 0 — they'll
+            # get correct values on the next rescan when the file changes.
+            requests = [_to_6tuple(r) for r in prev["requests"]]
             if acct is None:
                 acct = prev.get("acct") or "unknown"
         else:
             cwds, paths, user_text, raw_reqs = extract_session_signals(filepath)
-            requests = [[r[0], r[1], r[2], r[3]] for r in raw_reqs]
+            requests = [_to_6tuple(r) for r in raw_reqs]
             if acct is None:
                 acct = classify_by_content(cwds, paths, user_text)
             files_rescanned += 1
@@ -440,11 +467,10 @@ def scan(prev_cache: dict) -> dict:
 
         prev = prev_files.get(filepath)
         if prev and prev.get("mtime") == mtime_int and "requests" in prev:
-            # Normalize any historical 6-tuples in the cache to 4-tuples.
-            requests = [[r[0], r[1], r[2], r[3]] for r in prev["requests"]]
+            requests = [_to_6tuple(r) for r in prev["requests"]]
         else:
             _, _, _, raw_reqs = extract_session_signals(filepath)
-            requests = [[r[0], r[1], r[2], r[3]] for r in raw_reqs]
+            requests = [_to_6tuple(r) for r in raw_reqs]
             files_rescanned += 1
 
         new_files[filepath] = {"mtime": mtime_int, "acct": acct, "requests": requests}
@@ -476,10 +502,12 @@ def scan(prev_cache: dict) -> dict:
         }
 
     challenge_block = build_block(seen_challenge) if CHALLENGE_START else None
+    today_block = build_block(seen_today)
     result = {
         "timestamp": int(time.time()),
         "challenge_start": CHALLENGE_START or None,
         "global": build_block(seen_global),
+        "today": today_block,
         "files_scanned": len(new_files),
         "files_rescanned": files_rescanned,
         "files": new_files,
@@ -612,6 +640,7 @@ def main():
         "timestamp": result.get("timestamp"),
         "scan_duration_s": result.get("scan_duration_s"),
         "global": result["global"],
+        "today": result.get("today"),
         "redactions": {"sessions": r_sessions, "ranges": r_ranges},
     }
     if "challenge" in result:
