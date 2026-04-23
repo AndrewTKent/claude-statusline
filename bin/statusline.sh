@@ -1613,7 +1613,11 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 if [ -n "${_best_em:-}" ] && [ "$row_em" = "$_best_em" ] && [ "${five_hour_pct:-0}" -ge 70 ] 2>/dev/null; then
                     row_body+="   ${green}✓ best next ~2h${reset}"
                 fi
-                FINAL_ACCOUNT_ROWS+=$'\n'"  ${row_body}"
+                # Prefix with the marker (already 2 cols) — no extra leading
+                # whitespace. Claude Code's status panel strips leading spaces
+                # on wrapped/multi-line output, which misaligned earlier when
+                # the indent was "  " + marker.
+                FINAL_ACCOUNT_ROWS+=$'\n'"${row_body}"
             done
         fi
     fi
