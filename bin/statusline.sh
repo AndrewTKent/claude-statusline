@@ -1384,12 +1384,12 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 label="${tag:-$em}"
                 seg="${white}${label}${reset}"
                 # Leading marker: ◉ for current account, blank for the rest.
-                # Rows are sorted by soonest-reset already, so a separate →
-                # marker would just duplicate row position.
+                # Always a 2-col slot so all tag columns start at the same
+                # position regardless of whether the row is current or not.
                 if [ "$em" = "$ACCT_EMAIL" ]; then
-                    marker="${white}◉${reset}"
+                    marker="${white}◉${reset} "
                 else
-                    marker=" "
+                    marker="  "
                 fi
                 # Utilization: for the CURRENT account, use the interpolated
                 # value already computed by the rate-limit block (matches the
