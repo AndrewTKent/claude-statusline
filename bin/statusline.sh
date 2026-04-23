@@ -1379,21 +1379,17 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 else
                     tdisp="—"
                 fi
-                # Label: white for all accounts (the leading marker carries
-                # "is this you" / "is this resetting first" semantics).
+                # All account tags render white; only the leading marker
+                # distinguishes the current account (◉) from the others.
                 label="${tag:-$em}"
-                if [ "$em" = "$ACCT_EMAIL" ]; then
-                    seg="${white}${label}${reset}"
-                else
-                    seg="${dim}${label}${reset}"
-                fi
-                # Leading marker: ◉ for current account, → for soonest-reset
-                # (falls through to → if the current account IS also soonest).
-                marker=" "
+                seg="${white}${label}${reset}"
+                # Leading marker: ◉ for current account, blank for the rest.
+                # Rows are sorted by soonest-reset already, so a separate →
+                # marker would just duplicate row position.
                 if [ "$em" = "$ACCT_EMAIL" ]; then
                     marker="${white}◉${reset}"
-                elif [ -n "$ep" ] && [ "$ep" = "$soonest_epoch" ]; then
-                    marker="${white}→${reset}"
+                else
+                    marker=" "
                 fi
                 # Utilization: for the CURRENT account, use the interpolated
                 # value already computed by the rate-limit block (matches the
