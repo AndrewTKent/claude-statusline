@@ -410,7 +410,11 @@ TOKEN_DISPLAY=""
 
 IDLE_DISPLAY=""
 if [ -n "$SESSION_ID" ]; then
-    SESSION_TOKENS=$((INPUT_TOKENS + OUTPUT_TOKENS))
+    # Include cache_read + cache_creation so the "today" ledger reflects
+    # total Anthropic-billable tokens, not just input+output. Cache reads
+    # dominate heavy sessions (often 100x input+output) so omitting them
+    # under-reports daily usage by ~99%.
+    SESSION_TOKENS=$((INPUT_TOKENS + OUTPUT_TOKENS + CACHE_READ + CACHE_CREATE))
     get_subagent_tokens "$SESSION_ID" "$CWD"
 
     # Time since last user message — signals how long the current turn has been running.
@@ -460,6 +464,7 @@ if [ -n "$SESSION_ID" ]; then
 
     G_WORK=0 G_PERSONAL=0 G_UNKNOWN=0 G_TOTAL=0
     C_WORK=0 C_PERSONAL=0 C_TOTAL=0
+    T_TOTAL=0
     R_SESSIONS=0 R_RANGES=0
     scan_src=""
     [ -f "$SCAN_SUMMARY" ] && scan_src="$SCAN_SUMMARY"
@@ -473,6 +478,7 @@ if [ -n "$SESSION_ID" ]; then
             "C_WORK=" + (.challenge.work_tokens // 0 | tostring),
             "C_PERSONAL=" + (.challenge.personal_tokens // 0 | tostring),
             "C_TOTAL=" + (.challenge.total_tokens // 0 | tostring),
+            "T_TOTAL=" + (.today.total_tokens // 0 | tostring),
             "R_SESSIONS=" + (.redactions.sessions // 0 | tostring),
             "R_RANGES=" + (.redactions.ranges // 0 | tostring),
             "BOUNTY_ETA_H=" + (.bounty.eta_hours // "" | tostring),
@@ -570,7 +576,12 @@ if [ -n "$SESSION_ID" ]; then
             else printf "%d", t
         }'
     }
-    _today_fmt=$(_usage_fmt "${DAILY_TOKENS:-0}")
+    # Prefer scan-based T_TOTAL (summed from JSONL, includes cache reads) —
+    # DAILY_TOKENS is a context-window-snapshot proxy that undercounts by
+    # ~1000x on heavy sessions.
+    _today_src=${T_TOTAL:-0}
+    [ "$_today_src" -eq 0 ] && _today_src=${DAILY_TOKENS:-0}
+    _today_fmt=$(_usage_fmt "$_today_src")
     _session_fmt=$(_usage_fmt "${SESSION_DELTA:-0}")
     _lifetime_fmt=$(_usage_fmt "${G_TOTAL:-0}")
     USAGE_DISPLAY="${dim}today${reset} ${white}${_today_fmt}${reset} ${dim}·${reset} ${dim}session${reset} ${magenta}${_session_fmt}${reset} ${dim}·${reset} ${dim}lifetime${reset} ${white}${_lifetime_fmt}${reset}"
@@ -1278,22 +1289,34 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
     fi
 fi
 
-# ── Build the current-account rate-projection tail ──
-# Assembled here from vars computed by the rate-limit block above. Attached
-# to the current-account row in the per-account block, replacing the old
-# stand-alone "current" + "weekly" rows.
+# Weekly and survive are rendered as their own labeled rows now;
+# no longer appended to the current-account row.
 CURRENT_RATE_TAIL=""
-if [ -n "${CUR_FULL_DISPLAY:-}" ]; then
-    CURRENT_RATE_TAIL="${CUR_FULL_COLOR}full ~${CUR_FULL_DISPLAY}${reset}"
-fi
-if [ -n "${CUR_SURVIVE_DISPLAY:-}" ]; then
-    [ -n "$CURRENT_RATE_TAIL" ] && CURRENT_RATE_TAIL+=" ${dim}·${reset} "
-    CURRENT_RATE_TAIL+="${CUR_SURVIVE_COLOR}${CUR_SURVIVE_DISPLAY}${reset}"
-fi
+WEEKLY_BAR_LINE=""
+SURVIVE_BAR_LINE=""
 if [ -n "${WEEK_PCT_DISPLAY:-}" ] && [ "${WEEK_PCT_DISPLAY:-0}" -gt 0 ] 2>/dev/null; then
-    [ -n "$CURRENT_RATE_TAIL" ] && CURRENT_RATE_TAIL+=" ${dim}·${reset} "
-    CURRENT_RATE_TAIL+="${dim}7d${reset} ${WEEK_PCT_COLOR}${WEEK_PCT_DISPLAY}%${reset}"
-    [ -n "${WEEK_RESET_SHORT:-}" ] && CURRENT_RATE_TAIL+=" ${dim}(${WEEK_RESET_SHORT})${reset}"
+    _wk_bar=$(build_bar "$WEEK_PCT_DISPLAY" 15)
+    WEEKLY_BAR_LINE="${white}$(printf "%-7s" "weekly")${reset} ${_wk_bar} ${WEEK_PCT_COLOR}$(printf "%3d" "$WEEK_PCT_DISPLAY")%${reset}"
+    [ -n "${WEEK_RESET_SHORT:-}" ] && WEEKLY_BAR_LINE+="  ${dim}resets ${WEEK_RESET_SHORT}${reset}"
+fi
+# Survive bar: shows buffer (finishes window) or downtime (caps early).
+# Bar length is full-minutes/total-window-minutes so the filled portion
+# represents how much of the 5h window your current pace covers.
+if [ -n "${CUR_FULL_DISPLAY:-}" ]; then
+    # Compute bar fill from mins_to_full (computed above) vs the 5h window
+    # (300 min). Clamped 0..100.
+    _survive_pct=$(awk -v m="${mins_to_full:-0}" 'BEGIN {
+        p = m * 100 / 300;
+        if (p > 100) p = 100;
+        if (p < 0)   p = 0;
+        printf "%d", p
+    }')
+    _survive_bar=$(build_bar "$_survive_pct" 15)
+    SURVIVE_BAR_LINE="${white}$(printf "%-7s" "survive")${reset} ${_survive_bar} "
+    if [ -n "${CUR_SURVIVE_DISPLAY:-}" ]; then
+        SURVIVE_BAR_LINE+="${CUR_SURVIVE_COLOR}${CUR_SURVIVE_DISPLAY}${reset} "
+    fi
+    SURVIVE_BAR_LINE+="${dim}full in ${CUR_FULL_DISPLAY}${reset}"
 fi
 
 # ── Daily budget line ──────────────────────────────────
@@ -1595,9 +1618,8 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     row_line+="  ${red}⚠ hard wall${reset}"
                 fi
                 # Append projection tail to the current-account row only.
-                if [ "$em" = "$ACCT_EMAIL" ] && [ -n "$CURRENT_RATE_TAIL" ]; then
-                    row_line+="  ${CURRENT_RATE_TAIL}"
-                fi
+                # (CURRENT_RATE_TAIL no longer appended here — weekly and
+                # survive are standalone bar rows above the account block.)
                 ACCOUNT_ROWS+="|${em}:${row_line}"
             done <<< "$parsed"
             [ -n "$rendered" ] && ACCOUNT_RESETS_DISPLAY="$rendered"
@@ -1732,10 +1754,8 @@ render_default() {
         headroom_line="${white}$(printf "%-7s" "left")${reset} ${headroom_bar} ${headroom_color}$(printf "%3d" "$headroom_int")%${reset}"
         printf "\n%b" "$headroom_line"
     fi
-    # NOTE: rate_lines intentionally not printed — its current/weekly rows
-    # duplicated the current-account info already shown in the account block.
-    # The projection tail (full ~Xh · ✗/✓ · 7d N%) now rides on the current
-    # account row via CURRENT_RATE_TAIL.
+    [ -n "$WEEKLY_BAR_LINE"  ] && printf "\n%b" "$WEEKLY_BAR_LINE"
+    [ -n "$SURVIVE_BAR_LINE" ] && printf "\n%b" "$SURVIVE_BAR_LINE"
     [ -n "$BUDGET_DISPLAY" ] && printf "\n%b" "$BUDGET_DISPLAY"
     [ -n "$USAGE_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "usage")${reset} %b" "$USAGE_DISPLAY"
     [ -n "$FINAL_ACCOUNT_ROWS" ] && printf "%b" "$FINAL_ACCOUNT_ROWS"
