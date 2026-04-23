@@ -946,7 +946,8 @@ if $needs_refresh || $needs_profile_refresh; then
                                     seven_day_pct:   ($u.seven_day.utilization // 0),
                                     seven_day_reset: ($u.seven_day.resets_at // null),
                                     extra_used:      ($u.extra_usage.used_credits // 0),
-                                    extra_pct:       ($u.extra_usage.utilization // 0)
+                                    extra_pct:       ($u.extra_usage.utilization // 0),
+                                    extra_limit:     ($u.extra_usage.monthly_limit // 0)
                                 }' >> "$hist_file" 2>/dev/null
                             if [ -f "$hist_file" ]; then
                                 hist_size=$(stat -f %z "$hist_file" 2>/dev/null || stat -c %s "$hist_file" 2>/dev/null || echo 0)
@@ -1314,21 +1315,42 @@ fi
 # "→" marker. Reset times in the past are projected forward in 5h increments
 # (matches existing format_reset_time behavior) to handle accounts you
 # haven't touched in a while.
+# printf's %-Ns counts BYTES not display columns, which misaligns UTF-8
+# chars like "—" (3 bytes, 1 column). _pad_to_cols counts characters so
+# columns stay stable across rows regardless of mixed-byte content.
+_pad_to_cols() {
+    local s=$1 want=$2
+    local n=${#s}
+    local pad=$(( want - n ))
+    if [ "$pad" -gt 0 ]; then
+        printf '%s' "$s"
+        printf '%*s' "$pad" ''
+    else
+        printf '%s' "$s"
+    fi
+}
+
 ACCOUNT_RESETS_DISPLAY=""
 ACCOUNT_ROWS=""  # per-account stacked rows (new layout); each row starts with \n
 if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
     ledger_file="$HOME/.claude/account-resets.json"
     caps_file="$HOME/.claude/account-caps.json"
     hist_file="$HOME/.claude/utilization-history.jsonl"
-    # Build email -> latest extra_pct map from the history log's tail.
-    # Bash 3.2 on macOS has no assoc arrays, so store as a newline-delimited
-    # "email<TAB>pct" string and grep it for lookup. Read only the tail to keep
-    # it cheap. awk keeps the most recent value per email.
+    # Build email -> latest (extra_pct, extra_used_cents) map from the history
+    # log's tail. Bash 3.2 on macOS has no assoc arrays, so store as a
+    # newline-delimited "email<TAB>pct<TAB>cents" string. Read only the tail
+    # to keep it cheap. awk keeps the most recent values per email.
     EXTRA_PCT_LOOKUP=""
     if [ -f "$hist_file" ]; then
+        # Backfill limit from used/pct when the older log format omitted it.
         EXTRA_PCT_LOOKUP=$(tail -c 200000 "$hist_file" 2>/dev/null | \
-            jq -r 'select(.email) | [.email, (.extra_pct // 0)] | @tsv' 2>/dev/null | \
-            awk -F'\t' '{by[$1]=$2} END{for(k in by) print k"\t"by[k]}')
+            jq -r 'select(.email) | [.email, (.extra_pct // 0), (.extra_used // 0), (.extra_limit // 0)] | @tsv' 2>/dev/null | \
+            awk -F'\t' '{pct[$1]=$2; used[$1]=$3; lim[$1]=$4}
+                END{for(k in pct) {
+                    l=lim[k];
+                    if (l==0 && pct[k]>0) l=used[k]*100/pct[k];
+                    print k"\t"pct[k]"\t"used[k]"\t"l
+                }}')
     fi
     if [ -f "$ledger_file" ] && [ -n "$ACCT_EMAIL" ]; then
         # Collect entries: email|tag|reset_epoch|pct per line. Project past
@@ -1379,9 +1401,17 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 else
                     tdisp="—"
                 fi
+                # Display name: friendly title-cased per-tag label, overriding
+                # the lowercase tag used internally for lookups.
+                case "$tag" in
+                    work)     display_name="Coram"   ;;
+                    alumni)   display_name="Brown"   ;;
+                    personal) display_name="Andrew"  ;;
+                    *)        display_name="$tag"    ;;
+                esac
                 # All account tags render white; only the leading marker
                 # distinguishes the current account (◉) from the others.
-                label="${tag:-$em}"
+                label="${display_name:-$em}"
                 seg="${white}${label}${reset}"
                 # Leading marker: ◉ for current account, blank for the rest.
                 # Always a 2-col slot so all tag columns start at the same
@@ -1469,19 +1499,35 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 rendered+="${marker}${seg} ${white}${tdisp}${reset} ${pct_color}${pct_show}${reset}${cap_suffix}   "
 
                 # ── Per-account row (new stacked layout) ──
-                # Pull this account's latest extra-credit % from the lookup
-                # string we built above. "—" when no history yet.
+                # Pull this account's latest extra-credit spend from the lookup
+                # string we built above. Rendered as $remaining/$limit — the
+                # HEADROOM left on the paid-credit bucket, which is what you
+                # actually care about for planning.
                 extra_pct=""
+                extra_cents=""
+                extra_limit_cents=""
                 if [ -n "$EXTRA_PCT_LOOKUP" ]; then
-                    extra_pct=$(printf '%s\n' "$EXTRA_PCT_LOOKUP" | awk -F'\t' -v e="$em" '$1==e {print $2; exit}')
+                    IFS=$'\t' read -r extra_pct extra_cents extra_limit_cents < <(printf '%s\n' "$EXTRA_PCT_LOOKUP" | awk -F'\t' -v e="$em" '$1==e {print $2"\t"$3"\t"$4; exit}')
                 fi
-                if [ -n "$extra_pct" ]; then
+                # Account tags appear in title-case for display (Coram / Brown
+                # / Andrew) but we still key on the lowercased name for lookups.
+                # Handled in the rendering block below.
+                # Build the inner "$NNN/$NNNN" (or "—") text and pad it to a
+                # fixed 11 display columns so every row's hrs_col aligns.
+                if [ -n "$extra_pct" ] && [ -n "$extra_limit_cents" ] && awk "BEGIN{exit !(${extra_limit_cents:-0} > 0)}"; then
                     extra_int=$(printf "%.0f" "$extra_pct" 2>/dev/null || echo 0)
                     extra_color=$(color_for_pct "$extra_int")
-                    extra_seg="${dim}extra${reset} ${extra_color}$(printf "%3d%%" "$extra_int")${reset}"
+                    extra_left=$(awk -v u="${extra_cents:-0}" -v l="${extra_limit_cents:-0}" 'BEGIN { printf "%.0f", (l-u)/100 }')
+                    extra_limit_dollars=$(awk -v l="${extra_limit_cents:-0}" 'BEGIN { printf "%.0f", l/100 }')
+                    # left-padded 3 digits, right-padded 4 digits → "$  0/$1000" is 10.
+                    extra_inner=$(printf '$%3d/$%d' "$extra_left" "$extra_limit_dollars")
+                    extra_inner_padded=$(_pad_to_cols "$extra_inner" 11)
+                    # Color the whole inner segment by util (emitted at once so
+                    # we don't have to handle partial coloring around the "/").
+                    extra_seg="${dim}extra${reset} ${extra_color}${extra_inner_padded}${reset}"
                 else
                     extra_int=0
-                    extra_seg="${dim}extra   —${reset}"
+                    extra_seg="${dim}extra${reset} $(_pad_to_cols '—' 11)"
                 fi
 
                 # Hours-to-reset (computed from ep above, if known).
@@ -1531,20 +1577,6 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 fi
 
                 # Stash the row so we can emit after we know the best_em.
-                # printf's %-Ns counts BYTES not display columns, which
-                # misaligns UTF-8 chars like "—" (3 bytes, 1 column). Pad
-                # manually based on character count so the grid stays clean.
-                _pad_to_cols() {
-                    local s=$1 want=$2
-                    local n=${#s}
-                    local pad=$(( want - n ))
-                    if [ "$pad" -gt 0 ]; then
-                        printf '%s' "$s"
-                        printf '%*s' "$pad" ''
-                    else
-                        printf '%s' "$s"
-                    fi
-                }
                 tdisp_padded=$(_pad_to_cols "$tdisp" 8)
                 if [ -n "$_hrs_to_reset" ]; then
                     hrs_col="${_hrs_to_reset}h"
@@ -1556,7 +1588,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 hrs_pad=$(( 5 - hrs_n ))
                 [ "$hrs_pad" -lt 0 ] && hrs_pad=0
                 hrs_col=$(printf '%*s%s' "$hrs_pad" '' "$hrs_col")
-                row_line="${marker}$(_pad_to_cols "$tag" 9) ${white}${tdisp_padded}${reset}${pct_color}$(printf '%4s' "${pct_int}%")${reset}  ${extra_seg}  ${dim}${hrs_col}${reset}"
+                row_line="${marker}${white}$(_pad_to_cols "$display_name" 8)${reset} ${white}${tdisp_padded}${reset}${pct_color}$(printf '%4s' "${pct_int}%")${reset}  ${extra_seg}  ${dim}${hrs_col}${reset}"
                 # Annotate with hard-wall warning when applicable. (Windfall
                 # is implicit from the hrs_col — no extra note needed.)
                 if [ "$has_wall" = "1" ]; then
