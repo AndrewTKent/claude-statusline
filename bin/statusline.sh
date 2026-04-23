@@ -615,7 +615,7 @@ fi
 
 # ── Context % with visual bar ──────────────────────────
 CONTEXT_INT=$(printf "%.0f" "$CONTEXT_PCT")
-CTX_BAR=$(build_bar "$CONTEXT_INT" 30)
+CTX_BAR=$(build_bar "$CONTEXT_INT" 15)
 CTX_COLOR=$(color_for_pct "$CONTEXT_INT")
 
 # ── Context badge for line 1 (surfaces at 70%+) ───────
@@ -1738,7 +1738,7 @@ render_default() {
     if [ -n "${five_hour_pct:-}" ]; then
         headroom_int=$(( 100 - ${five_hour_pct%.*} ))
         [ "$headroom_int" -lt 0 ] && headroom_int=0
-        headroom_bar=$(build_bar "$headroom_int" 30)
+        headroom_bar=$(build_bar "$headroom_int" 15)
         headroom_color=$(color_for_pct "$five_hour_pct")
         headroom_line="${white}$(printf "%-7s" "left")${reset} ${headroom_bar} ${headroom_color}$(printf "%3d" "$headroom_int")%${reset}"
         printf "\n%b" "$headroom_line"
