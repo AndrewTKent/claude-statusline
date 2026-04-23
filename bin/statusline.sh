@@ -112,25 +112,39 @@ secs_since_last_user() {
     echo $(( $(date +%s) - ts_epoch ))
 }
 
+#   PCT        integer 0..100
+#   DIRECTION  "high-bad" (default) — green low, red at 90+: usage, context, rate
+#              "low-bad"             — green high, red at 10-: remaining, headroom
 color_for_pct() {
     local pct=$1
-    if [ "$pct" -ge 90 ] 2>/dev/null; then printf "$red"
-    elif [ "$pct" -ge 70 ] 2>/dev/null; then printf "$yellow"
-    elif [ "$pct" -ge 50 ] 2>/dev/null; then printf "$orange"
-    else printf "$green"
+    local dir="${2:-high-bad}"
+    if [ "$dir" = "low-bad" ]; then
+        if   [ "$pct" -le 10 ] 2>/dev/null; then printf "$red"
+        elif [ "$pct" -le 30 ] 2>/dev/null; then printf "$yellow"
+        elif [ "$pct" -le 50 ] 2>/dev/null; then printf "$orange"
+        else printf "$green"
+        fi
+    else
+        if   [ "$pct" -ge 90 ] 2>/dev/null; then printf "$red"
+        elif [ "$pct" -ge 70 ] 2>/dev/null; then printf "$yellow"
+        elif [ "$pct" -ge 50 ] 2>/dev/null; then printf "$orange"
+        else printf "$green"
+        fi
     fi
 }
 
+#   DIRECTION optional, passed through to color_for_pct ("high-bad" default).
 build_bar() {
     local pct=$1
     local width=$2
+    local dir="${3:-high-bad}"
     [ "$pct" -lt 0 ] 2>/dev/null && pct=0
     [ "$pct" -gt 100 ] 2>/dev/null && pct=100
 
     local filled=$(( pct * width / 100 ))
     local empty=$(( width - filled ))
     local bar_color
-    bar_color=$(color_for_pct "$pct")
+    bar_color=$(color_for_pct "$pct" "$dir")
 
     local filled_str="" empty_str=""
     for ((i=0; i<filled; i++)); do filled_str+="●"; done
@@ -664,7 +678,8 @@ FOCUS=""
 CACHE_TOTAL=$((CACHE_READ + CACHE_CREATE))
 if [ "$CACHE_TOTAL" -gt 0 ] 2>/dev/null; then
     CACHE_PCT=$((CACHE_READ * 100 / CACHE_TOTAL))
-    CACHE_COLOR=$(color_for_pct $((100 - CACHE_PCT)))  # invert: high cache = good
+    # low-bad: high cache hit rate = good
+    CACHE_COLOR=$(color_for_pct "$CACHE_PCT" "low-bad")
     CACHE_STR="${CACHE_COLOR}cache:${CACHE_PCT}%${reset}"
 else
     CACHE_STR="${dim}cache:--${reset}"
@@ -1342,7 +1357,8 @@ if [ -n "${CUR_FULL_DISPLAY:-}" ]; then
         if (p < 0)   p = 0;
         printf "%d", p
     }')
-    _survive_bar=$(build_bar "$_survive_pct" 15)
+    # low-bad: % of 5h covered at current pace. Low = cap hit early = bad.
+    _survive_bar=$(build_bar "$_survive_pct" 15 "low-bad")
     SURVIVE_BAR_LINE="${white}$(printf "%-7s" "survive")${reset} ${_survive_bar} "
     if [ -n "${CUR_SURVIVE_DISPLAY:-}" ]; then
         SURVIVE_BAR_LINE+="${CUR_SURVIVE_COLOR}${CUR_SURVIVE_DISPLAY}${reset} "
@@ -1780,8 +1796,9 @@ render_default() {
     if [ -n "${five_hour_pct:-}" ]; then
         headroom_int=$(( 100 - ${five_hour_pct%.*} ))
         [ "$headroom_int" -lt 0 ] && headroom_int=0
-        headroom_bar=$(build_bar "$headroom_int" 15)
-        headroom_color=$(color_for_pct "$five_hour_pct")
+        # low-bad: headroom IS the metric (0% = nothing left = red).
+        headroom_bar=$(build_bar "$headroom_int" 15 "low-bad")
+        headroom_color=$(color_for_pct "$headroom_int" "low-bad")
         headroom_line="${white}$(printf "%-7s" "left")${reset} ${headroom_bar} ${headroom_color}$(printf "%3d" "$headroom_int")%${reset}"
         printf "\n%b" "$headroom_line"
     fi
