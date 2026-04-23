@@ -615,7 +615,7 @@ fi
 
 # ── Context % with visual bar ──────────────────────────
 CONTEXT_INT=$(printf "%.0f" "$CONTEXT_PCT")
-CTX_BAR=$(build_bar "$CONTEXT_INT" 10)
+CTX_BAR=$(build_bar "$CONTEXT_INT" 30)
 CTX_COLOR=$(color_for_pct "$CONTEXT_INT")
 
 # ── Context badge for line 1 (surfaces at 70%+) ───────
