@@ -1707,7 +1707,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 # whitespace. Claude Code's status panel strips leading spaces
                 # on wrapped/multi-line output, which misaligned earlier when
                 # the indent was "  " + marker.
-                FINAL_ACCOUNT_ROWS+=$'\n'"${row_body}"
+                FINAL_ACCOUNT_ROWS+=$'\n'"        ${row_body}"
             done
         fi
     fi
