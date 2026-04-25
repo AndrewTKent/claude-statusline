@@ -36,6 +36,14 @@
 # Tokens from emails not in this map fall into "unknown".
 # EMAIL_PAYER_MAP="work:andrew@company.com personal:me@gmail.com alumni:me@alumni.example.edu"
 
+# Show a "resets" line listing next 5-hour reset + current utilization for
+# every account the statusline has polled. Eventually consistent — an
+# account's entry only updates while you're logged into it; stale reset
+# timestamps are projected forward in 5-hour increments. The current account
+# is highlighted, and the soonest-to-reset gets a "→" marker. Set to 1 to
+# enable.
+# SHOW_ACCOUNT_RESETS=1
+
 # ─── Token classifier (optional; for scan-tokens.py) ───────────────────────
 # Classify each token request as work / personal / unknown. Independent of
 # EMAIL_PAYER_MAP — email is about payment, work-type is about what you did.

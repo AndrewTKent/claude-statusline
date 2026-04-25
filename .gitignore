@@ -5,5 +5,9 @@ macos/claude-raycast/dist/
 npm/node_modules/
 npm/assets/
 
+# Python
+__pycache__/
+*.pyc
+
 # macOS
 .DS_Store

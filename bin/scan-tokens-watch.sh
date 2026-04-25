@@ -1,26 +1,29 @@
 #!/usr/bin/env bash
-# scan-tokens-watch.sh — trigger scan-tokens.py within ~1s of any JSONL change.
+# scan-tokens-watch.sh — pipe fswatch events into scan-tokens-daemon.py.
 #
-# Uses fswatch to watch ~/.claude/projects/ for writes. Debounces rapid events
-# (Claude Code streaming writes many lines per second during a response) so we
-# don't re-scan every single append. Calls scan-tokens.py with --incremental,
-# which only re-parses files whose mtime changed since the last run.
-#
-# Designed to run as a long-lived launchd agent (see install.sh).
+# This used to invoke scan-tokens.py as a subprocess on every event, which
+# meant a fresh Python interpreter + full tree walk + full re-aggregate per
+# file change. Under active streaming that pegged a core and paged the
+# machine. The daemon holds state in memory and updates incrementally, so
+# this script's only job is to shuttle events in.
 #
 # Env:
-#   CLAUDE_DIR              — defaults to $HOME/.claude
-#   SCAN_DEBOUNCE_MS        — defaults to 500ms
-#   SCAN_CONFIG             — path to statusline.conf (sourced before scan);
-#                             defaults to $HOME/.claude/statusline.conf
+#   CLAUDE_DIR        — defaults to $HOME/.claude
+#   SCAN_CONFIG       — path to statusline.conf, sourced before exec
+#                       (defaults to $CLAUDE_DIR/statusline.conf)
+#   SCAN_DEBOUNCE_MS  — fswatch --latency, in ms (default 500)
+#   PYTHON_BIN        — python interpreter (default /opt/homebrew/bin/python3)
+#   SCAN_VERBOSE      — if set to "1", daemon logs to stderr
 
 set -uo pipefail
 
 CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
 SCAN_CONFIG="${SCAN_CONFIG:-$CLAUDE_DIR/statusline.conf}"
 WATCH_DIR="$CLAUDE_DIR/projects"
-SCAN_SCRIPT="${BASH_SOURCE[0]%/*}/scan-tokens.py"
+SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DAEMON="$SCRIPT_DIR/scan-tokens-daemon.py"
 DEBOUNCE_MS="${SCAN_DEBOUNCE_MS:-500}"
+PYTHON_BIN="${PYTHON_BIN:-/opt/homebrew/bin/python3}"
 
 if [ ! -d "$WATCH_DIR" ]; then
     echo "watch dir missing: $WATCH_DIR" >&2
@@ -30,47 +33,51 @@ if ! command -v fswatch >/dev/null 2>&1; then
     echo "fswatch not installed; brew install fswatch" >&2
     exit 1
 fi
-if [ ! -x "$SCAN_SCRIPT" ]; then
-    echo "scan script not found/executable: $SCAN_SCRIPT" >&2
+if [ ! -x "$DAEMON" ]; then
+    echo "daemon not found or not executable: $DAEMON" >&2
+    exit 1
+fi
+if [ ! -x "$PYTHON_BIN" ]; then
+    echo "python interpreter not found: $PYTHON_BIN" >&2
     exit 1
 fi
 
-run_scan() {
-    # Source config so WORK_PATHS etc. flow through.
-    if [ -f "$SCAN_CONFIG" ]; then
-        set -a
-        # shellcheck disable=SC1090
-        source "$SCAN_CONFIG"
-        set +a
-    fi
-    /opt/homebrew/bin/python3 "$SCAN_SCRIPT" --quiet 2>/dev/null || true
-}
+# Source statusline.conf so classification env vars flow through to the daemon.
+if [ -f "$SCAN_CONFIG" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$SCAN_CONFIG"
+    set +a
+fi
 
-# Initial scan on startup so we don't wait for a JSONL change.
-run_scan
-
-# fswatch with latency (batch events within that window). fswatch already
-# debounces via its --latency flag, so a separate sleep loop isn't needed —
-# we convert ms to seconds for fswatch.
 LATENCY_S=$(awk -v ms="$DEBOUNCE_MS" 'BEGIN { printf "%.3f", ms/1000 }')
 
-# -r: recursive
-# -0: null-separated paths (handles spaces)
-# --latency: batch events within N seconds
-# --event Updated --event Created: only care about writes
-# --include '\.jsonl$': only JSONL files
-# --exclude '.*': exclude everything else
-fswatch \
-    -0 \
-    -r \
-    --latency "$LATENCY_S" \
-    --event Updated \
-    --event Created \
-    --include '\.jsonl$' \
-    --exclude '.*' \
-    "$WATCH_DIR" | while IFS= read -r -d '' _; do
-    # Drain any remaining queued events in this batch (fswatch already batched,
-    # but reading one and sleeping briefly lets a burst fully settle before we
-    # re-scan — avoids re-scanning in the middle of a multi-file streaming burst).
-    run_scan
-done
+daemon_arg=""
+if [ "${SCAN_VERBOSE:-}" = "1" ]; then
+    daemon_arg="--verbose"
+fi
+
+# fswatch options:
+#   -0                        NUL-separated paths (safe for spaces/newlines)
+#   -r                        recursive
+#   --latency                 batch events within N seconds
+#   --event Updated/Created   skip uninteresting events (attrs, platform noise)
+#   --include '\.jsonl$'      only JSONL files
+#   --exclude '.*'            exclude everything else
+#
+# Piping fswatch directly into the daemon keeps the event path in-kernel +
+# one pipe. The daemon reads NUL-delimited paths from stdin and handles
+# debounce/flush internally.
+if [ -n "$daemon_arg" ]; then
+    fswatch -0 -r --latency "$LATENCY_S" \
+        --event Updated --event Created \
+        --include '\.jsonl$' --exclude '.*' \
+        "$WATCH_DIR" \
+        | "$PYTHON_BIN" "$DAEMON" "$daemon_arg"
+else
+    fswatch -0 -r --latency "$LATENCY_S" \
+        --event Updated --event Created \
+        --include '\.jsonl$' --exclude '.*' \
+        "$WATCH_DIR" \
+        | "$PYTHON_BIN" "$DAEMON"
+fi
