@@ -54,7 +54,45 @@ def _split_csv(val: str) -> list[str]:
 
 
 # Challenge window (for the optional bounty tracker). "" disables.
+# Accepted forms:
+#   "2026-03-23"               — midnight UTC on that date
+#   "2026-03-23T00:00:00Z"     — explicit UTC timestamp
+#   "2026-03-23T00:00:00-07:00" — date at a specific offset (e.g. PT)
+# Timestamps in JSONLs are UTC (e.g. "2026-03-23T17:48:49.263Z"), so if you
+# want the boundary at "midnight Pacific," pass "2026-03-23T00:00:00-07:00"
+# or equivalently "2026-03-23T07:00:00Z".
 CHALLENGE_START = os.environ.get("CHALLENGE_START", "")
+
+
+def _normalize_challenge_start(raw: str) -> str:
+    """Normalize CHALLENGE_START to a UTC ISO string comparable to JSONL timestamps.
+
+    JSONL ts format: '2026-03-23T17:48:49.263Z'. We compare as strings, so we
+    must output a string lexicographically comparable to that. A date-only
+    input is treated as midnight UTC (liberal; counts a wider window). An
+    offset-aware input is converted to UTC.
+    """
+    if not raw:
+        return ""
+    # Date-only: treat as midnight UTC (appending T00:00:00Z makes it
+    # string-comparable to full JSONL timestamps).
+    if len(raw) == 10 and raw[4] == "-" and raw[7] == "-":
+        return raw + "T00:00:00Z"
+    # Offset-aware: convert to UTC 'Z' form.
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            # Naive — assume UTC.
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt_utc = dt.astimezone(timezone.utc)
+        # Format with millisecond precision + 'Z' so string compare works.
+        return dt_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    except (ValueError, TypeError):
+        return raw  # fall back to raw string compare
+
+
+CHALLENGE_START_NORM = _normalize_challenge_start(CHALLENGE_START)
 
 # Path substrings that signal work vs personal. Empty defaults — the user
 # supplies these via statusline.conf.
@@ -274,11 +312,32 @@ def extract_session_signals(filepath: str) -> tuple[set, set, str | None, list]:
                     usage = msg.get("usage") or {}
                     rid = entry.get("requestId") or msg.get("id", "")
                     ts = entry.get("timestamp", "")
+                    # "Completed" means the row represents a finished assistant
+                    # response, not a mid-stream snapshot. Signals:
+                    #   - stop_reason is set (main sessions: ~80% of rows;
+                    #     subagents: ~26%), OR
+                    #   - usage.iterations[] has entries (indicates the API
+                    #     returned at least one finalized iteration), OR
+                    #   - output_tokens > 0 AND stop_reason key exists but is
+                    #     None (older schema that doesn't populate stop_reason
+                    #     but still only writes completed rows)
+                    stop_reason = msg.get("stop_reason")
+                    has_iterations = bool(usage.get("iterations"))
+                    has_stop_key = "stop_reason" in msg
+                    # Heuristic: treat as completed unless output_tokens=0 AND
+                    # stop_reason is missing (a real mid-stream partial).
+                    completed = bool(stop_reason) or has_iterations or (
+                        has_stop_key and (usage.get("output_tokens") or 0) > 0
+                    )
                     if rid and ts and usage:
+                        # Per-record tuple: [rid, ts, inp, out, cache_read, completed]
+                        # `completed` drives dedup tie-breaks in ingest().
                         requests.append([
                             rid, ts,
                             usage.get("input_tokens", 0) or 0,
                             usage.get("output_tokens", 0) or 0,
+                            usage.get("cache_read_input_tokens", 0) or 0,
+                            completed,
                         ])
                     for block in msg.get("content", []) or []:
                         if not isinstance(block, dict):
@@ -365,21 +424,52 @@ def scan(prev_cache: dict) -> dict:
                 main_files.append(fp)
 
     def ingest(requests, base_acct, sid, spans_for_sid):
-        for rid, ts, inp, out in requests:
+        """Accumulate per-request into seen_global / seen_challenge.
+
+        Dedup by requestId. When the same rid appears multiple times (streaming
+        partial rows + final row, or multiple cache entries from reconnects),
+        choose the row to keep via this priority:
+          1. Completed row (stop_reason set) beats partial.
+          2. Otherwise, highest out_tokens wins.
+        Ties with completed=completed fall back to max(out).
+        This drops the pathology where a mid-stream partial with inflated
+        input_tokens ends up representing a rid whose real final is smaller.
+        """
+        for rec in requests:
+            # Back-compat: older caches had 4-tuple [rid, ts, inp, out].
+            # New format adds cache_read and completed at the end.
+            if len(rec) >= 6:
+                rid, ts, inp, out, cache_read, completed = rec[0], rec[1], rec[2], rec[3], rec[4], bool(rec[5])
+            else:
+                rid, ts, inp, out = rec[0], rec[1], rec[2], rec[3]
+                cache_read = 0
+                completed = False
+
             # Work-type (path+content+overrides — NEVER email)
             work_type = resolve_override(sid, ts, base_acct, overrides)
             if work_type not in ("work", "personal"):
                 work_type = "unknown"
             # Payer (email span lookup)
             payer = payer_for(spans_for_sid, ts)
+            entry = (inp, out, work_type, payer, cache_read, completed)
 
-            prev_seen = seen_global.get(rid)
-            if prev_seen is None or out > prev_seen[1]:
-                seen_global[rid] = (inp, out, work_type, payer)
-            if CHALLENGE_START and ts >= CHALLENGE_START:
-                prev_seen = seen_challenge.get(rid)
-                if prev_seen is None or out > prev_seen[1]:
-                    seen_challenge[rid] = (inp, out, work_type, payer)
+            def prefer(new, prev):
+                """Return the better of two entries for the same rid."""
+                if prev is None:
+                    return new
+                # completed beats partial
+                if new[5] and not prev[5]:
+                    return new
+                if prev[5] and not new[5]:
+                    return prev
+                # both complete or both partial — take higher out_tokens
+                if new[1] > prev[1]:
+                    return new
+                return prev
+
+            seen_global[rid] = prefer(entry, seen_global.get(rid))
+            if CHALLENGE_START_NORM and ts >= CHALLENGE_START_NORM:
+                seen_challenge[rid] = prefer(entry, seen_challenge.get(rid))
 
     # Main sessions
     for filepath in main_files:
@@ -398,7 +488,7 @@ def scan(prev_cache: dict) -> dict:
                 acct = prev.get("acct") or "unknown"
         else:
             cwds, paths, user_text, raw_reqs = extract_session_signals(filepath)
-            requests = [[r, t, i, o] for (r, t, i, o) in raw_reqs]
+            requests = [list(r) for r in raw_reqs]
             if acct is None:
                 acct = classify_by_content(cwds, paths, user_text)
             files_rescanned += 1
@@ -441,7 +531,7 @@ def scan(prev_cache: dict) -> dict:
             requests = prev["requests"]
         else:
             _, _, _, raw_reqs = extract_session_signals(filepath)
-            requests = [[r, t, i, o] for (r, t, i, o) in raw_reqs]
+            requests = [list(r) for r in raw_reqs]
             files_rescanned += 1
 
         new_files[filepath] = {"mtime": mtime_int, "acct": acct, "requests": requests}
@@ -454,7 +544,17 @@ def scan(prev_cache: dict) -> dict:
     def build_block(seen):
         work_type_totals = {"work": 0, "personal": 0, "unknown": 0}
         payer_totals = {p: 0 for p in payer_labels}
-        for _rid, (inp, out, wt, pr) in seen.items():
+        cache_read_total = 0
+        completed_count = 0
+        partial_count = 0
+        for _rid, tup in seen.items():
+            # Support both 4-tuple (legacy cache) and 6-tuple (new).
+            if len(tup) >= 6:
+                inp, out, wt, pr, cache_read, completed = tup
+            else:
+                inp, out, wt, pr = tup[0], tup[1], tup[2], tup[3]
+                cache_read = 0
+                completed = True  # assume good for legacy rows
             t = inp + out
             if wt not in work_type_totals:
                 wt = "unknown"
@@ -462,13 +562,21 @@ def scan(prev_cache: dict) -> dict:
             if pr not in payer_totals:
                 pr = "unknown"
             payer_totals[pr] += t
+            cache_read_total += cache_read
+            if completed:
+                completed_count += 1
+            else:
+                partial_count += 1
         total = sum(work_type_totals.values())
         return {
             "work_tokens": work_type_totals["work"],
             "personal_tokens": work_type_totals["personal"],
             "unknown_tokens": work_type_totals["unknown"],
             "total_tokens": total,
+            "cache_read_tokens": cache_read_total,
             "unique_requests": len(seen),
+            "completed_requests": completed_count,
+            "partial_requests": partial_count,
             "by_payer": payer_totals,
         }
 
@@ -489,6 +597,7 @@ def scan(prev_cache: dict) -> dict:
         result["personal_tokens"] = challenge_block["personal_tokens"]
         result["unknown_tokens"] = challenge_block["unknown_tokens"]
         result["total_tokens"] = challenge_block["total_tokens"]
+        result["cache_read_tokens"] = challenge_block["cache_read_tokens"]
         result["unique_requests"] = challenge_block["unique_requests"]
     return result
 
