@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """Export sanitized copies of session JSONLs for submission.
 
 Non-destructive: reads from ~/.claude/projects/, writes to <output-dir>/.

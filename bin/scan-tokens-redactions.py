@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """Report all redact ranges across all sessions.
 
 Reads ~/.claude/token-scan-overrides.json for entries with `ranges[]` containing
