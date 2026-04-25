@@ -1,0 +1,821 @@
+"""Core parsing, classification, and aggregation for Claude Code JSONL logs.
+
+This module is the single source of truth for:
+
+  * Parsing ~/.claude/projects/**/*.jsonl session files.
+  * Classifying each request along two orthogonal dimensions:
+      - work-type  ("work" | "personal" | "unknown")  — path/content/overrides
+      - payer      (EMAIL_PAYER_MAP label | "unknown") — session-accounts.json span
+  * Deduping requests by requestId, summing input+output tokens.
+  * Building summary and cache JSON payloads.
+
+Two consumers exist:
+
+  * scan-tokens.py          — one-shot CLI. Walks the whole tree, writes cache
+                              and summary, exits. Used by cron, launchd
+                              periodic runs, and manual invocations.
+  * scan-tokens-daemon.py   — long-running daemon. Boots once, then updates
+                              aggregates incrementally from fswatch events.
+                              Calls into this module for parsing and
+                              classification; manages its own in-memory state.
+
+Keep this module import-safe: no global I/O, no prints, no sys.exit. All
+configuration is pulled from the environment via load_config() so callers can
+override per-invocation if needed.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Iterable
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class Config:
+    """Runtime configuration resolved from environment variables."""
+
+    claude_dir: Path
+    projects_dir: Path
+    cache_file: Path
+    summary_file: Path
+    overrides_file: Path
+    session_accounts_file: Path
+    challenge_start: str
+    work_paths: tuple[str, ...]
+    personal_paths: tuple[str, ...]
+    work_keywords: tuple[str, ...]
+    personal_keywords: tuple[str, ...]
+    email_payer_map: dict[str, str]
+    bounty_target_tokens: int
+    bounty_lookback_days: int
+    bounty_session_gap_min: int
+
+
+def _split_csv(val: str) -> tuple[str, ...]:
+    return tuple(s.strip().lower() for s in val.split(",") if s.strip())
+
+
+def _parse_email_payer_map(raw: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for pair in raw.split():
+        if ":" in pair:
+            label, email = pair.split(":", 1)
+            result[email.strip().lower()] = label.strip()
+    return result
+
+
+def load_config() -> Config:
+    """Build a Config from environment variables. Safe to call multiple times."""
+    claude_dir = Path(os.environ.get("CLAUDE_DIR", str(Path.home() / ".claude")))
+    return Config(
+        claude_dir=claude_dir,
+        projects_dir=claude_dir / "projects",
+        cache_file=claude_dir / "token-scan-cache.json",
+        summary_file=claude_dir / "token-scan-summary.json",
+        overrides_file=claude_dir / "token-scan-overrides.json",
+        session_accounts_file=claude_dir / "session-accounts.json",
+        challenge_start=os.environ.get("CHALLENGE_START", ""),
+        work_paths=_split_csv(os.environ.get("WORK_PATHS", "")),
+        personal_paths=_split_csv(os.environ.get("PERSONAL_PATHS", "")),
+        work_keywords=_split_csv(os.environ.get("WORK_KEYWORDS", "")),
+        personal_keywords=_split_csv(os.environ.get("PERSONAL_KEYWORDS", "")),
+        email_payer_map=_parse_email_payer_map(os.environ.get("EMAIL_PAYER_MAP", "")),
+        bounty_target_tokens=int(os.environ.get("BOUNTY_TARGET_TOKENS", "0") or "0"),
+        bounty_lookback_days=int(os.environ.get("BOUNTY_LOOKBACK_DAYS", "3") or "3"),
+        bounty_session_gap_min=int(os.environ.get("BOUNTY_SESSION_GAP_MIN", "30") or "30"),
+    )
+
+
+UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+PATH_RE = re.compile(r"/Users/[^\s\"'`]+")
+
+REDACT_CATEGORIES = {
+    "rude-to-claude",
+    "personal-aside",
+    "personal-comms",
+    "sensitive-data",
+    "other",
+}
+
+
+# ---------------------------------------------------------------------------
+# Requests and session state
+# ---------------------------------------------------------------------------
+# A "request row" is [rid, ts, inp, out, cache_read, cache_create].
+# We keep it as a list (not a dataclass) because it's stored in JSON caches
+# and we want minimal overhead across thousands of rows.
+Request = list
+
+
+def normalize_request(r: list) -> Request:
+    """Pad older 4-tuple cached rows up to 6-tuple [rid,ts,inp,out,cr,cc]."""
+    return [
+        r[0], r[1], r[2], r[3],
+        r[4] if len(r) > 4 else 0,
+        r[5] if len(r) > 5 else 0,
+    ]
+
+
+@dataclass
+class SessionSignals:
+    """What we extract in a single pass over a JSONL file."""
+
+    cwds: set[str] = field(default_factory=set)
+    paths: set[str] = field(default_factory=set)
+    user_text: str | None = None
+    requests: list[Request] = field(default_factory=list)
+
+
+USER_TEXT_CAP = 20_000
+USER_SNIPPET_CAP = 2_000
+
+
+def parse_jsonl_signals(filepath: str | Path, start_offset: int = 0) -> tuple[SessionSignals, int]:
+    """Parse a JSONL file from start_offset to EOF.
+
+    Returns (signals, new_offset). When start_offset is nonzero we only collect
+    new requests — cwds/paths/user_text are left empty because classification
+    uses the per-file snapshot, not per-event deltas.
+
+    A partial line at the tail (likely a mid-write) is skipped and the offset
+    is left at the start of that line so the next call re-reads it.
+    """
+    signals = SessionSignals()
+    offset = start_offset
+
+    try:
+        with open(filepath, "rb") as f:
+            f.seek(start_offset)
+            # Track where each line starts so a partial tail rewinds correctly.
+            line_start = f.tell()
+            while True:
+                raw = f.readline()
+                if not raw:
+                    break
+                if not raw.endswith(b"\n"):
+                    # Partial line at tail — caller comes back later.
+                    return signals, line_start
+                offset = f.tell()
+                line_start = offset
+                _ingest_line(raw, signals, collect_context=(start_offset == 0))
+    except OSError:
+        return signals, start_offset
+
+    return signals, offset
+
+
+def _ingest_line(raw: bytes, signals: SessionSignals, collect_context: bool) -> None:
+    line = raw.strip()
+    if not line:
+        return
+    try:
+        entry = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return
+
+    if collect_context:
+        cwd = entry.get("cwd")
+        if isinstance(cwd, str):
+            signals.cwds.add(cwd)
+
+    etype = entry.get("type")
+    if etype == "user" and collect_context:
+        _collect_user_text(entry, signals)
+    elif etype == "assistant":
+        _collect_assistant(entry, signals, collect_context)
+
+
+def _collect_user_text(entry: dict, signals: SessionSignals) -> None:
+    if signals.user_text is not None and len(signals.user_text) >= USER_TEXT_CAP:
+        return
+    content = entry.get("message", {}).get("content", "")
+    text = ""
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        for c in content:
+            if isinstance(c, dict) and c.get("type") == "text":
+                text = c.get("text", "")
+                break
+    if not text:
+        return
+    snippet = text[:USER_SNIPPET_CAP]
+    signals.user_text = (signals.user_text or "") + (" " if signals.user_text else "") + snippet
+
+
+def _collect_assistant(entry: dict, signals: SessionSignals, collect_context: bool) -> None:
+    msg = entry.get("message", {})
+    usage = msg.get("usage") or {}
+    rid = entry.get("requestId") or msg.get("id", "")
+    ts = entry.get("timestamp", "")
+    if rid and ts and usage:
+        signals.requests.append([
+            rid, ts,
+            usage.get("input_tokens", 0) or 0,
+            usage.get("output_tokens", 0) or 0,
+            usage.get("cache_read_input_tokens", 0) or 0,
+            usage.get("cache_creation_input_tokens", 0) or 0,
+        ])
+    if not collect_context:
+        return
+    for block in msg.get("content", []) or []:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        inp = block.get("input", {})
+        for k in ("file_path", "path", "cwd"):
+            v = inp.get(k)
+            if isinstance(v, str) and v.startswith("/"):
+                signals.paths.add(v)
+        cmd = inp.get("command", "")
+        if isinstance(cmd, str):
+            for p in PATH_RE.findall(cmd):
+                signals.paths.add(p)
+
+
+# ---------------------------------------------------------------------------
+# Classification
+# ---------------------------------------------------------------------------
+def classify_path(path: str, cfg: Config) -> str | None:
+    """Return 'work' | 'personal' | None based on path substrings."""
+    p = path.lower()
+    for needle in cfg.personal_paths:
+        if needle in p:
+            return "personal"
+    for needle in cfg.work_paths:
+        if needle in p:
+            return "work"
+    return None
+
+
+def classify_by_content(signals: SessionSignals, cfg: Config) -> str:
+    """Fallback classifier by path + keyword hits. Returns work/personal/unknown."""
+    all_paths = signals.cwds | signals.paths
+    work = 0
+    personal = 0
+    for p in all_paths:
+        pl = p.lower()
+        if any(n in pl for n in cfg.work_paths):
+            work += 1
+        if any(n in pl for n in cfg.personal_paths):
+            personal += 1
+    if signals.user_text:
+        lower = signals.user_text.lower()
+        work += 3 * sum(1 for k in cfg.work_keywords if k in lower)
+        personal += 3 * sum(1 for k in cfg.personal_keywords if k in lower)
+    if work > personal:
+        return "work"
+    if personal > work:
+        return "personal"
+    return "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Overrides (per-session manual reclassification)
+# ---------------------------------------------------------------------------
+def load_overrides(cfg: Config) -> dict:
+    try:
+        with open(cfg.overrides_file) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def parse_override(entry):
+    if isinstance(entry, str):
+        return entry, []
+    if isinstance(entry, dict):
+        tag = entry.get("tag")
+        ranges = entry.get("ranges", []) or []
+        validated = []
+        for r in ranges:
+            if not isinstance(r, dict):
+                continue
+            validated.append({
+                "from": r.get("from"),
+                "to": r.get("to"),
+                "tag": r.get("tag"),
+                "redact": r.get("redact"),
+                "note": r.get("note"),
+            })
+        return tag, validated
+    return None, []
+
+
+def count_redactions(overrides: dict) -> tuple[int, int]:
+    sessions = 0
+    ranges = 0
+    for entry in overrides.values():
+        if not isinstance(entry, dict):
+            continue
+        rs = [r for r in (entry.get("ranges") or []) if r.get("redact")]
+        if rs:
+            sessions += 1
+            ranges += len(rs)
+    return sessions, ranges
+
+
+def resolve_override(sid: str, ts: str, base_acct: str, overrides: dict) -> str:
+    """Apply per-session overrides; range tag beats session tag, last match wins."""
+    entry = overrides.get(sid)
+    if entry is None:
+        return base_acct
+    session_tag, ranges = parse_override(entry)
+    effective = session_tag or base_acct
+    for rng in ranges:
+        if rng.get("tag") is None:
+            continue
+        frm, to = rng.get("from"), rng.get("to")
+        if frm is not None and ts < frm:
+            continue
+        if to is not None and ts > to:
+            continue
+        effective = rng["tag"]
+    return effective
+
+
+# ---------------------------------------------------------------------------
+# Payer dimension (email → label via session-accounts.json spans)
+# ---------------------------------------------------------------------------
+def load_session_payer_spans(cfg: Config) -> dict:
+    """Load session-accounts.json and return {sid: [(from, to, payer)]}."""
+    try:
+        with open(cfg.session_accounts_file) as f:
+            raw = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    result: dict[str, list] = {}
+    for sid, info in raw.items():
+        if not isinstance(info, dict):
+            continue
+        spans = info.get("spans") or []
+        norm = []
+        for span in spans:
+            if not isinstance(span, dict):
+                continue
+            email = (span.get("email") or "").lower()
+            payer = cfg.email_payer_map.get(email, "unknown")
+            norm.append((span.get("from"), span.get("to"), payer))
+        if norm:
+            norm.sort(key=lambda s: s[0] or "")
+            result[sid] = norm
+    return result
+
+
+def payer_for(spans: list, ts: str) -> str:
+    if not spans:
+        return "unknown"
+    for frm, to, payer in spans:
+        if frm is not None and ts < frm:
+            continue
+        if to is not None and ts > to:
+            continue
+        return payer
+    return "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Aggregation
+# ---------------------------------------------------------------------------
+def today_start_iso() -> str:
+    now = datetime.now().astimezone()
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+@dataclass
+class Aggregates:
+    """In-memory aggregation state, keyed by requestId."""
+
+    seen_global: dict[str, tuple] = field(default_factory=dict)
+    seen_challenge: dict[str, tuple] = field(default_factory=dict)
+    seen_today: dict[str, tuple] = field(default_factory=dict)
+    today_start: str = field(default_factory=today_start_iso)
+
+    def ingest(self, requests: Iterable[Request], work_type: str, payer: str,
+               challenge_start: str) -> None:
+        for row in requests:
+            rid, ts, inp, out = row[0], row[1], row[2], row[3]
+            tup = (inp, out, work_type, payer)
+            _remember_max_out(self.seen_global, rid, tup)
+            if challenge_start and ts >= challenge_start:
+                _remember_max_out(self.seen_challenge, rid, tup)
+            if ts >= self.today_start:
+                _remember_max_out(self.seen_today, rid, tup)
+
+    def ingest_with_resolver(self, requests: Iterable[Request], sid: str,
+                             base_acct: str, overrides: dict,
+                             payer_spans_for_sid: list,
+                             challenge_start: str) -> None:
+        """Ingest requests where work-type depends on (sid, ts) — i.e. overrides."""
+        for row in requests:
+            rid, ts, inp, out = row[0], row[1], row[2], row[3]
+            wt = resolve_override(sid, ts, base_acct, overrides)
+            if wt not in ("work", "personal"):
+                wt = "unknown"
+            payer = payer_for(payer_spans_for_sid, ts)
+            tup = (inp, out, wt, payer)
+            _remember_max_out(self.seen_global, rid, tup)
+            if challenge_start and ts >= challenge_start:
+                _remember_max_out(self.seen_challenge, rid, tup)
+            if ts >= self.today_start:
+                _remember_max_out(self.seen_today, rid, tup)
+
+    def roll_over_midnight_if_needed(self) -> bool:
+        """If the local day has changed, reset the 'today' bucket. Returns True on rollover."""
+        current = today_start_iso()
+        if current != self.today_start:
+            self.today_start = current
+            self.seen_today = {}
+            return True
+        return False
+
+    def build_summary_block(self, seen: dict, payer_labels: set[str]) -> dict:
+        work_type_totals = {"work": 0, "personal": 0, "unknown": 0}
+        payer_totals = {p: 0 for p in payer_labels}
+        for _rid, (inp, out, wt, pr) in seen.items():
+            t = inp + out
+            if wt not in work_type_totals:
+                wt = "unknown"
+            work_type_totals[wt] += t
+            if pr not in payer_totals:
+                pr = "unknown"
+            payer_totals[pr] += t
+        total = sum(work_type_totals.values())
+        return {
+            "work_tokens": work_type_totals["work"],
+            "personal_tokens": work_type_totals["personal"],
+            "unknown_tokens": work_type_totals["unknown"],
+            "total_tokens": total,
+            "unique_requests": len(seen),
+            "by_payer": payer_totals,
+        }
+
+
+def _remember_max_out(store: dict, rid: str, tup: tuple) -> None:
+    """Keep the request tuple with the highest output_tokens for each rid."""
+    prev = store.get(rid)
+    if prev is None or tup[1] > prev[1]:
+        store[rid] = tup
+
+
+# ---------------------------------------------------------------------------
+# Bounty tracker (active-minute rate → ETA)
+# ---------------------------------------------------------------------------
+def compute_bounty_eta(result: dict, cfg: Config) -> dict:
+    target = cfg.bounty_target_tokens
+    if not target:
+        return {"target": 0}
+
+    block = result.get("challenge") or result.get("global") or {}
+    current_work = block.get("work_tokens", 0)
+
+    if current_work >= target:
+        return {
+            "current_work_tokens": current_work,
+            "target": target,
+            "active_minutes": 0,
+            "tokens_per_min": 0,
+            "eta_hours": 0.0,
+            "cleared": True,
+        }
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=cfg.bounty_lookback_days)
+    events: list[tuple[datetime, int]] = []
+    for fdata in result.get("files", {}).values():
+        if fdata.get("acct") != "work":
+            continue
+        for req in fdata.get("requests", []):
+            try:
+                ts = datetime.fromisoformat(req[1].rstrip("Z")).replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError, IndexError):
+                continue
+            if ts < cutoff:
+                continue
+            tokens = (req[2] or 0) + (req[3] or 0)
+            if tokens <= 0:
+                continue
+            events.append((ts, tokens))
+
+    empty = {
+        "current_work_tokens": current_work,
+        "target": target,
+        "active_minutes": 0,
+        "tokens_per_min": 0,
+        "eta_hours": None,
+        "cleared": False,
+    }
+    if len(events) < 2:
+        return empty
+
+    events.sort(key=lambda e: e[0])
+    gap = timedelta(minutes=cfg.bounty_session_gap_min)
+    burst_start = events[0][0]
+    burst_tokens = events[0][1]
+    prev_ts = events[0][0]
+    total_active = 0.0
+    total_tokens = 0
+
+    def flush():
+        nonlocal total_active, total_tokens
+        dur = (prev_ts - burst_start).total_seconds() / 60.0
+        if dur > 0:
+            total_active += dur
+            total_tokens += burst_tokens
+
+    for ts, tokens in events[1:]:
+        if ts - prev_ts >= gap:
+            flush()
+            burst_start = ts
+            burst_tokens = tokens
+        else:
+            burst_tokens += tokens
+        prev_ts = ts
+    flush()
+
+    if total_active <= 0 or total_tokens <= 0:
+        empty["active_minutes"] = round(total_active, 1)
+        return empty
+
+    rate = total_tokens / total_active
+    eta_minutes = (target - current_work) / rate
+    return {
+        "current_work_tokens": current_work,
+        "target": target,
+        "active_minutes": round(total_active, 1),
+        "tokens_per_min": round(rate, 1),
+        "eta_hours": round(eta_minutes / 60.0, 2),
+        "cleared": False,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Disk I/O helpers
+# ---------------------------------------------------------------------------
+def load_cache(cfg: Config) -> dict:
+    try:
+        with open(cfg.cache_file) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def atomic_write_json(path: Path, payload: dict) -> None:
+    """Write JSON atomically via temp-file + rename.
+
+    The tmp path includes the writer PID so concurrent writers from different
+    processes don't clobber each other's half-written files. A second process
+    writing the same target is rare (we run one daemon + the one-shot CLI),
+    but launchd can briefly overlap two instances during a reload — the
+    PID-scoped tmp makes that safe instead of a FileNotFoundError race.
+    """
+    tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.tmp")
+    with open(tmp, "w") as f:
+        json.dump(payload, f)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------------------
+# Full-tree scan (used by scan-tokens.py one-shot and daemon boot)
+# ---------------------------------------------------------------------------
+def iter_jsonls(cfg: Config) -> tuple[list[str], list[str]]:
+    """Return (main_files, subagent_files) under PROJECTS_DIR."""
+    main_files: list[str] = []
+    subagent_files: list[str] = []
+    for root, _dirs, files in os.walk(cfg.projects_dir):
+        for fname in files:
+            if not fname.endswith(".jsonl"):
+                continue
+            fp = os.path.join(root, fname)
+            if "subagent" in root:
+                subagent_files.append(fp)
+            else:
+                main_files.append(fp)
+    return main_files, subagent_files
+
+
+@dataclass
+class FileCacheEntry:
+    """Per-file cache: mtime, classification, offsets, and parsed requests."""
+
+    mtime: int
+    acct: str
+    size: int
+    offset: int
+    requests: list[Request]
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "FileCacheEntry":
+        return cls(
+            mtime=int(d.get("mtime", 0)),
+            acct=d.get("acct") or "unknown",
+            size=int(d.get("size", 0)),
+            offset=int(d.get("offset", 0)),
+            requests=[normalize_request(r) for r in d.get("requests", [])],
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "mtime": self.mtime,
+            "acct": self.acct,
+            "size": self.size,
+            "offset": self.offset,
+            "requests": self.requests,
+        }
+
+
+def full_scan(cfg: Config, prev_cache: dict) -> tuple[dict, Aggregates, int]:
+    """Walk every JSONL and build file-level cache + aggregates.
+
+    Returns (new_files_cache, aggregates, files_rescanned).
+    """
+    prev_files = prev_cache.get("files", {})
+    overrides = load_overrides(cfg)
+    payer_spans = load_session_payer_spans(cfg)
+
+    aggregates = Aggregates()
+    session_classifications: dict[str, str] = {}
+    new_files: dict[str, dict] = {}
+    files_rescanned = 0
+
+    main_files, subagent_files = iter_jsonls(cfg)
+
+    for filepath in main_files:
+        entry, was_rescanned = _scan_main_file(
+            filepath, prev_files.get(filepath), cfg, overrides,
+        )
+        if entry is None:
+            continue
+        if was_rescanned:
+            files_rescanned += 1
+        sid = _sid_for(filepath)
+        session_classifications[sid] = entry.acct
+        new_files[filepath] = entry.to_dict()
+        aggregates.ingest_with_resolver(
+            entry.requests, sid, entry.acct, overrides,
+            payer_spans.get(sid, []), cfg.challenge_start,
+        )
+
+    for filepath in subagent_files:
+        entry, was_rescanned = _scan_subagent_file(
+            filepath, prev_files.get(filepath), cfg, overrides,
+            session_classifications,
+        )
+        if entry is None:
+            continue
+        if was_rescanned:
+            files_rescanned += 1
+        sid = _sid_for(filepath)
+        parent_sid = _find_parent_sid(filepath, sid, session_classifications)
+        lookup_sid = parent_sid or sid
+        new_files[filepath] = entry.to_dict()
+        aggregates.ingest_with_resolver(
+            entry.requests, sid, entry.acct, overrides,
+            payer_spans.get(lookup_sid, []), cfg.challenge_start,
+        )
+
+    return new_files, aggregates, files_rescanned
+
+
+def _sid_for(filepath: str) -> str:
+    return os.path.basename(filepath).replace(".jsonl", "")
+
+
+def _find_parent_sid(filepath: str, sid: str, session_classifications: dict[str, str]) -> str | None:
+    for uuid in UUID_RE.findall(filepath):
+        if uuid != sid and uuid in session_classifications:
+            return uuid
+    return None
+
+
+def _scan_main_file(filepath: str, prev: dict | None, cfg: Config,
+                    overrides: dict) -> tuple[FileCacheEntry | None, bool]:
+    try:
+        stat = os.stat(filepath)
+    except OSError:
+        return None, False
+    mtime = int(stat.st_mtime)
+    size = stat.st_size
+    sid = _sid_for(filepath)
+    acct = classify_path(filepath, cfg)
+
+    cache_hit = (
+        prev
+        and prev.get("mtime") == mtime
+        and int(prev.get("size", -1)) == size
+        and "requests" in prev
+    )
+    if cache_hit:
+        requests = [normalize_request(r) for r in prev["requests"]]
+        if acct is None:
+            acct = prev.get("acct") or "unknown"
+        offset = int(prev.get("offset", size))
+    else:
+        signals, offset = parse_jsonl_signals(filepath, 0)
+        requests = signals.requests
+        if acct is None:
+            acct = classify_by_content(signals, cfg)
+
+    if sid in overrides:
+        tag, _ = parse_override(overrides[sid])
+        if tag:
+            acct = tag
+
+    return (
+        FileCacheEntry(mtime=mtime, acct=acct or "unknown",
+                       size=size, offset=offset, requests=requests),
+        not cache_hit,
+    )
+
+
+def _scan_subagent_file(filepath: str, prev: dict | None, cfg: Config,
+                        overrides: dict,
+                        session_classifications: dict[str, str]
+                        ) -> tuple[FileCacheEntry | None, bool]:
+    try:
+        stat = os.stat(filepath)
+    except OSError:
+        return None, False
+    mtime = int(stat.st_mtime)
+    size = stat.st_size
+    sid = _sid_for(filepath)
+
+    parent_sid = _find_parent_sid(filepath, sid, session_classifications)
+    if parent_sid:
+        acct = session_classifications[parent_sid]
+    else:
+        acct = classify_path(filepath, cfg) or "unknown"
+    if sid in overrides:
+        tag, _ = parse_override(overrides[sid])
+        if tag:
+            acct = tag
+
+    cache_hit = (
+        prev
+        and prev.get("mtime") == mtime
+        and int(prev.get("size", -1)) == size
+        and "requests" in prev
+    )
+    if cache_hit:
+        requests = [normalize_request(r) for r in prev["requests"]]
+        offset = int(prev.get("offset", size))
+    else:
+        signals, offset = parse_jsonl_signals(filepath, 0)
+        requests = signals.requests
+
+    return (
+        FileCacheEntry(mtime=mtime, acct=acct, size=size,
+                       offset=offset, requests=requests),
+        not cache_hit,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Summary assembly
+# ---------------------------------------------------------------------------
+def build_cache_payload(cfg: Config, new_files: dict, aggregates: Aggregates,
+                        files_rescanned: int) -> dict:
+    payer_labels = set(cfg.email_payer_map.values()) | {"unknown"}
+    result: dict = {
+        "timestamp": int(time.time()),
+        "challenge_start": cfg.challenge_start or None,
+        "global": aggregates.build_summary_block(aggregates.seen_global, payer_labels),
+        "today": aggregates.build_summary_block(aggregates.seen_today, payer_labels),
+        "files_scanned": len(new_files),
+        "files_rescanned": files_rescanned,
+        "files": new_files,
+    }
+    if cfg.challenge_start:
+        challenge = aggregates.build_summary_block(aggregates.seen_challenge, payer_labels)
+        result["challenge"] = challenge
+        # Back-compat top-level fields for statusline.sh.
+        result["work_tokens"] = challenge["work_tokens"]
+        result["personal_tokens"] = challenge["personal_tokens"]
+        result["unknown_tokens"] = challenge["unknown_tokens"]
+        result["total_tokens"] = challenge["total_tokens"]
+        result["unique_requests"] = challenge["unique_requests"]
+    return result
+
+
+def build_summary_payload(cfg: Config, cache_payload: dict, overrides: dict) -> dict:
+    r_sessions, r_ranges = count_redactions(overrides)
+    summary = {
+        "timestamp": cache_payload.get("timestamp"),
+        "scan_duration_s": cache_payload.get("scan_duration_s"),
+        "global": cache_payload["global"],
+        "today": cache_payload.get("today"),
+        "redactions": {"sessions": r_sessions, "ranges": r_ranges},
+    }
+    if "challenge" in cache_payload:
+        summary["challenge"] = cache_payload["challenge"]
+    if cfg.bounty_target_tokens:
+        summary["bounty"] = compute_bounty_eta(cache_payload, cfg)
+    return summary

@@ -112,25 +112,39 @@ secs_since_last_user() {
     echo $(( $(date +%s) - ts_epoch ))
 }
 
+#   PCT        integer 0..100
+#   DIRECTION  "high-bad" (default) — green low, red at 90+: usage, context, rate
+#              "low-bad"             — green high, red at 10-: remaining, headroom
 color_for_pct() {
     local pct=$1
-    if [ "$pct" -ge 90 ] 2>/dev/null; then printf "$red"
-    elif [ "$pct" -ge 70 ] 2>/dev/null; then printf "$yellow"
-    elif [ "$pct" -ge 50 ] 2>/dev/null; then printf "$orange"
-    else printf "$green"
+    local dir="${2:-high-bad}"
+    if [ "$dir" = "low-bad" ]; then
+        if   [ "$pct" -le 10 ] 2>/dev/null; then printf "$red"
+        elif [ "$pct" -le 30 ] 2>/dev/null; then printf "$yellow"
+        elif [ "$pct" -le 50 ] 2>/dev/null; then printf "$orange"
+        else printf "$green"
+        fi
+    else
+        if   [ "$pct" -ge 90 ] 2>/dev/null; then printf "$red"
+        elif [ "$pct" -ge 70 ] 2>/dev/null; then printf "$yellow"
+        elif [ "$pct" -ge 50 ] 2>/dev/null; then printf "$orange"
+        else printf "$green"
+        fi
     fi
 }
 
+#   DIRECTION optional, passed through to color_for_pct ("high-bad" default).
 build_bar() {
     local pct=$1
     local width=$2
+    local dir="${3:-high-bad}"
     [ "$pct" -lt 0 ] 2>/dev/null && pct=0
     [ "$pct" -gt 100 ] 2>/dev/null && pct=100
 
     local filled=$(( pct * width / 100 ))
     local empty=$(( width - filled ))
     local bar_color
-    bar_color=$(color_for_pct "$pct")
+    bar_color=$(color_for_pct "$pct" "$dir")
 
     local filled_str="" empty_str=""
     for ((i=0; i<filled; i++)); do filled_str+="●"; done
@@ -362,6 +376,10 @@ format_reset_time() {
             date -j -r "$epoch" +"%b %-d, %l:%M%p" 2>/dev/null | sed 's/  / /g; s/^ //; s/\.//g' | tr '[:upper:]' '[:lower:]' || \
             date -d "@$epoch" +"%b %-d, %l:%M%P" 2>/dev/null | sed 's/  / /g; s/^ //; s/\.//g'
             ;;
+        date)
+            date -j -r "$epoch" +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]' || \
+            date -d "@$epoch" +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]'
+            ;;
     esac
 }
 
@@ -406,7 +424,11 @@ TOKEN_DISPLAY=""
 
 IDLE_DISPLAY=""
 if [ -n "$SESSION_ID" ]; then
-    SESSION_TOKENS=$((INPUT_TOKENS + OUTPUT_TOKENS))
+    # Include cache_read + cache_creation so the "today" ledger reflects
+    # total Anthropic-billable tokens, not just input+output. Cache reads
+    # dominate heavy sessions (often 100x input+output) so omitting them
+    # under-reports daily usage by ~99%.
+    SESSION_TOKENS=$((INPUT_TOKENS + OUTPUT_TOKENS + CACHE_READ + CACHE_CREATE))
     get_subagent_tokens "$SESSION_ID" "$CWD"
 
     # Time since last user message — signals how long the current turn has been running.
@@ -456,6 +478,7 @@ if [ -n "$SESSION_ID" ]; then
 
     G_WORK=0 G_PERSONAL=0 G_UNKNOWN=0 G_TOTAL=0
     C_WORK=0 C_PERSONAL=0 C_TOTAL=0
+    T_TOTAL=0
     R_SESSIONS=0 R_RANGES=0
     scan_src=""
     [ -f "$SCAN_SUMMARY" ] && scan_src="$SCAN_SUMMARY"
@@ -469,6 +492,7 @@ if [ -n "$SESSION_ID" ]; then
             "C_WORK=" + (.challenge.work_tokens // 0 | tostring),
             "C_PERSONAL=" + (.challenge.personal_tokens // 0 | tostring),
             "C_TOTAL=" + (.challenge.total_tokens // 0 | tostring),
+            "T_TOTAL=" + (.today.total_tokens // 0 | tostring),
             "R_SESSIONS=" + (.redactions.sessions // 0 | tostring),
             "R_RANGES=" + (.redactions.ranges // 0 | tostring),
             "BOUNTY_ETA_H=" + (.bounty.eta_hours // "" | tostring),
@@ -554,6 +578,28 @@ if [ -n "$SESSION_ID" ]; then
         BOUNTY_DISPLAY="${cyan}→${bounty_target_m}M${reset} ${dim}~${reset}${BOUNTY_ETA_H}h ${dim}active (${reset}${bounty_gap_m}M left @ ${bounty_rate_kh}k/h${dim})${reset}"
     fi
 
+    # ── Unified usage line (replaces tokens/100m/bounty in default render) ──
+    # Shows today (since local midnight) · current session · lifetime total,
+    # each formatted human-readably. All three are already computed above.
+    USAGE_DISPLAY=""
+    _usage_fmt() {
+        awk -v t="$1" 'BEGIN {
+            if (t >= 1e9) printf "%.1fB", t/1e9;
+            else if (t >= 1e6) printf "%.1fM", t/1e6;
+            else if (t >= 1e3) printf "%.0fk", t/1e3;
+            else printf "%d", t
+        }'
+    }
+    # Prefer scan-based T_TOTAL (summed from JSONL, includes cache reads) —
+    # DAILY_TOKENS is a context-window-snapshot proxy that undercounts by
+    # ~1000x on heavy sessions.
+    _today_src=${T_TOTAL:-0}
+    [ "$_today_src" -eq 0 ] && _today_src=${DAILY_TOKENS:-0}
+    _today_fmt=$(_usage_fmt "$_today_src")
+    _session_fmt=$(_usage_fmt "${SESSION_DELTA:-0}")
+    _lifetime_fmt=$(_usage_fmt "${G_TOTAL:-0}")
+    USAGE_DISPLAY="${dim}today${reset} ${white}${_today_fmt}${reset} ${dim}·${reset} ${dim}session${reset} ${magenta}${_session_fmt}${reset} ${dim}·${reset} ${dim}lifetime${reset} ${white}${_lifetime_fmt}${reset}"
+
     # ── Redaction indicator (only when ranges > 0) ──
     # Reminds to run scan-tokens-export.py before submission.
     REDACT_DISPLAY=""
@@ -594,7 +640,7 @@ fi
 
 # ── Context % with visual bar ──────────────────────────
 CONTEXT_INT=$(printf "%.0f" "$CONTEXT_PCT")
-CTX_BAR=$(build_bar "$CONTEXT_INT" 10)
+CTX_BAR=$(build_bar "$CONTEXT_INT" 15)
 CTX_COLOR=$(color_for_pct "$CONTEXT_INT")
 
 # ── Context badge for line 1 (surfaces at 70%+) ───────
@@ -632,7 +678,8 @@ FOCUS=""
 CACHE_TOTAL=$((CACHE_READ + CACHE_CREATE))
 if [ "$CACHE_TOTAL" -gt 0 ] 2>/dev/null; then
     CACHE_PCT=$((CACHE_READ * 100 / CACHE_TOTAL))
-    CACHE_COLOR=$(color_for_pct $((100 - CACHE_PCT)))  # invert: high cache = good
+    # low-bad: high cache hit rate = good
+    CACHE_COLOR=$(color_for_pct "$CACHE_PCT" "low-bad")
     CACHE_STR="${CACHE_COLOR}cache:${CACHE_PCT}%${reset}"
 else
     CACHE_STR="${dim}cache:--${reset}"
@@ -888,6 +935,53 @@ if $needs_refresh || $needs_profile_refresh; then
                             printf '{"ts":%s,"five_hour":%s,"seven_day":%s,"extra_used":%s}' "$prev_ts" "${prev_5h:-0}" "${prev_7d:-0}" "${prev_extra:-0}" > "/tmp/claude/statusline-usage-prev.json"
                         fi
                         echo "$response" > "$cache_file"
+
+                        # Cross-account reset ledger: record the active account's
+                        # 5h/7d reset times + utilization so other sessions can
+                        # render "when does X reset" even when not logged in.
+                        # Keyed by email. Eventually consistent — only the
+                        # active account is updated per poll.
+                        ledger_email=""
+                        [ -f "$profile_cache_file" ] && ledger_email=$(jq -r '.account.email // empty' "$profile_cache_file" 2>/dev/null)
+                        if [ -n "$ledger_email" ]; then
+                            ledger_file="$HOME/.claude/account-resets.json"
+                            ledger_now=$(date +%s)
+                            [ -f "$ledger_file" ] || echo '{}' > "$ledger_file"
+                            tmp_ledger=$(mktemp "/tmp/claude/acct-resets.XXXXXX")
+                            jq --arg e "$ledger_email" --argjson ts "$ledger_now" --argjson u "$response" \
+                                '.[$e] = {
+                                    "five_hour_reset": ($u.five_hour.resets_at // null),
+                                    "five_hour_pct":   ($u.five_hour.utilization // 0),
+                                    "seven_day_reset": ($u.seven_day.resets_at // null),
+                                    "seven_day_pct":   ($u.seven_day.utilization // 0),
+                                    "last_seen":       $ts
+                                }' "$ledger_file" > "$tmp_ledger" 2>/dev/null && mv "$tmp_ledger" "$ledger_file" || rm -f "$tmp_ledger"
+
+                            # Append to history log — one JSON line per poll.
+                            # This is the dataset we'll regress (util, token_spend)
+                            # pairs against to derive the hidden per-account cap.
+                            # Cheap (~120 bytes/line, ~60 polls/hr → ~7KB/hr).
+                            # Rotate if file exceeds ~5MB (keep last ~half).
+                            hist_file="$HOME/.claude/utilization-history.jsonl"
+                            jq -c --arg e "$ledger_email" --argjson ts "$ledger_now" --argjson u "$response" -n \
+                                '{
+                                    ts: $ts,
+                                    email: $e,
+                                    five_hour_pct:   ($u.five_hour.utilization // 0),
+                                    five_hour_reset: ($u.five_hour.resets_at // null),
+                                    seven_day_pct:   ($u.seven_day.utilization // 0),
+                                    seven_day_reset: ($u.seven_day.resets_at // null),
+                                    extra_used:      ($u.extra_usage.used_credits // 0),
+                                    extra_pct:       ($u.extra_usage.utilization // 0),
+                                    extra_limit:     ($u.extra_usage.monthly_limit // 0)
+                                }' >> "$hist_file" 2>/dev/null
+                            if [ -f "$hist_file" ]; then
+                                hist_size=$(stat -f %z "$hist_file" 2>/dev/null || stat -c %s "$hist_file" 2>/dev/null || echo 0)
+                                if [ "$hist_size" -gt 5000000 ] 2>/dev/null; then
+                                    tail -c 2500000 "$hist_file" > "${hist_file}.tmp" && mv "${hist_file}.tmp" "$hist_file"
+                                fi
+                            fi
+                        fi
                     fi
                 fi
                 if $needs_profile_refresh; then
@@ -1039,7 +1133,22 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
     fi
 
     # ── Burn-down projection ──────────────────────────
-    # Estimate minutes until 100% based on utilization velocity
+    # Estimate minutes until 100% based on utilization velocity.
+    #
+    # Rate preference (in order):
+    #   1. Recent-window rate: (pct - prev_5h) / (poll_ts - prev_ts).
+    #      Reflects actual current burn — idle time makes survive grow,
+    #      sprints make it shrink. Needs two consecutive polls.
+    #   2. Since-window-start average: pct / secs_elapsed. Coarse but
+    #      always available — used on first poll after a window reset
+    #      or when prev-poll data is missing.
+    #
+    # The old code used (2) exclusively. Because both "time to full"
+    # and "time to reset" shrink together under steady burn, the
+    # survive delta (difference between them) stayed nearly constant
+    # for hours — giving the impression the number was frozen. Using
+    # the recent-window rate makes survive actually respond to changes
+    # in behavior.
     if [ "$five_hour_pct" -gt 0 ] 2>/dev/null && [ -n "$five_hour_reset_iso" ] && [ "$five_hour_reset_iso" != "" ]; then
         reset_epoch=$(iso_to_epoch "$five_hour_reset_iso")
         if [ -n "$reset_epoch" ]; then
@@ -1055,9 +1164,25 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
             if [ "$secs_elapsed" -gt 0 ] && [ "$five_hour_pct" -gt 0 ] 2>/dev/null; then
                 remaining_pct=$(( 100 - five_hour_pct ))
                 if [ "$remaining_pct" -gt 0 ]; then
-                    # Minutes to full = remaining_pct / (pct / secs_elapsed) / 60
+                    # Minutes to full = remaining_pct / rate / 60. Prefer the
+                    # recent-poll delta when we have it; else fall back to the
+                    # since-window-start average.
                     mins_to_full=$(awk "BEGIN {
-                        rate = $five_hour_pct / $secs_elapsed;
+                        poll_interval = ${poll_interval:-0};
+                        prev_pct      = ${prev_5h:-0};
+                        cur_pct       = $five_hour_pct;
+                        delta_pct     = cur_pct - prev_pct;
+
+                        # Only trust the recent rate when the poll gap is
+                        # long enough to be informative (>30s) and utilization
+                        # actually moved up. Zero or negative deltas mean
+                        # no recent burn (or a reset) — fall through.
+                        if (poll_interval >= 30 && delta_pct > 0) {
+                            rate = delta_pct / poll_interval;
+                        } else {
+                            rate = cur_pct / $secs_elapsed;
+                        }
+
                         if (rate > 0) printf \"%.0f\", $remaining_pct / rate / 60;
                         else print 999
                     }")
@@ -1070,6 +1195,9 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
                         full_display=$(fmt_duration_m "$mins_to_full")
                         # Pad "→full ~Xm" to 11 cols so "✗buf" lines up.
                         rate_lines+=" ${bd_color}$(pad_right "→full ~${full_display}" 14)${reset}"
+                        # Expose for the current-account row tail.
+                        CUR_FULL_DISPLAY="$full_display"
+                        CUR_FULL_COLOR="$bd_color"
 
                         # Survive indicator: buffer or downtime until window resets
                         mins_to_reset=$(( secs_to_reset / 60 ))
@@ -1077,9 +1205,13 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
                             if [ "$mins_to_full" -gt "$mins_to_reset" ] 2>/dev/null; then
                                 buf_display=$(fmt_duration_m $(( mins_to_full - mins_to_reset )))
                                 rate_lines+=" ${green}✓${buf_display}${reset}"
+                                CUR_SURVIVE_DISPLAY="✓${buf_display}"
+                                CUR_SURVIVE_COLOR="$green"
                             else
                                 dt_display=$(fmt_duration_m $(( mins_to_reset - mins_to_full )))
                                 rate_lines+=" ${red}✗${dt_display}${reset}"
+                                CUR_SURVIVE_DISPLAY="✗${dt_display}"
+                                CUR_SURVIVE_COLOR="$red"
                             fi
                         fi
                     fi
@@ -1092,6 +1224,14 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
     seven_day_reset=$(format_reset_time "$seven_day_reset_iso" "datetime")
     seven_day_bar=$(build_bar "$seven_day_pct" "$bar_width")
     seven_day_pct_color=$(color_for_pct "$seven_day_pct")
+    # Short weekly reset (date only, e.g. "apr 28") for the current-account tail.
+    WEEK_RESET_SHORT=$(format_reset_time "$seven_day_reset_iso" "date" 2>/dev/null || echo "")
+    if [ -z "$WEEK_RESET_SHORT" ]; then
+        # Fallback: pull just the "apr 28" chunk from the long form.
+        WEEK_RESET_SHORT=$(echo "$seven_day_reset" | awk -F',' '{print $1}')
+    fi
+    WEEK_PCT_DISPLAY="$seven_day_pct"
+    WEEK_PCT_COLOR="$seven_day_pct_color"
 
     rate_lines+="\n${white}$(printf "%-7s" "weekly")${reset} ${seven_day_bar} ${seven_day_pct_color}$(fmt_pct "$seven_day_pct_display")${reset}   "
     if [ -n "$seven_day_reset" ]; then
@@ -1195,13 +1335,380 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
     fi
 fi
 
+# Weekly and survive are rendered as their own labeled rows now;
+# no longer appended to the current-account row.
+CURRENT_RATE_TAIL=""
+WEEKLY_BAR_LINE=""
+SURVIVE_BAR_LINE=""
+if [ -n "${WEEK_PCT_DISPLAY:-}" ] && [ "${WEEK_PCT_DISPLAY:-0}" -gt 0 ] 2>/dev/null; then
+    _wk_bar=$(build_bar "$WEEK_PCT_DISPLAY" 15)
+    # fmt_pct on the fractional display preserves interpolated sub-percent
+    # precision; the int WEEK_PCT_DISPLAY still drives bar fill + color.
+    WEEKLY_BAR_LINE="${white}$(printf "%-7s" "weekly")${reset} ${_wk_bar} ${WEEK_PCT_COLOR}$(fmt_pct "${seven_day_pct_display:-$WEEK_PCT_DISPLAY}")${reset}"
+    [ -n "${WEEK_RESET_SHORT:-}" ] && WEEKLY_BAR_LINE+="  ${dim}resets ${WEEK_RESET_SHORT}${reset}"
+fi
+# Survive bar: shows buffer (finishes window) or downtime (caps early).
+# Bar length is full-minutes/total-window-minutes so the filled portion
+# represents how much of the 5h window your current pace covers.
+if [ -n "${CUR_FULL_DISPLAY:-}" ]; then
+    # Burn bar: % of 5h window you'll CONSUME at current pace (the inverse
+    # of "% covered"). Fills up as you burn faster. High = cap early = bad.
+    # Display gets 2-dec precision (derived from minute-granular mins_to_full);
+    # the integer form feeds the bar + color_for_pct which both need ints.
+    _burn_display=$(awk -v m="${mins_to_full:-0}" 'BEGIN {
+        p = m * 100 / 300;
+        if (p > 100) p = 100;
+        if (p < 0)   p = 0;
+        printf "%.2f", 100 - p
+    }')
+    _burn_pct="${_burn_display%.*}"
+    [ "$_burn_pct" -lt 0 ] 2>/dev/null && _burn_pct=0
+    [ "$_burn_pct" -gt 100 ] 2>/dev/null && _burn_pct=100
+    _burn_bar=$(build_bar "$_burn_pct" 15)
+    _burn_color=$(color_for_pct "$_burn_pct")
+    SURVIVE_BAR_LINE="${white}$(printf "%-7s" "burn")${reset} ${_burn_bar} ${_burn_color}$(fmt_pct "$_burn_display")${reset}  "
+    if [ -n "${CUR_SURVIVE_DISPLAY:-}" ]; then
+        SURVIVE_BAR_LINE+="${CUR_SURVIVE_COLOR}${CUR_SURVIVE_DISPLAY}${reset} "
+    fi
+    SURVIVE_BAR_LINE+="${dim}full in ${CUR_FULL_DISPLAY}${reset}"
+fi
+
 # ── Daily budget line ──────────────────────────────────
 BUDGET_DISPLAY=""
 if [ "$DAILY_BUDGET" -gt 0 ] 2>/dev/null; then
-    budget_pct=$(awk "BEGIN {p=$DAILY_COST * 100 / $DAILY_BUDGET; printf \"%.0f\", (p > 100 ? 100 : p)}")
+    budget_display=$(awk "BEGIN {p=$DAILY_COST * 100 / $DAILY_BUDGET; printf \"%.2f\", (p > 100 ? 100 : p)}")
+    budget_pct="${budget_display%.*}"
+    [ "$budget_pct" -gt 100 ] 2>/dev/null && budget_pct=100
     budget_bar=$(build_bar "$budget_pct" 10)
     budget_color=$(color_for_pct "$budget_pct")
-    BUDGET_DISPLAY="${white}$(printf "%-7s" "budget")${reset} ${budget_bar} ${budget_color}$(printf "%3d" "$budget_pct")%${reset} ${white}\$${DAILY_FMT}${dim}/${reset}${white}\$${DAILY_BUDGET}${reset}"
+    BUDGET_DISPLAY="${white}$(printf "%-7s" "budget")${reset} ${budget_bar} ${budget_color}$(fmt_pct "$budget_display")${reset} ${white}\$${DAILY_FMT}${dim}/${reset}${white}\$${DAILY_BUDGET}${reset}"
+fi
+
+# ── Multi-account reset ledger line ────────────────────
+# Shows each tracked account's next 5-hour reset + current utilization, so
+# you know which login has headroom at a glance. Opt-in via SHOW_ACCOUNT_RESETS=1
+# in ~/.claude/statusline.conf. Data is written per-account during usage polls
+# (see background refresh block above) and keyed by email.
+#
+# The current account's entry is highlighted; the soonest-to-reset gets a
+# "→" marker. Reset times in the past are projected forward in 5h increments
+# (matches existing format_reset_time behavior) to handle accounts you
+# haven't touched in a while.
+# printf's %-Ns counts BYTES not display columns, which misaligns UTF-8
+# chars like "—" (3 bytes, 1 column). _pad_to_cols counts characters so
+# columns stay stable across rows regardless of mixed-byte content.
+_pad_to_cols() {
+    local s=$1 want=$2
+    local n=${#s}
+    local pad=$(( want - n ))
+    if [ "$pad" -gt 0 ]; then
+        printf '%s' "$s"
+        printf '%*s' "$pad" ''
+    else
+        printf '%s' "$s"
+    fi
+}
+
+ACCOUNT_RESETS_DISPLAY=""
+ACCOUNT_ROWS=""  # per-account stacked rows (new layout); each row starts with \n
+if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
+    ledger_file="$HOME/.claude/account-resets.json"
+    caps_file="$HOME/.claude/account-caps.json"
+    hist_file="$HOME/.claude/utilization-history.jsonl"
+    # Build email -> latest (extra_pct, extra_used_cents) map from the history
+    # log's tail. Bash 3.2 on macOS has no assoc arrays, so store as a
+    # newline-delimited "email<TAB>pct<TAB>cents" string. Read only the tail
+    # to keep it cheap. awk keeps the most recent values per email.
+    EXTRA_PCT_LOOKUP=""
+    if [ -f "$hist_file" ]; then
+        # Backfill limit from used/pct when the older log format omitted it.
+        EXTRA_PCT_LOOKUP=$(tail -c 200000 "$hist_file" 2>/dev/null | \
+            jq -r 'select(.email) | [.email, (.extra_pct // 0), (.extra_used // 0), (.extra_limit // 0)] | @tsv' 2>/dev/null | \
+            awk -F'\t' '{pct[$1]=$2; used[$1]=$3; lim[$1]=$4}
+                END{for(k in pct) {
+                    l=lim[k];
+                    if (l==0 && pct[k]>0) l=used[k]*100/pct[k];
+                    print k"\t"pct[k]"\t"used[k]"\t"l
+                }}')
+    fi
+    if [ -f "$ledger_file" ] && [ -n "$ACCT_EMAIL" ]; then
+        # Collect entries: email|tag|reset_epoch|pct per line. Project past
+        # reset times forward in 5h increments (18000s).
+        now_ar=$(date +%s)
+        entries=$(jq -r --argjson now "$now_ar" '
+            to_entries[] |
+            [.key, (.value.five_hour_reset // ""), (.value.five_hour_pct // 0)] |
+            @tsv' "$ledger_file" 2>/dev/null)
+        if [ -n "$entries" ]; then
+            # Parse + compute projected epochs, find soonest
+            parsed=""
+            soonest_epoch=""
+            while IFS=$'\t' read -r em iso pct; do
+                [ -z "$em" ] && continue
+                ep=""
+                if [ -n "$iso" ] && [ "$iso" != "null" ]; then
+                    ep=$(iso_to_epoch "$iso")
+                    if [ -n "$ep" ]; then
+                        while [ "$ep" -le "$now_ar" ]; do
+                            ep=$((ep + 18000))
+                        done
+                    fi
+                fi
+                tag=$(resolve_account_label "$em")
+                parsed+="${em}|${tag}|${ep}|${pct}"$'\n'
+                if [ -n "$ep" ]; then
+                    if [ -z "$soonest_epoch" ] || [ "$ep" -lt "$soonest_epoch" ] 2>/dev/null; then
+                        soonest_epoch="$ep"
+                    fi
+                fi
+            done <<< "$entries"
+
+            # Sort by projected reset epoch (soonest first). Entries with no
+            # epoch sort to the end.
+            parsed=$(printf '%s' "$parsed" | awk -F'|' 'NF>=4 { key=($3==""?"9999999999":$3); print key"\t"$0 }' | sort -n | cut -f2-)
+
+            rendered=""
+            while IFS='|' read -r em tag ep pct; do
+                [ -z "$em" ] && continue
+                # Reset per-iteration cap vars so stale values don't leak across
+                # accounts when jq returns empty for this email.
+                ci_status="" ci_cur="0" ci_cap=""
+                # Display time (respects the projected epoch)
+                if [ -n "$ep" ]; then
+                    tdisp=$(date -j -r "$ep" +"%l:%M%p" 2>/dev/null | sed 's/^ //; s/\.//g' | tr '[:upper:]' '[:lower:]') || \
+                        tdisp=$(date -d "@$ep" +"%l:%M%P" 2>/dev/null | sed 's/^ //; s/\.//g')
+                else
+                    tdisp="—"
+                fi
+                # Display name: friendly title-cased per-tag label, overriding
+                # the lowercase tag used internally for lookups.
+                case "$tag" in
+                    work)     display_name="Coram"   ;;
+                    alumni)   display_name="Brown"   ;;
+                    personal) display_name="Andrew"  ;;
+                    *)        display_name="$tag"    ;;
+                esac
+                # All account tags render white; only the leading marker
+                # distinguishes the current account (◉) from the others.
+                label="${display_name:-$em}"
+                seg="${white}${label}${reset}"
+                # Leading marker: * for current, · for others. Using a visible
+                # dim dot for non-current rows prevents Claude Code's status
+                # panel from trimming leading whitespace and shifting columns.
+                if [ "$em" = "$ACCT_EMAIL" ]; then
+                    marker="${white}*${reset} "
+                else
+                    marker="${dim}·${reset} "
+                fi
+                # Utilization: for the CURRENT account, use the interpolated
+                # value already computed by the rate-limit block (matches the
+                # "current" row exactly). For other accounts, fall back to
+                # the ledger value (no interpolation possible — we're not
+                # logged into them).
+                if [ "$em" = "$ACCT_EMAIL" ] && [ -n "${five_hour_pct_display:-}" ]; then
+                    pct_disp="$five_hour_pct_display"
+                else
+                    pct_disp="$pct"
+                fi
+                pct_int=$(printf "%.0f" "$pct_disp" 2>/dev/null || echo 0)
+                pct_color=$(color_for_pct "$pct_int")
+                # Display fractional util for the current account (matches the
+                # "current" row); other accounts only have integer ledger data.
+                if [ "$em" = "$ACCT_EMAIL" ]; then
+                    pct_show=$(fmt_pct "$pct_disp")
+                else
+                    pct_show=$(printf "%d%%" "$pct_int")
+                fi
+
+                # Work-unit display from derive-cap.py. "wu" is a plan-agnostic
+                # unit defined as "1 output-token-equivalent" — it's consistent
+                # across accounts regardless of Pro/Max/Max-5× tier.
+                #   status=ok       → "(Xwu/Ywu)"
+                #   status=calibrating with current_wu → "(Xwu · calibrating)"
+                #   otherwise omitted
+                cap_suffix=""
+                if [ -f "$caps_file" ]; then
+                    cap_info=$(jq -r --arg e "$em" '.[$e] // empty |
+                        if .status == "ok" and .cap_wu then
+                          "ok|" + (.current_wu|tostring) + "|" + (.cap_wu|tostring)
+                        elif .current_wu then
+                          "cal|" + (.current_wu|tostring) + "|" + ((.best_observed_wu // 0)|tostring)
+                        else "" end' "$caps_file" 2>/dev/null)
+                    if [ -n "$cap_info" ]; then
+                        IFS='|' read -r ci_status ci_cur ci_cap <<< "$cap_info"
+                        _wu_fmt() {
+                            awk -v n="$1" 'BEGIN {
+                                if (n>=1e9) printf "%.1fB", n/1e9;
+                                else if (n>=1e6) printf "%.1fM", n/1e6;
+                                else if (n>=1e3) printf "%.0fK", n/1e3;
+                                else printf "%.0f", n
+                            }'
+                        }
+                        cur_fmt=$(_wu_fmt "$ci_cur")
+                        if [ "$ci_status" = "ok" ]; then
+                            cap_fmt=$(_wu_fmt "$ci_cap")
+                            cap_suffix=" ${dim}(${reset}${white}${cur_fmt}wu${dim}/${white}${cap_fmt}wu${dim})${reset}"
+                        elif [ "$ci_status" = "cal" ]; then
+                            cap_suffix=" ${dim}(${cur_fmt}wu)${reset}"
+                        fi
+                    fi
+                fi
+
+                # Legacy pending-samples fallback (no wu data yet at all)
+                if [ -z "$cap_suffix" ] && [ -f "$caps_file" ]; then
+                    legacy=$(jq -r --arg e "$em" '.[$e] // empty |
+                        if .n_points then
+                          "pending|" + (.n_points|tostring) + "|" + ((.min_required // 30)|tostring)
+                        else "" end' "$caps_file" 2>/dev/null)
+                    if [ -n "$legacy" ]; then
+                        IFS='|' read -r ci_status ci_a ci_b <<< "$legacy"
+                        if [ "$ci_status" = "pending" ]; then
+                            cap_suffix=" ${dim}(${ci_a}/${ci_b} samples)${reset}"
+                        fi
+                    fi
+                fi
+
+                # Skip dead-weight rows: non-current accounts with no usage
+                # signal (0% and no observed wu). These just bloat the line
+                # past Claude Code's status-panel width budget and cause collapse.
+                if [ "$em" != "$ACCT_EMAIL" ] && [ "$pct_int" = "0" ] && { [ -z "$cap_suffix" ] || [ "${ci_cur:-0}" = "0" ]; }; then
+                    continue
+                fi
+
+                rendered+="${marker}${seg} ${white}${tdisp}${reset} ${pct_color}${pct_show}${reset}${cap_suffix}   "
+
+                # ── Per-account row (new stacked layout) ──
+                # Pull this account's latest extra-credit spend from the lookup
+                # string we built above. Rendered as $remaining/$limit — the
+                # HEADROOM left on the paid-credit bucket, which is what you
+                # actually care about for planning.
+                extra_pct=""
+                extra_cents=""
+                extra_limit_cents=""
+                if [ -n "$EXTRA_PCT_LOOKUP" ]; then
+                    IFS=$'\t' read -r extra_pct extra_cents extra_limit_cents < <(printf '%s\n' "$EXTRA_PCT_LOOKUP" | awk -F'\t' -v e="$em" '$1==e {print $2"\t"$3"\t"$4; exit}')
+                fi
+                # Account tags appear in title-case for display (Coram / Brown
+                # / Andrew) but we still key on the lowercased name for lookups.
+                # Handled in the rendering block below.
+                # Build the inner "$NNN/$NNNN" (or "—") text and pad it to a
+                # fixed 11 display columns so every row's hrs_col aligns.
+                if [ -n "$extra_pct" ] && [ -n "$extra_limit_cents" ] && awk "BEGIN{exit !(${extra_limit_cents:-0} > 0)}"; then
+                    extra_int=$(printf "%.0f" "$extra_pct" 2>/dev/null || echo 0)
+                    extra_color=$(color_for_pct "$extra_int")
+                    # Show spent/limit to match the dashboard ("$455.52 spent,
+                    # 46% used, $1000 cap") and the rest of the statusline's
+                    # fill-up-as-you-consume framing.
+                    extra_spent=$(awk -v u="${extra_cents:-0}" 'BEGIN { printf "%.0f", u/100 }')
+                    extra_limit_dollars=$(awk -v l="${extra_limit_cents:-0}" 'BEGIN { printf "%.0f", l/100 }')
+                    # left-padded 3 digits, right-padded 4 digits → "$  0/$1000" is 10.
+                    extra_inner=$(printf '$%3d/$%d' "$extra_spent" "$extra_limit_dollars")
+                    extra_inner_padded=$(_pad_to_cols "$extra_inner" 11)
+                    # Color the whole inner segment by util (emitted at once so
+                    # we don't have to handle partial coloring around the "/").
+                    extra_seg="${dim}extra${reset} ${extra_color}${extra_inner_padded}${reset}"
+                else
+                    extra_int=0
+                    extra_seg="${dim}extra${reset} $(_pad_to_cols '—' 11)"
+                fi
+
+                # Hours-to-reset (computed from ep above, if known).
+                _now_ep=$(date +%s)
+                if [ -n "$ep" ]; then
+                    _secs_to_reset=$(( ep - _now_ep ))
+                    _hrs_to_reset=$(awk -v s="$_secs_to_reset" 'BEGIN { printf "%.1f", s/3600 }')
+                else
+                    _hrs_to_reset=""
+                fi
+
+                # Row note: one of (in priority order)
+                #   ⚠ hard wall  — 5h≥90% AND extra≥99% AND not resetting soon
+                #   ✓ use now    — best non-current candidate under the same
+                #                  scoring model as plan CLI
+                #   → resets Xh  — a reset lands within 2h (windfall)
+                #   (blank)      — unremarkable
+                note=""
+                headroom=$(( 100 - pct_int ))
+                extra_headroom=$(( 100 - extra_int ))
+                has_wall=0
+                if [ "$pct_int" -ge 90 ] 2>/dev/null && [ "$extra_int" -ge 99 ] 2>/dev/null; then
+                    if [ -z "$_hrs_to_reset" ] || awk "BEGIN{exit !($_hrs_to_reset > 1.0)}"; then
+                        note="${red}⚠ hard wall${reset}"
+                        has_wall=1
+                    fi
+                fi
+
+                # Compute planning score (for later pick of best non-current).
+                # Matches the python plan model: window_headroom + 0.5×extra
+                # + reset_windfall_if_within_2h − hard_wall_penalty.
+                windfall=0
+                if [ -n "$_hrs_to_reset" ]; then
+                    # Bonus scaled by fraction of a 2h plan horizon that lands
+                    # AFTER the reset.
+                    windfall=$(awk -v h="$_hrs_to_reset" 'BEGIN {
+                        if (h < 0 || h >= 2) print 0; else printf "%d", 100*(2-h)/2
+                    }')
+                fi
+                score=$(( headroom + extra_headroom / 2 + windfall ))
+                [ "$has_wall" = "1" ] && score=0
+
+                # Track best non-current account for the "✓ use now" marker.
+                if [ "$em" != "$ACCT_EMAIL" ] && [ "$score" -gt "${_best_score:-0}" ]; then
+                    _best_score=$score
+                    _best_em=$em
+                fi
+
+                # Stash the row so we can emit after we know the best_em.
+                tdisp_padded=$(_pad_to_cols "$tdisp" 8)
+
+                # Trailing column: extra-usage reset date (1st of next month
+                # local — matches Anthropic's monthly rollover policy and the
+                # dashboard's "Resets May 1"). Only shown when the account has
+                # extra usage enabled; otherwise a dash. Replaces the
+                # redundant "hours to 5h reset" — tdisp already shows that
+                # moment as a local time.
+                if [ -n "$extra_pct" ] && [ -n "$extra_limit_cents" ] && awk "BEGIN{exit !(${extra_limit_cents:-0} > 0)}"; then
+                    # First of next month, in local TZ.
+                    extra_reset_col=$(date -v1d -v+1m +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]' || \
+                                      date -d "$(date +%Y-%m-01) +1 month" +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+                else
+                    extra_reset_col="—"
+                fi
+                reset_n=${#extra_reset_col}
+                reset_pad=$(( 6 - reset_n ))
+                [ "$reset_pad" -lt 0 ] && reset_pad=0
+                extra_reset_col=$(printf '%*s%s' "$reset_pad" '' "$extra_reset_col")
+                row_line="${marker}${white}$(_pad_to_cols "$display_name" 8)${reset} ${white}${tdisp_padded}${reset}${pct_color}$(printf '%4s' "${pct_int}%")${reset}  ${extra_seg}  ${dim}${extra_reset_col}${reset}"
+                # Annotate with hard-wall warning when applicable. (Windfall
+                # is implicit from the hrs_col — no extra note needed.)
+                if [ "$has_wall" = "1" ]; then
+                    row_line+="  ${red}⚠ hard wall${reset}"
+                fi
+                # Append projection tail to the current-account row only.
+                # (CURRENT_RATE_TAIL no longer appended here — weekly and
+                # survive are standalone bar rows above the account block.)
+                ACCOUNT_ROWS+="|${em}:${row_line}"
+            done <<< "$parsed"
+            [ -n "$rendered" ] && ACCOUNT_RESETS_DISPLAY="$rendered"
+
+            # Second pass: annotate the "✓ best next" row and assemble final output.
+            FINAL_ACCOUNT_ROWS=""
+            IFS='|' read -ra _rows <<< "$ACCOUNT_ROWS"
+            for r in "${_rows[@]}"; do
+                [ -z "$r" ] && continue
+                row_em="${r%%:*}"
+                row_body="${r#*:}"
+                if [ -n "${_best_em:-}" ] && [ "$row_em" = "$_best_em" ] && [ "${five_hour_pct:-0}" -ge 70 ] 2>/dev/null; then
+                    row_body+="   ${green}✓ best next ~2h${reset}"
+                fi
+                # Prefix with the marker (already 2 cols) — no extra leading
+                # whitespace. Claude Code's status panel strips leading spaces
+                # on wrapped/multi-line output, which misaligned earlier when
+                # the indent was "  " + marker.
+                FINAL_ACCOUNT_ROWS+=$'\n'"${row_body}"
+            done
+        fi
+    fi
 fi
 
 # ── Terminal width detection ──────────────────────────────
@@ -1291,38 +1798,49 @@ fi
 
 # ── Render: default (multi-line) ──────────────────────────
 render_default() {
-    line1b=""
-    if [ "$COLS" -ge 100 ]; then
-        # Row 1: identity (model, account, dir+git, ctx badge, focus).
-        line1="${blue}${MODEL}${reset}${EFFORT}${FAST_MODE}"
-        [ -n "$ACCOUNT_LABEL" ] && line1+="${sep}${ACCOUNT_LABEL}"
-        line1+="${sep}${cyan}${DIR_NAME}${reset}${SHORT_GIT_INFO}${FOCUS}"
-        # Row 2: state (cost + burn + billable + timer + idle). Split so the
-        # header doesn't get truncated by Claude Code's status area width.
-        # Each segment is pipe-separated; vars have a leading space we strip.
-        line1b="${magenta}\$${COST_FMT}${reset}"
-        [ -n "$DAILY_SUFFIX" ] && line1b+="${sep}${DAILY_SUFFIX# }"
-        [ -n "$BURN_RATE" ] && line1b+="${sep}${BURN_RATE# }"
-        [ -n "$BILLABLE" ] && line1b+="${sep}${BILLABLE# }"
-        [ -n "$SESSION_TIME" ] && line1b+="${sep}${dim}⏱${reset} ${white}${SESSION_TIME}${reset}${IDLE_DISPLAY}"
-    else
-        line1="${blue}${MODEL}${reset}${EFFORT}${FAST_MODE}"
-        [ -n "$ACCOUNT_LABEL" ] && line1+="${sep}${ACCOUNT_LABEL}"
-        [ -n "$TINY_GIT_INFO" ] && line1+="${sep}${TINY_GIT_INFO}"
-        line1+="${sep}${magenta}\$${COST_FMT}${reset}${DAILY_SUFFIX}${BILLABLE}${FOCUS}"
-    fi
+    # Labeled identity block — one fact per row, consistent with
+    # context/left/usage rows below.
+    printf "${white}%-7s${reset} %b\n" "model"   "${blue}${MODEL}${reset}${EFFORT}${FAST_MODE}"
+    [ -n "$SESSION_TIME" ] && \
+        printf "${white}%-7s${reset} %b\n" "time"    "${dim}⏱${reset} ${white}${SESSION_TIME}${reset}${IDLE_DISPLAY}"
+    [ -n "$ACCT_EMAIL" ] && \
+        printf "${white}%-7s${reset} %b\n" "account" "${ACCOUNT_LABEL}"
+    printf  "${white}%-7s${reset} %b"   "repo"    "${cyan}${DIR_NAME}${reset}${SHORT_GIT_INFO}${FOCUS}"
 
-    printf "%b\n" "$line1"
-    [ -n "$line1b" ] && printf "%b\n" "$line1b"
-
-    # Detail lines (dimmer for visual hierarchy)
-    ctx_line="${white}$(printf "%-7s" "context")${reset} ${CTX_BAR} ${CTX_COLOR}$(printf "%3d" "$CONTEXT_INT")%${reset}"
+    # Detail lines (dimmer for visual hierarchy). CONTEXT_PCT carries the
+    # API's sub-percent precision; CONTEXT_INT still drives bar + color.
+    ctx_line="${white}$(printf "%-7s" "context")${reset} ${CTX_BAR} ${CTX_COLOR}$(fmt_pct "${CONTEXT_PCT:-$CONTEXT_INT}")${reset}"
     printf "\n%b" "$ctx_line"
-    [ -n "$rate_lines" ] && printf "\n%b" "$rate_lines"
+
+    # Headroom bar for the current 5h window — how much you've got LEFT.
+    # Uses interpolated five_hour_pct from the rate-limit block above.
+    if [ -n "${five_hour_pct:-}" ]; then
+        # Show 5h window as "used" — fills up as you consume. Uses interpolated
+        # five_hour_pct_display (sub-percent precision when poll delta is
+        # available; falls back to API integer otherwise). fmt_pct strips
+        # trailing zeros so "93%" stays short and "93.4%" shows real precision.
+        # used_int is an integer for the bar fill + color_for_pct (which needs
+        # integers — floats silently fall through to green).
+        used_display="${five_hour_pct_display:-$five_hour_pct}"
+        used_int="${used_display%.*}"
+        [ "$used_int" -lt 0 ] 2>/dev/null && used_int=0
+        [ "$used_int" -gt 100 ] 2>/dev/null && used_int=100
+        used_bar=$(build_bar "$used_int" 15)
+        used_color=$(color_for_pct "$used_int")
+        used_line="${white}$(printf "%-7s" "used")${reset} ${used_bar} ${used_color}$(fmt_pct "$used_display")${reset}"
+        # Reset time (five_hour_reset set earlier via format_reset_time).
+        # Local TZ formatting verified against the dashboard ("8:00pm" etc).
+        [ -n "${five_hour_reset:-}" ] && used_line+="  ${dim}resets ${five_hour_reset}${reset}"
+        printf "\n%b" "$used_line"
+    fi
+    [ -n "$WEEKLY_BAR_LINE"  ] && printf "\n%b" "$WEEKLY_BAR_LINE"
+    [ -n "$SURVIVE_BAR_LINE" ] && printf "\n%b" "$SURVIVE_BAR_LINE"
     [ -n "$BUDGET_DISPLAY" ] && printf "\n%b" "$BUDGET_DISPLAY"
     [ -n "$TOKEN_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "tokens")${reset} %b" "$TOKEN_DISPLAY"
     [ -n "$CHALLENGE_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "$CHALLENGE_LABEL")${reset} %b" "$CHALLENGE_DISPLAY"
     [ -n "$BOUNTY_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "bounty")${reset} %b" "$BOUNTY_DISPLAY"
+    [ -n "$USAGE_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "usage")${reset} %b" "$USAGE_DISPLAY"
+    [ -n "$FINAL_ACCOUNT_ROWS" ] && printf "%b" "$FINAL_ACCOUNT_ROWS"
 }
 
 # ── Render: sigil (single dense line) ─────────────────────
