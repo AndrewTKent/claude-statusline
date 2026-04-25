@@ -1836,6 +1836,9 @@ render_default() {
     [ -n "$WEEKLY_BAR_LINE"  ] && printf "\n%b" "$WEEKLY_BAR_LINE"
     [ -n "$SURVIVE_BAR_LINE" ] && printf "\n%b" "$SURVIVE_BAR_LINE"
     [ -n "$BUDGET_DISPLAY" ] && printf "\n%b" "$BUDGET_DISPLAY"
+    [ -n "$TOKEN_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "tokens")${reset} %b" "$TOKEN_DISPLAY"
+    [ -n "$CHALLENGE_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "$CHALLENGE_LABEL")${reset} %b" "$CHALLENGE_DISPLAY"
+    [ -n "$BOUNTY_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "bounty")${reset} %b" "$BOUNTY_DISPLAY"
     [ -n "$USAGE_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "usage")${reset} %b" "$USAGE_DISPLAY"
     [ -n "$FINAL_ACCOUNT_ROWS" ] && printf "%b" "$FINAL_ACCOUNT_ROWS"
 }
