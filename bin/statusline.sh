@@ -796,7 +796,9 @@ SID=""
 [ -n "$SESSION_ID" ] && SID=" ${dim}${SESSION_ID:0:8}${reset}"
 
 # ── Directory name ──────────────────────────────────────
+# Strip to last path component. Handle both / (Unix) and \ (Windows/MSYS).
 DIR_NAME="${CWD##*/}"
+DIR_NAME="${DIR_NAME##*\\}"
 
 # ── OAuth token resolution ──────────────────────────────
 get_oauth_token() {
