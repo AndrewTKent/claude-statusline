@@ -796,7 +796,9 @@ SID=""
 [ -n "$SESSION_ID" ] && SID=" ${dim}${SESSION_ID:0:8}${reset}"
 
 # ── Directory name ──────────────────────────────────────
+# Strip to last path component. Handle both / (Unix) and \ (Windows/MSYS).
 DIR_NAME="${CWD##*/}"
+DIR_NAME="${DIR_NAME##*\\}"
 
 # ── OAuth token resolution ──────────────────────────────
 get_oauth_token() {
@@ -1836,8 +1838,29 @@ render_default() {
     [ -n "$WEEKLY_BAR_LINE"  ] && printf "\n%b" "$WEEKLY_BAR_LINE"
     [ -n "$SURVIVE_BAR_LINE" ] && printf "\n%b" "$SURVIVE_BAR_LINE"
     [ -n "$BUDGET_DISPLAY" ] && printf "\n%b" "$BUDGET_DISPLAY"
+    [ -n "$TOKEN_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "tokens")${reset} %b" "$TOKEN_DISPLAY"
+    [ -n "$CHALLENGE_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "$CHALLENGE_LABEL")${reset} %b" "$CHALLENGE_DISPLAY"
+    [ -n "$BOUNTY_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "bounty")${reset} %b" "$BOUNTY_DISPLAY"
     [ -n "$USAGE_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "usage")${reset} %b" "$USAGE_DISPLAY"
     [ -n "$FINAL_ACCOUNT_ROWS" ] && printf "%b" "$FINAL_ACCOUNT_ROWS"
+}
+
+# ── Render: compact (context + used only) ─────────────────
+render_compact() {
+    ctx_line="${white}$(printf "%-7s" "context")${reset} ${CTX_BAR} ${CTX_COLOR}$(fmt_pct "${CONTEXT_PCT:-$CONTEXT_INT}")${reset}"
+    printf "%b" "$ctx_line"
+
+    if [ -n "${five_hour_pct:-}" ]; then
+        used_display="${five_hour_pct_display:-$five_hour_pct}"
+        used_int="${used_display%.*}"
+        [ "$used_int" -lt 0 ] 2>/dev/null && used_int=0
+        [ "$used_int" -gt 100 ] 2>/dev/null && used_int=100
+        used_bar=$(build_bar "$used_int" 15)
+        used_color=$(color_for_pct "$used_int")
+        used_line="${white}$(printf "%-7s" "used")${reset} ${used_bar} ${used_color}$(fmt_pct "$used_display")${reset}"
+        [ -n "${five_hour_reset:-}" ] && used_line+="  ${dim}resets ${five_hour_reset}${reset}"
+        printf "\n%b" "$used_line"
+    fi
 }
 
 # ── Render: sigil (single dense line) ─────────────────────
@@ -2174,6 +2197,7 @@ printf '\033]0;%s\007' "$TAB_TITLE"
 
 case "$FORMAT" in
     sigil)     render_sigil ;;
+    compact)   render_compact ;;
     rprompt)   render_rprompt ;;
     sparkline) render_sparkline ;;
     iterm2)    render_iterm2 ;;
