@@ -1,6 +1,6 @@
 {
   "name": "@andrewkent/claude-statusline",
-  "version": "1.1.43",
+  "version": "1.1.44",
   "description": "Rich multi-line status bar for Claude Code — model, cost, context, git, rate limits",
   "keywords": [
     "claude",
