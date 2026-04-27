@@ -153,6 +153,114 @@ build_bar() {
     printf "${bar_color}${filled_str}${dim}${empty_str}${reset}"
 }
 
+# Sweet-spot zones for context fill (fighting-game combo meter style).
+# Override via env: CTX_SWEET_LO / CTX_SWEET_HI / CTX_HOT (ints, 0-100).
+CTX_SWEET_LO="${CTX_SWEET_LO:-30}"
+CTX_SWEET_HI="${CTX_SWEET_HI:-70}"
+CTX_HOT="${CTX_HOT:-85}"
+
+# color_for_context PCT — sweet-spot palette. Below sweet = cool (blue, "loading in"),
+# in sweet = green ("in the zone"), above sweet but below hot = yellow ("wrap up"),
+# at/above hot = red ("compact now").
+color_for_context() {
+    local pct=$1
+    if   [ "$pct" -ge "$CTX_HOT" ] 2>/dev/null;      then printf "$red"
+    elif [ "$pct" -gt "$CTX_SWEET_HI" ] 2>/dev/null; then printf "$yellow"
+    elif [ "$pct" -ge "$CTX_SWEET_LO" ] 2>/dev/null; then printf "$green"
+    else printf "$blue"
+    fi
+}
+
+# build_context_bar PCT WIDTH — sweet-spot meter. The empty track marks the
+# sweet-spot band (dim green ○) and the hot zone (dim red ○); filled cells are
+# colored by current zone. Makes the "target range" visible at a glance.
+build_context_bar() {
+    local pct=$1 width=$2
+    [ "$pct" -lt 0 ] 2>/dev/null && pct=0
+    [ "$pct" -gt 100 ] 2>/dev/null && pct=100
+
+    local filled=$(( pct * width / 100 ))
+    local sweet_lo_idx=$(( CTX_SWEET_LO * width / 100 ))
+    local sweet_hi_idx=$(( CTX_SWEET_HI * width / 100 ))
+    local hot_idx=$(( CTX_HOT * width / 100 ))
+
+    local fill_color
+    fill_color=$(color_for_context "$pct")
+
+    local out="" i cell
+    for ((i=0; i<width; i++)); do
+        if [ "$i" -lt "$filled" ]; then
+            cell="${fill_color}●${reset}"
+        else
+            # Empty cell — tint track to show the target band.
+            if   [ "$i" -ge "$hot_idx" ];      then cell="${red}${dim:+}○${reset}"
+            elif [ "$i" -ge "$sweet_lo_idx" ] && [ "$i" -lt "$sweet_hi_idx" ]; then
+                cell="${green}○${reset}"
+            else cell="${dim}○${reset}"
+            fi
+        fi
+        out+="$cell"
+    done
+    printf "%b" "$out"
+}
+
+# ── Context-fill ETA (minutes until ~95% full) ─────────────
+# History file: /tmp/claude/ctx-history-<SID>.txt, one line per sample:
+#   <epoch_seconds> <context_pct_float>
+# Linear fit over recent samples gives a minutes-to-full estimate. Samples
+# older than the current session's start are ignored when SID changes.
+#
+# Writes: CTX_ETA_DISPLAY (e.g. "~18m to full") or empty if not enough data.
+CTX_ETA_DISPLAY=""
+compute_context_eta() {
+    local sid="$1" pct="$2"
+    [ -z "$sid" ] && return
+    [ -z "$pct" ] && return
+
+    mkdir -p /tmp/claude
+    local hist="/tmp/claude/ctx-history-${sid}.txt"
+    local now
+    now=$(date +%s)
+
+    # Append current sample, keep only last 40 lines (bounded, cheap).
+    printf "%s %s\n" "$now" "$pct" >> "$hist"
+    if [ "$(wc -l < "$hist" 2>/dev/null)" -gt 40 ]; then
+        tail -n 40 "$hist" > "${hist}.tmp" && mv "${hist}.tmp" "$hist"
+    fi
+
+    # Need ≥3 samples spanning ≥60s to compute a meaningful slope.
+    local n_lines
+    n_lines=$(wc -l < "$hist" 2>/dev/null | tr -d ' ')
+    [ "${n_lines:-0}" -lt 3 ] && return
+
+    # Linear regression via awk: slope in %/sec, then minutes to hit 95%.
+    local result
+    result=$(awk -v now="$now" -v cur="$pct" '
+        { n++; x[n]=$1; y[n]=$2; sx+=$1; sy+=$2 }
+        END {
+            if (n < 3) exit
+            span = x[n] - x[1]
+            if (span < 60) exit
+            mx = sx/n; my = sy/n
+            num=0; den=0
+            for (i=1; i<=n; i++) { dx=x[i]-mx; num += dx*(y[i]-my); den += dx*dx }
+            if (den == 0) exit
+            slope = num/den  # percent per second
+            if (slope <= 0.0005) { print "flat"; exit }  # ~<0.03%/min, effectively idle
+            remaining = 95 - cur
+            if (remaining <= 0) { print "0"; exit }
+            mins = remaining / (slope * 60)
+            if (mins < 0) exit
+            printf "%.0f", mins
+        }' "$hist")
+
+    if [ "$result" = "flat" ]; then
+        CTX_ETA_DISPLAY="idle"
+    elif [ -n "$result" ]; then
+        CTX_ETA_DISPLAY="~${result}m to full"
+    fi
+}
+
 # build_ratio_bar WORK_PCT PERSONAL_PCT WIDTH EMPTY_CHAR
 # Two-color stacked ratio bar: cyan work + magenta personal + dim empty.
 build_ratio_bar() {
@@ -640,8 +748,11 @@ fi
 
 # ── Context % with visual bar ──────────────────────────
 CONTEXT_INT=$(printf "%.0f" "$CONTEXT_PCT")
-CTX_BAR=$(build_bar "$CONTEXT_INT" 15)
-CTX_COLOR=$(color_for_pct "$CONTEXT_INT")
+CTX_BAR=$(build_context_bar "$CONTEXT_INT" 15)
+CTX_COLOR=$(color_for_context "$CONTEXT_INT")
+
+# Sample current context pct into history → compute minutes-to-full ETA.
+compute_context_eta "$SESSION_ID" "$CONTEXT_PCT"
 
 # ── Context badge for line 1 (surfaces at 70%+) ───────
 CTX_BADGE=""
@@ -1812,6 +1923,7 @@ render_default() {
     # Detail lines (dimmer for visual hierarchy). CONTEXT_PCT carries the
     # API's sub-percent precision; CONTEXT_INT still drives bar + color.
     ctx_line="${white}$(printf "%-7s" "context")${reset} ${CTX_BAR} ${CTX_COLOR}$(fmt_pct "${CONTEXT_PCT:-$CONTEXT_INT}")${reset}"
+    [ -n "$CTX_ETA_DISPLAY" ] && ctx_line+="  ${dim}${CTX_ETA_DISPLAY}${reset}"
     printf "\n%b" "$ctx_line"
 
     # Headroom bar for the current 5h window — how much you've got LEFT.
@@ -1842,7 +1954,7 @@ render_default() {
     [ -n "$CHALLENGE_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "$CHALLENGE_LABEL")${reset} %b" "$CHALLENGE_DISPLAY"
     [ -n "$BOUNTY_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "bounty")${reset} %b" "$BOUNTY_DISPLAY"
     [ -n "$USAGE_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "usage")${reset} %b" "$USAGE_DISPLAY"
-    [ -n "$FINAL_ACCOUNT_ROWS" ] && printf "%b" "$FINAL_ACCOUNT_ROWS"
+    [ -n "$FINAL_ACCOUNT_ROWS" ] && printf "\n${dim}·${reset}\n%b" "$FINAL_ACCOUNT_ROWS"
 }
 
 # ── Render: compact (context + used only) ─────────────────
