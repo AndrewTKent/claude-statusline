@@ -1455,6 +1455,7 @@ fi
 CURRENT_RATE_TAIL=""
 WEEKLY_BAR_LINE=""
 SURVIVE_BAR_LINE=""
+EXTRA_BAR_LINE=""
 if [ -n "${WEEK_PCT_DISPLAY:-}" ] && [ "${WEEK_PCT_DISPLAY:-0}" -gt 0 ] 2>/dev/null; then
     _wk_bar=$(build_bar "$WEEK_PCT_DISPLAY" 15)
     # fmt_pct on the fractional display preserves interpolated sub-percent
@@ -1462,6 +1463,22 @@ if [ -n "${WEEK_PCT_DISPLAY:-}" ] && [ "${WEEK_PCT_DISPLAY:-0}" -gt 0 ] 2>/dev/n
     WEEKLY_BAR_LINE="${white}$(printf "%-7s" "weekly")${reset} ${_wk_bar} ${WEEK_PCT_COLOR}$(fmt_pct "${seven_day_pct_display:-$WEEK_PCT_DISPLAY}")${reset}"
     [ -n "${WEEK_RESET_SHORT:-}" ] && WEEKLY_BAR_LINE+="  ${dim}resets ${WEEK_RESET_SHORT}${reset}"
 fi
+
+# Extra-credits bar: $-spent / $-cap on the current account's monthly bucket.
+# Renders only when extra usage is enabled on the account; otherwise the
+# survive/burn line below takes the slot.
+if [ "${extra_enabled:-false}" = "true" ]; then
+    _extra_pct_display=$(printf "%.2f" "${extra_pct_raw:-0}" 2>/dev/null || echo "0.00")
+    _extra_pct_int=$(printf "%.0f" "${extra_pct_raw:-0}" 2>/dev/null || echo 0)
+    [ "$_extra_pct_int" -lt 0 ] 2>/dev/null && _extra_pct_int=0
+    [ "$_extra_pct_int" -gt 100 ] 2>/dev/null && _extra_pct_int=100
+    _extra_used=$(awk "BEGIN {printf \"%.0f\", ${extra_used_raw:-0} / 100}" 2>/dev/null)
+    _extra_limit=$(awk "BEGIN {printf \"%.0f\", ${extra_limit_raw:-0} / 100}" 2>/dev/null)
+    _extra_bar=$(build_bar "$_extra_pct_int" 15)
+    _extra_color=$(color_for_pct "$_extra_pct_int")
+    EXTRA_BAR_LINE="${white}$(printf "%-7s" "extra")${reset} ${_extra_bar} ${_extra_color}$(fmt_pct "$_extra_pct_display")${reset}  ${dim}\$${reset}${white}${_extra_used}${dim}/\$${reset}${white}${_extra_limit}${reset}"
+fi
+
 # Survive bar: shows buffer (finishes window) or downtime (caps early).
 # Bar length is full-minutes/total-window-minutes so the filled portion
 # represents how much of the 5h window your current pace covers.
@@ -1953,7 +1970,13 @@ render_default() {
         printf "\n%b" "$used_line"
     fi
     [ -n "$WEEKLY_BAR_LINE"  ] && printf "\n%b" "$WEEKLY_BAR_LINE"
-    [ -n "$SURVIVE_BAR_LINE" ] && printf "\n%b" "$SURVIVE_BAR_LINE"
+    # Prefer extra-credits bar over burn line; fall through to burn when
+    # extra usage isn't enabled on this account.
+    if [ -n "$EXTRA_BAR_LINE" ]; then
+        printf "\n%b" "$EXTRA_BAR_LINE"
+    elif [ -n "$SURVIVE_BAR_LINE" ]; then
+        printf "\n%b" "$SURVIVE_BAR_LINE"
+    fi
     [ -n "$BUDGET_DISPLAY" ] && printf "\n%b" "$BUDGET_DISPLAY"
     # Each opt-out defaults to 1 (show); set to 0 in statusline.conf to hide.
     [ -n "$TOKEN_DISPLAY" ] && [ "${SHOW_TOKENS_ROW:-1}" = "1" ] && printf "\n${white}$(printf "%-7s" "tokens")${reset} %b" "$TOKEN_DISPLAY"
