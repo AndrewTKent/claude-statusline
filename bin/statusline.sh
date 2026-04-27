@@ -1091,7 +1091,9 @@ if $needs_refresh || $needs_profile_refresh; then
                             if [ -f "$hist_file" ]; then
                                 hist_size=$(stat -f %z "$hist_file" 2>/dev/null || stat -c %s "$hist_file" 2>/dev/null || echo 0)
                                 if [ "$hist_size" -gt 5000000 ] 2>/dev/null; then
-                                    tail -c 2500000 "$hist_file" > "${hist_file}.tmp" && mv "${hist_file}.tmp" "$hist_file"
+                                    # Byte-truncate then drop the partial first line so readers
+                                    # don't have to defend against a corrupt leading record.
+                                    tail -c 2500000 "$hist_file" | awk 'NR>1' > "${hist_file}.tmp" && mv "${hist_file}.tmp" "$hist_file"
                                 fi
                             fi
                         fi
@@ -1534,8 +1536,11 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
     # to keep it cheap. awk keeps the most recent values per email.
     EXTRA_PCT_LOOKUP=""
     if [ -f "$hist_file" ]; then
-        # Backfill limit from used/pct when the older log format omitted it.
-        EXTRA_PCT_LOOKUP=$(tail -c 200000 "$hist_file" 2>/dev/null | \
+        # `tail -c` slices mid-line, so the first line of the window is a
+        # fragment that makes jq abort the whole stream. Drop it with `awk
+        # NR>1`. Backfill limit from used/pct when the older log format
+        # omitted it.
+        EXTRA_PCT_LOOKUP=$(tail -c 200000 "$hist_file" 2>/dev/null | awk 'NR>1' | \
             jq -r 'select(.email) | [.email, (.extra_pct // 0), (.extra_used // 0), (.extra_limit // 0)] | @tsv' 2>/dev/null | \
             awk -F'\t' '{pct[$1]=$2; used[$1]=$3; lim[$1]=$4}
                 END{for(k in pct) {
