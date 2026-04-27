@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""One-shot scan of Claude Code session JSONLs.
+from __future__ import annotations
+"""Scan Claude Code session JSONLs and bucket tokens into two dimensions.
 
 Walks ~/.claude/projects/, parses every session, deduplicates by requestId,
 and writes:
