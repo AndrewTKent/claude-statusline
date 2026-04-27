@@ -66,3 +66,9 @@
 # BOUNTY_TARGET_TOKENS=40000000
 # BOUNTY_LOOKBACK_DAYS=3
 # BOUNTY_SESSION_GAP_MIN=30
+
+# ─── Row visibility toggles ────────────────────────────────────────────────
+# Each row is shown by default when its data is available. Set to 0 to hide.
+# SHOW_TOKENS_ROW=1     # all-time work/personal token ratio bar
+# SHOW_CHALLENGE_ROW=1  # progress toward CHALLENGE_GOAL_M
+# SHOW_BOUNTY_ROW=1     # bounty ETA / cleared marker
