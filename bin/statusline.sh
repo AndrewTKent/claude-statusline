@@ -1836,7 +1836,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 fi
 
                 # Stash the row so we can emit after we know the best_em.
-                tdisp_padded=$(_pad_to_cols "$tdisp" 8)
+                tdisp_padded=$(_pad_to_cols "$tdisp" 11)
 
                 # Trailing column: extra-usage reset date (1st of next month
                 # local — matches Anthropic's monthly rollover policy and the
@@ -1855,11 +1855,17 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 reset_pad=$(( 6 - reset_n ))
                 [ "$reset_pad" -lt 0 ] && reset_pad=0
                 extra_reset_col=$(printf '%*s%s' "$reset_pad" '' "$extra_reset_col")
+                # Right-align to 4 display cols. printf %4s counts bytes, not
+                # cols — em-dash is 3 bytes / 1 col, which knocks alignment
+                # off. Build the padding manually with ${#} (display width).
                 if [ "${pct_state:-ok}" = "unknown" ]; then
-                    pct_col=$(printf '%4s' "—")
+                    pct_raw="—"
                 else
-                    pct_col=$(printf '%4s' "${pct_int}%")
+                    pct_raw="${pct_int}%"
                 fi
+                pct_pad=$(( 4 - ${#pct_raw} ))
+                [ "$pct_pad" -lt 0 ] && pct_pad=0
+                pct_col=$(printf '%*s%s' "$pct_pad" '' "$pct_raw")
                 row_line="${marker}${white}$(_pad_to_cols "$display_name" 8)${reset} ${white}${tdisp_padded}${reset}${pct_color}${pct_col}${reset}  ${extra_seg}  ${dim}${extra_reset_col}${reset}"
                 # Annotate with hard-wall warning when applicable. (Windfall
                 # is implicit from the hrs_col — no extra note needed.)
