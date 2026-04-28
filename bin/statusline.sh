@@ -468,21 +468,30 @@ format_reset_time() {
     epoch=$(iso_to_epoch "$iso_str")
     [ -z "$epoch" ] && return
 
-    # If the reset time is in the past, project forward in 5-hour increments
+    # If the reset time is in the past, project forward in 5-hour increments.
+    # 30s grace so a reset that just elapsed rolls forward instead of
+    # displaying as "now" for half a minute.
     local now
     now=$(date +%s)
-    while [ "$epoch" -le "$now" ]; do
+    while [ "$epoch" -le "$((now + 30))" ]; do
         epoch=$((epoch + 18000))
     done
 
+    local tz
+    tz=$(date -j -r "$epoch" +"%Z" 2>/dev/null || date -d "@$epoch" +"%Z" 2>/dev/null)
+
     case "$style" in
         time)
-            date -j -r "$epoch" +"%l:%M%p" 2>/dev/null | sed 's/^ //; s/\.//g' | tr '[:upper:]' '[:lower:]' || \
-            date -d "@$epoch" +"%l:%M%P" 2>/dev/null | sed 's/^ //; s/\.//g'
+            local raw
+            raw=$(date -j -r "$epoch" +"%l:%M%p" 2>/dev/null | sed 's/^ //; s/\.//g' | tr '[:upper:]' '[:lower:]') || \
+            raw=$(date -d "@$epoch" +"%l:%M%P" 2>/dev/null | sed 's/^ //; s/\.//g')
+            [ -n "$raw" ] && printf '%s %s' "$raw" "$tz"
             ;;
         datetime)
-            date -j -r "$epoch" +"%b %-d, %l:%M%p" 2>/dev/null | sed 's/  / /g; s/^ //; s/\.//g' | tr '[:upper:]' '[:lower:]' || \
-            date -d "@$epoch" +"%b %-d, %l:%M%P" 2>/dev/null | sed 's/  / /g; s/^ //; s/\.//g'
+            local raw
+            raw=$(date -j -r "$epoch" +"%b %-d, %l:%M%p" 2>/dev/null | sed 's/  / /g; s/^ //; s/\.//g' | tr '[:upper:]' '[:lower:]') || \
+            raw=$(date -d "@$epoch" +"%b %-d, %l:%M%P" 2>/dev/null | sed 's/  / /g; s/^ //; s/\.//g')
+            [ -n "$raw" ] && printf '%s %s' "$raw" "$tz"
             ;;
         date)
             date -j -r "$epoch" +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]' || \
@@ -1581,16 +1590,32 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
             while IFS=$'\t' read -r em iso pct; do
                 [ -z "$em" ] && continue
                 ep=""
+                # pct_state: ok = use stored pct; reset = fresh window, show 0%;
+                # unknown = stale account, show —. Decided after rollover.
+                pct_state="ok"
                 if [ -n "$iso" ] && [ "$iso" != "null" ]; then
                     ep=$(iso_to_epoch "$iso")
                     if [ -n "$ep" ]; then
-                        while [ "$ep" -le "$now_ar" ]; do
+                        if [ "$ep" -le "$now_ar" ]; then
+                            # Reset elapsed. The new window started at 0% — but
+                            # only if the elapsed reset is the MOST RECENT one
+                            # (within ~5h of now). If it's older than that, the
+                            # account has been idle for many windows and we
+                            # have no signal for the current one — unknown.
+                            since_reset=$(( now_ar - ep ))
+                            if [ "$since_reset" -le 18000 ]; then
+                                pct_state="reset"
+                            else
+                                pct_state="unknown"
+                            fi
+                        fi
+                        while [ "$ep" -le "$((now_ar + 30))" ]; do
                             ep=$((ep + 18000))
                         done
                     fi
                 fi
                 tag=$(resolve_account_label "$em")
-                parsed+="${em}|${tag}|${ep}|${pct}"$'\n'
+                parsed+="${em}|${tag}|${ep}|${pct}|${pct_state}"$'\n'
                 if [ -n "$ep" ]; then
                     if [ -z "$soonest_epoch" ] || [ "$ep" -lt "$soonest_epoch" ] 2>/dev/null; then
                         soonest_epoch="$ep"
@@ -1600,18 +1625,24 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
 
             # Sort by projected reset epoch (soonest first). Entries with no
             # epoch sort to the end.
-            parsed=$(printf '%s' "$parsed" | awk -F'|' 'NF>=4 { key=($3==""?"9999999999":$3); print key"\t"$0 }' | sort -n | cut -f2-)
+            parsed=$(printf '%s' "$parsed" | awk -F'|' 'NF>=5 { key=($3==""?"9999999999":$3); print key"\t"$0 }' | sort -n | cut -f2-)
 
             rendered=""
-            while IFS='|' read -r em tag ep pct; do
+            while IFS='|' read -r em tag ep pct pct_state; do
                 [ -z "$em" ] && continue
                 # Reset per-iteration cap vars so stale values don't leak across
                 # accounts when jq returns empty for this email.
                 ci_status="" ci_cur="0" ci_cap=""
                 # Display time (respects the projected epoch)
                 if [ -n "$ep" ]; then
-                    tdisp=$(date -j -r "$ep" +"%l:%M%p" 2>/dev/null | sed 's/^ //; s/\.//g' | tr '[:upper:]' '[:lower:]') || \
-                        tdisp=$(date -d "@$ep" +"%l:%M%P" 2>/dev/null | sed 's/^ //; s/\.//g')
+                    ep_tz=$(date -j -r "$ep" +"%Z" 2>/dev/null || date -d "@$ep" +"%Z" 2>/dev/null)
+                    tdisp_raw=$(date -j -r "$ep" +"%l:%M%p" 2>/dev/null | sed 's/^ //; s/\.//g' | tr '[:upper:]' '[:lower:]') || \
+                        tdisp_raw=$(date -d "@$ep" +"%l:%M%P" 2>/dev/null | sed 's/^ //; s/\.//g')
+                    if [ -n "$tdisp_raw" ]; then
+                        tdisp="${tdisp_raw} ${ep_tz}"
+                    else
+                        tdisp="—"
+                    fi
                 else
                     tdisp="—"
                 fi
@@ -1642,14 +1673,25 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 # logged into them).
                 if [ "$em" = "$ACCT_EMAIL" ] && [ -n "${five_hour_pct_display:-}" ]; then
                     pct_disp="$five_hour_pct_display"
+                    pct_state="ok"
                 else
                     pct_disp="$pct"
+                fi
+                # Reset state overrides cached values: a freshly-rolled window
+                # starts at 0%, an account with no recent samples is unknown.
+                if [ "${pct_state:-ok}" = "reset" ]; then
+                    pct_int=0
+                    pct_disp="0"
                 fi
                 pct_int=$(printf "%.0f" "$pct_disp" 2>/dev/null || echo 0)
                 pct_color=$(color_for_pct "$pct_int")
                 # Display fractional util for the current account (matches the
                 # "current" row); other accounts only have integer ledger data.
-                if [ "$em" = "$ACCT_EMAIL" ]; then
+                if [ "${pct_state:-ok}" = "unknown" ]; then
+                    pct_show="$(_pad_to_cols '—' 4)"
+                    pct_color="$dim"
+                    pct_int=0
+                elif [ "$em" = "$ACCT_EMAIL" ]; then
                     pct_show=$(fmt_pct "$pct_disp")
                 else
                     pct_show=$(printf "%d%%" "$pct_int")
@@ -1813,7 +1855,12 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 reset_pad=$(( 6 - reset_n ))
                 [ "$reset_pad" -lt 0 ] && reset_pad=0
                 extra_reset_col=$(printf '%*s%s' "$reset_pad" '' "$extra_reset_col")
-                row_line="${marker}${white}$(_pad_to_cols "$display_name" 8)${reset} ${white}${tdisp_padded}${reset}${pct_color}$(printf '%4s' "${pct_int}%")${reset}  ${extra_seg}  ${dim}${extra_reset_col}${reset}"
+                if [ "${pct_state:-ok}" = "unknown" ]; then
+                    pct_col=$(printf '%4s' "—")
+                else
+                    pct_col=$(printf '%4s' "${pct_int}%")
+                fi
+                row_line="${marker}${white}$(_pad_to_cols "$display_name" 8)${reset} ${white}${tdisp_padded}${reset}${pct_color}${pct_col}${reset}  ${extra_seg}  ${dim}${extra_reset_col}${reset}"
                 # Annotate with hard-wall warning when applicable. (Windfall
                 # is implicit from the hrs_col — no extra note needed.)
                 if [ "$has_wall" = "1" ]; then
