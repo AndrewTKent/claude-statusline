@@ -2036,6 +2036,10 @@ render_default() {
     [ -n "$CHALLENGE_DISPLAY" ] && [ "${SHOW_CHALLENGE_ROW:-1}" = "1" ] && printf "\n${white}$(printf "%-7s" "$CHALLENGE_LABEL")${reset} %b" "$CHALLENGE_DISPLAY"
     [ -n "$BOUNTY_DISPLAY" ] && [ "${SHOW_BOUNTY_ROW:-1}" = "1" ] && printf "\n${white}$(printf "%-7s" "bounty")${reset} %b" "$BOUNTY_DISPLAY"
     [ -n "$USAGE_DISPLAY" ] && printf "\n${white}$(printf "%-7s" "usage")${reset} %b" "$USAGE_DISPLAY"
+    if [ "${SHOW_BACKENDS_ROW:-0}" = "1" ]; then
+        backends_line=$("${BASH_SOURCE[0]%/*}/live-state.py" --render 2>/dev/null)
+        [ -n "$backends_line" ] && printf "\n${white}$(printf "%-7s" "stack")${reset} ${dim}%s${reset}" "$backends_line"
+    fi
     [ -n "$FINAL_ACCOUNT_ROWS" ] && printf "\n${dim}·${reset}\n%b" "$FINAL_ACCOUNT_ROWS"
 }
 

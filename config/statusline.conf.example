@@ -72,3 +72,10 @@
 # SHOW_TOKENS_ROW=1     # all-time work/personal token ratio bar
 # SHOW_CHALLENGE_ROW=1  # progress toward CHALLENGE_GOAL_M
 # SHOW_BOUNTY_ROW=1     # bounty ETA / cleared marker
+
+# ─── Live state stack row (opt-in) ─────────────────────────────────────────
+# Adds a "stack" row driven by bin/live-state.py — a snapshot probe across
+# Claude (account-resets.json), Codex (state_5.sqlite), and hound autobuild
+# agents (sessions.jsonl). Distinct from the historical scan-tokens engine;
+# see bin/ARCHITECTURE.md for the two-layer model. Set to 1 to enable.
+# SHOW_BACKENDS_ROW=1
