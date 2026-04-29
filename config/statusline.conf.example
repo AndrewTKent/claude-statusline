@@ -72,3 +72,9 @@
 # SHOW_TOKENS_ROW=1     # all-time work/personal token ratio bar
 # SHOW_CHALLENGE_ROW=1  # progress toward CHALLENGE_GOAL_M
 # SHOW_BOUNTY_ROW=1     # bounty ETA / cleared marker
+
+# ─── Backend stack tracker (opt-in) ────────────────────────────────────────
+# Adds a "stack" row showing live state across Claude + Codex + (when present)
+# hound autobuild agents. Reads ~/.claude/account-resets.json,
+# ~/.codex/state_5.sqlite, and ~/.hound-mcp/sessions.jsonl. Set to 1 to enable.
+# SHOW_BACKENDS_ROW=1
