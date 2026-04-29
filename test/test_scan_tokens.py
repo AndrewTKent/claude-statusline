@@ -86,14 +86,17 @@ class ScanTokensTestCase(unittest.TestCase):
         self.claude_dir = Path(self.tmp.name) / ".claude"
         self.projects_dir = self.claude_dir / "projects"
         self.projects_dir.mkdir(parents=True)
+        self.codex_dir = Path(self.tmp.name) / ".codex"
+        self.codex_sessions_dir = self.codex_dir / "sessions"
 
         # Isolated env so core.load_config sees only what we supply.
         self._orig_env = os.environ.copy()
         for k in list(os.environ):
-            if k.startswith(("CLAUDE_", "CHALLENGE_", "WORK_", "PERSONAL_",
+            if k.startswith(("CLAUDE_", "CODEX_", "CHALLENGE_", "WORK_", "PERSONAL_",
                              "EMAIL_PAYER_MAP", "BOUNTY_")):
                 os.environ.pop(k, None)
         os.environ["CLAUDE_DIR"] = str(self.claude_dir)
+        os.environ["CODEX_DIR"] = str(self.codex_dir)
         os.environ["WORK_PATHS"] = "work-project,acme"
         os.environ["PERSONAL_PATHS"] = "personal-project"
         os.environ["WORK_KEYWORDS"] = "deploy prod,production"
@@ -348,6 +351,102 @@ class TestSummaryContract(ScanTokensTestCase):
         summary = self.run_oneshot()
         self.assertIn("challenge", summary)
         self.assertEqual(summary["challenge"]["total_tokens"], 150)
+
+
+# ---------------------------------------------------------------------------
+# Codex parsing tests
+# ---------------------------------------------------------------------------
+def write_codex_rollout(sessions_dir: Path, sid: str, cwd: str,
+                         turns: list[tuple[str, int]],
+                         rate_limits: dict | None = None) -> Path:
+    """Build a minimal codex rollout JSONL with session_meta + token_count events."""
+    day_dir = sessions_dir / "2026" / "04" / "29"
+    day_dir.mkdir(parents=True, exist_ok=True)
+    path = day_dir / f"rollout-{sid}.jsonl"
+    lines: list[str] = []
+    lines.append(json.dumps({
+        "timestamp": "2026-04-29T00:00:00.000Z",
+        "type": "session_meta",
+        "payload": {"id": sid, "cwd": cwd, "model_provider": "openai"},
+    }))
+    for ts, tokens in turns:
+        payload = {
+            "type": "token_count",
+            "info": {
+                "last_token_usage": {"total_tokens": tokens},
+                "total_token_usage": {"total_tokens": tokens},
+            },
+        }
+        if rate_limits is not None:
+            payload["rate_limits"] = rate_limits
+        lines.append(json.dumps({
+            "timestamp": ts, "type": "event_msg", "payload": payload,
+        }))
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+class TestCodexScan(ScanTokensTestCase):
+
+    def test_no_codex_dir_yields_empty_aggregates(self):
+        # Codex dir doesn't exist — engine still works, just emits no codex block.
+        summary = self.run_oneshot()
+        self.assertNotIn("codex", summary)
+
+    def test_codex_session_classifies_by_cwd(self):
+        # work cwd matches WORK_PATHS=acme → tokens land in "work" bucket
+        write_codex_rollout(
+            self.codex_sessions_dir, "sess-work-1",
+            cwd="/Users/me/acme/repo",
+            turns=[("2026-04-29T01:00:00Z", 1500), ("2026-04-29T01:05:00Z", 500)],
+        )
+        # personal cwd matches PERSONAL_PATHS → "personal" bucket
+        write_codex_rollout(
+            self.codex_sessions_dir, "sess-personal-1",
+            cwd="/Users/me/personal-project/x",
+            turns=[("2026-04-29T01:10:00Z", 800)],
+        )
+        # unmatched cwd → "unknown"
+        write_codex_rollout(
+            self.codex_sessions_dir, "sess-unknown-1",
+            cwd="/Users/me/random",
+            turns=[("2026-04-29T01:20:00Z", 200)],
+        )
+        summary = self.run_oneshot()
+        self.assertIn("codex", summary)
+        cx = summary["codex"]
+        self.assertEqual(cx["session_count"], 3)
+        self.assertEqual(cx["global"]["work_tokens"], 2000)
+        self.assertEqual(cx["global"]["personal_tokens"], 800)
+        self.assertEqual(cx["global"]["unknown_tokens"], 200)
+        self.assertEqual(cx["global"]["total_tokens"], 3000)
+
+    def test_codex_rate_limit_picks_most_recent(self):
+        write_codex_rollout(
+            self.codex_sessions_dir, "sess-old",
+            cwd="/Users/me/acme/repo",
+            turns=[("2026-04-29T01:00:00Z", 100)],
+            rate_limits={
+                "plan_type": "pro",
+                "primary": {"used_percent": 25.0, "window_minutes": 300, "resets_at": 1},
+                "secondary": {"used_percent": 5.0, "window_minutes": 10080, "resets_at": 2},
+            },
+        )
+        write_codex_rollout(
+            self.codex_sessions_dir, "sess-new",
+            cwd="/Users/me/acme/repo",
+            turns=[("2026-04-29T03:00:00Z", 100)],
+            rate_limits={
+                "plan_type": "pro",
+                "primary": {"used_percent": 73.0, "window_minutes": 300, "resets_at": 9},
+                "secondary": {"used_percent": 18.0, "window_minutes": 10080, "resets_at": 99},
+            },
+        )
+        summary = self.run_oneshot()
+        rl = summary["codex"]["rate_limit"]
+        self.assertEqual(rl["primary"]["used_percent"], 73.0)
+        self.assertEqual(rl["primary"]["resets_at"], 9)
+        self.assertEqual(rl["secondary"]["used_percent"], 18.0)
 
 
 if __name__ == "__main__":

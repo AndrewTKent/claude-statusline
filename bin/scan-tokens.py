@@ -21,7 +21,6 @@ Env (see config/statusline.conf.example):
   WORK_KEYWORDS, PERSONAL_KEYWORDS, EMAIL_PAYER_MAP,
   BOUNTY_TARGET_TOKENS, BOUNTY_LOOKBACK_DAYS, BOUNTY_SESSION_GAP_MIN
 """
-from __future__ import annotations
 
 import argparse
 import os
@@ -72,9 +71,12 @@ def main() -> int:
     start = time.time()
     prev_cache = core.load_cache(cfg)
     new_files_raw, aggregates, rescanned = core.full_scan(cfg, prev_cache)
+    codex_aggs = core.codex_full_scan(cfg)
     elapsed = time.time() - start
 
-    cache_payload = core.build_cache_payload(cfg, new_files_raw, aggregates, rescanned)
+    cache_payload = core.build_cache_payload(
+        cfg, new_files_raw, aggregates, rescanned, codex_aggs,
+    )
     cache_payload["scan_duration_s"] = round(elapsed, 2)
     core.atomic_write_json(cfg.cache_file, cache_payload)
 
