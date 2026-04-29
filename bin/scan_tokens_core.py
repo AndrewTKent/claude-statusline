@@ -57,6 +57,7 @@ class Config:
     bounty_target_tokens: int
     bounty_lookback_days: int
     bounty_session_gap_min: int
+    codex_sessions_dir: Path
 
 
 def _split_csv(val: str) -> tuple[str, ...]:
@@ -75,6 +76,7 @@ def _parse_email_payer_map(raw: str) -> dict[str, str]:
 def load_config() -> Config:
     """Build a Config from environment variables. Safe to call multiple times."""
     claude_dir = Path(os.environ.get("CLAUDE_DIR", str(Path.home() / ".claude")))
+    codex_dir = Path(os.environ.get("CODEX_DIR", str(Path.home() / ".codex")))
     return Config(
         claude_dir=claude_dir,
         projects_dir=claude_dir / "projects",
@@ -91,6 +93,7 @@ def load_config() -> Config:
         bounty_target_tokens=int(os.environ.get("BOUNTY_TARGET_TOKENS", "0") or "0"),
         bounty_lookback_days=int(os.environ.get("BOUNTY_LOOKBACK_DAYS", "3") or "3"),
         bounty_session_gap_min=int(os.environ.get("BOUNTY_SESSION_GAP_MIN", "30") or "30"),
+        codex_sessions_dir=codex_dir / "sessions",
     )
 
 
@@ -467,6 +470,163 @@ def _remember_max_out(store: dict, rid: str, tup: tuple) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Codex session parsing & aggregation
+#
+# Codex stores rollouts at $CODEX_DIR/sessions/YYYY/MM/DD/rollout-*.jsonl.
+# Each rollout begins with a session_meta event (cwd, model_provider, ...) and
+# emits token_count events with cumulative + per-turn token usage. token_count
+# events also carry rate_limits.{primary,secondary} with used_percent and
+# resets_at — the *authoritative* signal for Codex 5h/7d utilization, which
+# `codex exec` mode strips. The most-recent token_count across all rollouts
+# is the live utilization snapshot.
+# ---------------------------------------------------------------------------
+@dataclass
+class CodexSession:
+    """One Codex rollout's extracted state."""
+
+    sid: str
+    cwd: str
+    work_type: str  # work | personal | unknown
+    # List of (ts_iso, last_total_tokens) per token_count event with non-null info.
+    turn_tokens: list[tuple[str, int]]
+    # Latest rate_limits payload observed in this rollout, plus its ISO ts.
+    last_rate_limits: dict | None
+    last_rate_limits_ts: str
+
+
+def _classify_codex_cwd(cwd: str, cfg: Config) -> str:
+    label = classify_path(cwd, cfg)
+    return label if label in ("work", "personal") else "unknown"
+
+
+def parse_codex_jsonl(filepath: str | Path, cfg: Config) -> CodexSession | None:
+    """Parse one Codex rollout. Returns None if it can't be opened or has no meta."""
+    sid = ""
+    cwd = ""
+    turn_tokens: list[tuple[str, int]] = []
+    last_rl: dict | None = None
+    last_rl_ts: str = ""
+    try:
+        with open(filepath, "rb") as f:
+            for raw in f:
+                try:
+                    ev = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                ts = str(ev.get("timestamp", ""))
+                ev_type = ev.get("type")
+                payload = ev.get("payload") or {}
+                if ev_type == "session_meta":
+                    sid = str(payload.get("id", "") or "")
+                    cwd = str(payload.get("cwd", "") or "")
+                elif ev_type == "event_msg" and payload.get("type") == "token_count":
+                    info = payload.get("info") or None
+                    if info:
+                        last_total = (info.get("last_token_usage") or {}).get("total_tokens", 0)
+                        turn_tokens.append((ts, int(last_total or 0)))
+                    rl = payload.get("rate_limits") or None
+                    if rl:
+                        last_rl = rl
+                        last_rl_ts = ts
+    except OSError:
+        return None
+    if not sid:
+        return None
+    return CodexSession(
+        sid=sid,
+        cwd=cwd,
+        work_type=_classify_codex_cwd(cwd, cfg),
+        turn_tokens=turn_tokens,
+        last_rate_limits=last_rl,
+        last_rate_limits_ts=last_rl_ts,
+    )
+
+
+def iter_codex_jsonls(cfg: Config) -> list[str]:
+    if not cfg.codex_sessions_dir.is_dir():
+        return []
+    files: list[str] = []
+    for root, _dirs, names in os.walk(cfg.codex_sessions_dir):
+        for n in names:
+            if n.endswith(".jsonl"):
+                files.append(os.path.join(root, n))
+    return files
+
+
+@dataclass
+class CodexAggregates:
+    """Aggregation state for Codex sessions, parallel to Aggregates."""
+
+    today_start: str = field(default_factory=today_start_iso)
+    # Per-window: {work: int, personal: int, unknown: int}
+    global_tokens: dict[str, int] = field(
+        default_factory=lambda: {"work": 0, "personal": 0, "unknown": 0}
+    )
+    today_tokens: dict[str, int] = field(
+        default_factory=lambda: {"work": 0, "personal": 0, "unknown": 0}
+    )
+    challenge_tokens: dict[str, int] = field(
+        default_factory=lambda: {"work": 0, "personal": 0, "unknown": 0}
+    )
+    session_count: int = 0
+    # Most-recent rate_limits across all rollouts.
+    latest_rate_limits: dict | None = None
+    latest_rate_limits_ts: str = ""
+
+    def ingest(self, session: CodexSession, challenge_start: str) -> None:
+        self.session_count += 1
+        wt = session.work_type
+        for ts, tok in session.turn_tokens:
+            self.global_tokens[wt] += tok
+            if challenge_start and ts >= challenge_start:
+                self.challenge_tokens[wt] += tok
+            if ts >= self.today_start:
+                self.today_tokens[wt] += tok
+        if session.last_rate_limits and session.last_rate_limits_ts > self.latest_rate_limits_ts:
+            self.latest_rate_limits = session.last_rate_limits
+            self.latest_rate_limits_ts = session.last_rate_limits_ts
+
+    def build_summary_block(self, totals: dict[str, int]) -> dict:
+        return {
+            "work_tokens": totals.get("work", 0),
+            "personal_tokens": totals.get("personal", 0),
+            "unknown_tokens": totals.get("unknown", 0),
+            "total_tokens": sum(totals.values()),
+        }
+
+    def build_rate_limit_block(self) -> dict | None:
+        if not self.latest_rate_limits:
+            return None
+        primary = self.latest_rate_limits.get("primary") or {}
+        secondary = self.latest_rate_limits.get("secondary") or {}
+        return {
+            "observed_at": self.latest_rate_limits_ts,
+            "plan_type": self.latest_rate_limits.get("plan_type"),
+            "primary": {
+                "used_percent": primary.get("used_percent"),
+                "window_minutes": primary.get("window_minutes"),
+                "resets_at": primary.get("resets_at"),
+            } if primary else None,
+            "secondary": {
+                "used_percent": secondary.get("used_percent"),
+                "window_minutes": secondary.get("window_minutes"),
+                "resets_at": secondary.get("resets_at"),
+            } if secondary else None,
+        }
+
+
+def codex_full_scan(cfg: Config) -> CodexAggregates:
+    """Walk every Codex rollout JSONL and return aggregates. Empty if Codex absent."""
+    aggs = CodexAggregates()
+    for filepath in iter_codex_jsonls(cfg):
+        session = parse_codex_jsonl(filepath, cfg)
+        if session is None:
+            continue
+        aggs.ingest(session, cfg.challenge_start)
+    return aggs
+
+
+# ---------------------------------------------------------------------------
 # Bounty tracker (active-minute rate → ETA)
 # ---------------------------------------------------------------------------
 def compute_bounty_eta(result: dict, cfg: Config) -> dict:
@@ -782,7 +942,8 @@ def _scan_subagent_file(filepath: str, prev: dict | None, cfg: Config,
 # Summary assembly
 # ---------------------------------------------------------------------------
 def build_cache_payload(cfg: Config, new_files: dict, aggregates: Aggregates,
-                        files_rescanned: int) -> dict:
+                        files_rescanned: int,
+                        codex_aggregates: "CodexAggregates | None" = None) -> dict:
     payer_labels = set(cfg.email_payer_map.values()) | {"unknown"}
     result: dict = {
         "timestamp": int(time.time()),
@@ -802,6 +963,20 @@ def build_cache_payload(cfg: Config, new_files: dict, aggregates: Aggregates,
         result["unknown_tokens"] = challenge["unknown_tokens"]
         result["total_tokens"] = challenge["total_tokens"]
         result["unique_requests"] = challenge["unique_requests"]
+    if codex_aggregates is not None and codex_aggregates.session_count > 0:
+        codex_block: dict = {
+            "session_count": codex_aggregates.session_count,
+            "global": codex_aggregates.build_summary_block(codex_aggregates.global_tokens),
+            "today": codex_aggregates.build_summary_block(codex_aggregates.today_tokens),
+        }
+        if cfg.challenge_start:
+            codex_block["challenge"] = codex_aggregates.build_summary_block(
+                codex_aggregates.challenge_tokens
+            )
+        rl = codex_aggregates.build_rate_limit_block()
+        if rl:
+            codex_block["rate_limit"] = rl
+        result["codex"] = codex_block
     return result
 
 
@@ -816,6 +991,8 @@ def build_summary_payload(cfg: Config, cache_payload: dict, overrides: dict) -> 
     }
     if "challenge" in cache_payload:
         summary["challenge"] = cache_payload["challenge"]
+    if "codex" in cache_payload:
+        summary["codex"] = cache_payload["codex"]
     if cfg.bounty_target_tokens:
         summary["bounty"] = compute_bounty_eta(cache_payload, cfg)
     return summary
