@@ -10,6 +10,11 @@ input=$(cat)
 #   CHALLENGE_GOAL_M=100      # Token goal in millions (enables challenge progress line)
 #   CHALLENGE_START_DATE=...  # ISO date (YYYY-MM-DD) for challenge window start
 #   CHALLENGE_LABEL=100m      # Label shown on the challenge line
+#   NARROW_THRESHOLD=60       # default render auto-falls-through to narrow
+#                             # when detected terminal cols are below this
+#   MAX_COLS=80               # force a specific terminal width (overrides
+#                             # auto-detection — useful when Claude Code's
+#                             # status panel is narrower than the terminal)
 
 if [ -z "$input" ]; then
     printf "Claude"
@@ -770,8 +775,10 @@ if [ "$CONTEXT_INT" -ge 70 ] 2>/dev/null; then
 fi
 
 # ── Effort level ───────────────────────────────────────
+# Claude Code 2.1+ emits effort as `.effort.level`; older builds used
+# `.effort_level`. Accept both, then fall back to settings.json.
 EFFORT=""
-effort_val=$(echo "$input" | jq -r '.effort_level // empty' 2>/dev/null)
+effort_val=$(echo "$input" | jq -r '.effort.level // .effort_level // empty' 2>/dev/null)
 if [ -z "$effort_val" ]; then
     settings_path="$HOME/.claude/settings.json"
     [ -f "$settings_path" ] && effort_val=$(jq -r '.effortLevel // empty' "$settings_path" 2>/dev/null)
@@ -780,6 +787,7 @@ case "$effort_val" in
     low)    EFFORT="${dim}.low${reset}" ;;
     medium) EFFORT="${orange}.medium${reset}" ;;
     high)   EFFORT="${red}.high${reset}" ;;
+    xhigh)  EFFORT="${red}.xhigh${reset}" ;;
     max)    EFFORT="${red}.max${reset}" ;;
 esac
 
@@ -1900,14 +1908,43 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
 fi
 
 # ── Terminal width detection ──────────────────────────────
-# Under Claude Code the statusline runs in a non-TTY subprocess; tput cols
-# returns a misleading default of 80 regardless of the real terminal width.
-# Only trust tput when stdout is an actual TTY; otherwise assume wide (120).
-if [ -t 1 ]; then
-    COLS=$(tput cols 2>/dev/null || echo 120)
-else
-    COLS=120
-fi
+# The statusline runs as a non-TTY subprocess under Claude Code, so $COLUMNS
+# is unset and tput cols returns 80 regardless of real width. Try in order:
+#   1. MAX_COLS config override (always wins)
+#   2. $COLUMNS exported by the parent shell
+#   3. tput, but only when stdout is a real TTY
+#   4. walk up the process ancestry looking for a controlling TTY we can stty
+# Falling back to 120 (assume wide) only when nothing above worked.
+detect_cols() {
+    if [ -n "${MAX_COLS:-}" ] && [ "$MAX_COLS" -gt 0 ] 2>/dev/null; then
+        printf '%s' "$MAX_COLS"; return
+    fi
+    if [ -n "${COLUMNS:-}" ] && [ "$COLUMNS" -gt 0 ] 2>/dev/null; then
+        printf '%s' "$COLUMNS"; return
+    fi
+    if [ -t 1 ]; then
+        local tcols
+        tcols=$(tput cols 2>/dev/null)
+        if [ -n "$tcols" ] && [ "$tcols" -gt 0 ] 2>/dev/null; then
+            printf '%s' "$tcols"; return
+        fi
+    fi
+    local pid=$$ tty size cols
+    for _ in 1 2 3 4 5 6 7 8; do
+        pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+        [ -z "$pid" ] || [ "$pid" = "0" ] || [ "$pid" = "1" ] && break
+        tty=$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')
+        [ -z "$tty" ] || [ "$tty" = "??" ] && continue
+        size=$(stty size < "/dev/$tty" 2>/dev/null) || continue
+        cols="${size##* }"
+        if [ -n "$cols" ] && [ "$cols" -gt 0 ] 2>/dev/null; then
+            printf '%s' "$cols"; return
+        fi
+    done
+    printf '120'
+}
+COLS=$(detect_cols)
+NARROW_THRESHOLD="${NARROW_THRESHOLD:-60}"
 
 # ── Branch name compression ──────────────────────────────
 # Long branches overflow the top row under Claude Code's status area (the
@@ -2058,6 +2095,54 @@ render_compact() {
         used_line="${white}$(printf "%-7s" "used")${reset} ${used_bar} ${used_color}$(fmt_pct "$used_display")${reset}"
         [ -n "${five_hour_reset:-}" ] && used_line+="  ${dim}resets ${five_hour_reset}${reset}"
         printf "\n%b" "$used_line"
+    fi
+}
+
+# ── Render: narrow (auto-selected when terminal is too narrow for default) ─
+# Keeps the same fact-per-row shape as render_default but trims aggressively:
+# shorter labels, 5-char bars, and no trailing suffixes (ETA, reset times,
+# breakdowns). Activates for COLS < NARROW_THRESHOLD (default 60).
+render_narrow() {
+    local bar_w=5
+    [ "$COLS" -ge 50 ] 2>/dev/null && bar_w=8
+
+    # Identity line: model + effort + fast (no label — it's the obvious row).
+    printf "%b" "${blue}${MODEL}${reset}${EFFORT}${FAST_MODE}"
+
+    # Repo + short branch + dirty marker. Reuse SHORT_GIT_INFO when it fits,
+    # else fall back to TINY_GIT_INFO (already capped via MAX_BRANCH).
+    if [ -n "$BRANCH" ]; then
+        local git_seg="$TINY_GIT_INFO"
+        [ "$COLS" -ge 50 ] 2>/dev/null && [ -n "$SHORT_GIT_INFO" ] && git_seg="$SHORT_GIT_INFO"
+        printf "\n${cyan}%s${reset}%b" "$DIR_NAME" "$git_seg"
+    fi
+
+    # Context — bar shrinks at narrower widths, percent always shown.
+    local ctx_pct="${CONTEXT_PCT:-$CONTEXT_INT}"
+    local ctx_bar
+    ctx_bar=$(build_context_bar "$CONTEXT_INT" "$bar_w")
+    printf "\n${white}ctx${reset} %b ${CTX_COLOR}%s${reset}" "$ctx_bar" "$(fmt_pct "$ctx_pct")"
+
+    # 5h window — same treatment, no reset suffix at narrow widths.
+    if [ -n "${five_hour_pct:-}" ]; then
+        local used_display="${five_hour_pct_display:-$five_hour_pct}"
+        local used_int="${used_display%.*}"
+        [ "$used_int" -lt 0 ] 2>/dev/null && used_int=0
+        [ "$used_int" -gt 100 ] 2>/dev/null && used_int=100
+        local used_bar used_color
+        used_bar=$(build_bar "$used_int" "$bar_w")
+        used_color=$(color_for_pct "$used_int")
+        printf "\n${white}5h ${reset} %b ${used_color}%s${reset}" "$used_bar" "$(fmt_pct "$used_display")"
+    fi
+
+    # Weekly + cost on one line when we have room; cost-only otherwise.
+    if [ -n "${seven_day_pct:-}" ] && [ "$seven_day_pct" -gt 0 ] 2>/dev/null; then
+        local wcolor
+        wcolor=$(color_for_pct "$seven_day_pct")
+        printf "\n${white}7d ${reset} ${wcolor}%s${reset}" "$(fmt_pct "${seven_day_pct_display:-$seven_day_pct}")"
+        printf "  ${magenta}\$%s${reset}" "$COST_FMT"
+    elif [ -n "${COST_FMT:-}" ]; then
+        printf "\n${magenta}\$%s${reset}" "$COST_FMT"
     fi
 }
 
@@ -2396,10 +2481,20 @@ printf '\033]0;%s\007' "$TAB_TITLE"
 case "$FORMAT" in
     sigil)     render_sigil ;;
     compact)   render_compact ;;
+    narrow)    render_narrow ;;
     rprompt)   render_rprompt ;;
     sparkline) render_sparkline ;;
     iterm2)    render_iterm2 ;;
-    *)         render_default ;;
+    *)
+        # Default format wraps badly under a narrow status panel. Fall through
+        # to the narrow renderer when we detect (or are told) the panel is
+        # tight. NARROW_THRESHOLD is configurable in statusline.conf.
+        if [ "$COLS" -lt "$NARROW_THRESHOLD" ] 2>/dev/null; then
+            render_narrow
+        else
+            render_default
+        fi
+        ;;
 esac
 
 exit 0
