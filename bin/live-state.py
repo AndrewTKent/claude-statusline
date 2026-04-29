@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Emit backend tracking state for the statusline.
+"""Live-state probe across Claude, Codex, and hound autobuild agents.
+
+The "live state" half of the two-layer architecture (see bin/ARCHITECTURE.md).
+Snapshot only — for historical attribution, see scan_tokens_core.py.
 
 Reads (when present):
   - ~/.claude/account-resets.json      → Claude 5h/7d utilization per account
