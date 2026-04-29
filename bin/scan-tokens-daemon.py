@@ -90,6 +90,7 @@ class Daemon:
         new_files_raw, aggregates, rescanned = core.full_scan(self.cfg, prev_cache)
         self.files = {fp: core.FileCacheEntry.from_dict(d) for fp, d in new_files_raw.items()}
         self.aggregates = aggregates
+        self.codex_aggregates = core.codex_full_scan(self.cfg)
 
         # Prime session_classifications for subagent inheritance.
         for fp, entry in self.files.items():
@@ -335,8 +336,12 @@ class Daemon:
 
     def _current_cache_payload(self, elapsed_s: float) -> dict:
         new_files_raw = {fp: entry.to_dict() for fp, entry in self.files.items()}
+        # Codex sessions get rescanned each flush — cheap (few rollouts, small files).
+        # Incremental codex tracking would need its own fswatch; not worth the complexity yet.
+        self.codex_aggregates = core.codex_full_scan(self.cfg)
         payload = core.build_cache_payload(
             self.cfg, new_files_raw, self.aggregates, files_rescanned=0,
+            codex_aggregates=self.codex_aggregates,
         )
         if elapsed_s:
             payload["scan_duration_s"] = round(elapsed_s, 2)

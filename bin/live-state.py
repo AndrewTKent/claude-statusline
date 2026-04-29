@@ -4,9 +4,10 @@
 The "live state" half of the two-layer architecture (see bin/ARCHITECTURE.md).
 Snapshot only — for historical attribution, see scan_tokens_core.py.
 
-Reads (when present):
+Reads (in this preference order):
+  - ~/.claude/token-scan-summary.json  → engine-derived Codex rate_limit (auth)
   - ~/.claude/account-resets.json      → Claude 5h/7d utilization per account
-  - ~/.codex/state_5.sqlite            → Codex token usage (last 5h)
+  - ~/.codex/state_5.sqlite            → Codex token-count fallback when no engine summary
   - ~/.hound-mcp/sessions.jsonl        → hound agent session activity
 
 Modes:
@@ -14,9 +15,9 @@ Modes:
   --render   single human-readable statusline row
   --json     JSON object
 
-The 5h window is anchored to "now" (UTC), not to plan-reset boundaries.
-ChatGPT-plan quotas don't map cleanly to a token count; codex_5h_tokens is
-a raw activity gauge, not a quota percentage.
+When the historical engine has scanned Codex sessions, codex utilization comes
+from the actual rate_limits payload Codex emits (used_percent + resets_at).
+Without it, falls back to a raw 5h token sum from the sqlite state.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from pathlib import Path
 
 HOME = Path(os.environ.get("HOME", os.path.expanduser("~")))
 CLAUDE_RESETS = HOME / ".claude" / "account-resets.json"
+CLAUDE_TOKEN_SUMMARY = HOME / ".claude" / "token-scan-summary.json"
 CODEX_STATE = HOME / ".codex" / "state_5.sqlite"
 HOUND_SESSIONS = HOME / ".hound-mcp" / "sessions.jsonl"
 
@@ -67,8 +69,28 @@ def collect() -> dict:
                 }
         except (OSError, json.JSONDecodeError, ValueError):
             pass
-    # Codex
-    if CODEX_STATE.is_file():
+    # Codex — prefer the engine's authoritative rate_limit payload when available.
+    codex_state: dict | None = None
+    if CLAUDE_TOKEN_SUMMARY.is_file():
+        try:
+            summary = json.loads(CLAUDE_TOKEN_SUMMARY.read_text())
+            codex_block = summary.get("codex") or {}
+            rl = codex_block.get("rate_limit") or {}
+            primary = rl.get("primary") or {}
+            secondary = rl.get("secondary") or {}
+            if primary.get("used_percent") is not None:
+                codex_state = {
+                    "rate_limit_5h_pct": primary.get("used_percent"),
+                    "rate_limit_5h_resets_at": primary.get("resets_at"),
+                    "rate_limit_7d_pct": secondary.get("used_percent"),
+                    "rate_limit_7d_resets_at": secondary.get("resets_at"),
+                    "plan_type": rl.get("plan_type"),
+                    "session_count": codex_block.get("session_count", 0),
+                }
+        except (OSError, json.JSONDecodeError):
+            pass
+    # Fallback: raw 5h token sum from sqlite when engine summary is missing.
+    if codex_state is None and CODEX_STATE.is_file():
         cutoff = int(time.time()) - WINDOW_5H_SECS
         try:
             conn = sqlite3.connect(f"file:{CODEX_STATE}?mode=ro", uri=True, timeout=2)
@@ -79,13 +101,15 @@ def collect() -> dict:
             ).fetchone()
             conn.close()
             threads, tokens, last_update = row or (0, 0, 0)
-            state["codex"] = {
+            codex_state = {
                 "threads_5h": threads,
                 "tokens_5h": tokens,
                 "last_active_epoch": last_update,
             }
         except sqlite3.Error:
             pass
+    if codex_state is not None:
+        state["codex"] = codex_state
     # Hound
     if HOUND_SESSIONS.is_file():
         try:
@@ -131,6 +155,14 @@ def render_kv(state: dict) -> None:
         emit("claude_account_count", c.get("account_count"))
     if "codex" in state:
         c = state["codex"]
+        # Engine-derived (preferred)
+        emit("codex_rate_limit_5h_pct", c.get("rate_limit_5h_pct"))
+        emit("codex_rate_limit_5h_resets_at", c.get("rate_limit_5h_resets_at"))
+        emit("codex_rate_limit_7d_pct", c.get("rate_limit_7d_pct"))
+        emit("codex_rate_limit_7d_resets_at", c.get("rate_limit_7d_resets_at"))
+        emit("codex_plan_type", c.get("plan_type"))
+        emit("codex_session_count", c.get("session_count"))
+        # Sqlite fallback
         emit("codex_5h_threads", c.get("threads_5h"))
         emit("codex_5h_tokens", c.get("tokens_5h"))
         if c.get("last_active_epoch"):
@@ -159,7 +191,17 @@ def render_line(state: dict) -> str:
         parts.append(f"claude 5h: {c['worst_5h_pct']}%")
     if "codex" in state:
         c = state["codex"]
-        parts.append(f"codex 5h: {c['threads_5h']}t / {fmt_tokens(int(c['tokens_5h']))}")
+        if c.get("rate_limit_5h_pct") is not None:
+            five = int(round(float(c["rate_limit_5h_pct"])))
+            week = c.get("rate_limit_7d_pct")
+            if week is not None:
+                parts.append(f"codex 5h: {five}% · 7d: {int(round(float(week)))}%")
+            else:
+                parts.append(f"codex 5h: {five}%")
+        else:
+            parts.append(
+                f"codex 5h: {c.get('threads_5h', 0)}t / {fmt_tokens(int(c.get('tokens_5h', 0)))}"
+            )
     if "hound" in state:
         agents_in_order = ["build", "strategist", "hardware", "infra"]
         agent_parts: list[str] = []
