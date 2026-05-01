@@ -2030,7 +2030,15 @@ render_default() {
         printf "${white}%-7s${reset} %b\n" "time"    "${dim}⏱${reset} ${white}${SESSION_TIME}${reset}${IDLE_DISPLAY}"
     [ -n "$ACCT_EMAIL" ] && \
         printf "${white}%-7s${reset} %b\n" "account" "${ACCOUNT_LABEL}"
-    printf  "${white}%-7s${reset} %b"   "repo"    "${cyan}${DIR_NAME}${reset}${SHORT_GIT_INFO}${FOCUS}"
+    REPO_LABEL="${cyan}${DIR_NAME}${reset}"
+    if [ -n "$BRANCH" ]; then
+        if $IN_WORKTREE; then
+            REPO_LABEL="${magenta}⌥ ${reset}${REPO_LABEL} ${dim}worktree${reset}"
+        else
+            REPO_LABEL="${REPO_LABEL} ${dim}primary${reset}"
+        fi
+    fi
+    printf  "${white}%-7s${reset} %b"   "repo"    "${REPO_LABEL}${SHORT_GIT_INFO}${FOCUS}"
 
     # Detail lines (dimmer for visual hierarchy). CONTEXT_PCT carries the
     # API's sub-percent precision; CONTEXT_INT still drives bar + color.
