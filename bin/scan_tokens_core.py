@@ -401,24 +401,28 @@ class Aggregates:
     seen_challenge: dict[str, tuple] = field(default_factory=dict)
     seen_today: dict[str, tuple] = field(default_factory=dict)
     today_start: str = field(default_factory=today_start_iso)
-    # input+output tokens per local-day (YYYY-MM-DD), keyed by requestId so
-    # duplicates aren't double-counted across files. Used to diff against the
-    # /recover-stats snapshot for dates where scanner data is incomplete.
-    seen_global_by_date: dict[str, dict[str, tuple[int, int]]] = field(default_factory=dict)
+    # rid → (earliest_date_seen, max_inp, max_out). Single bucket per rid even
+    # if streaming chunks straddle midnight, so per-date totals don't
+    # double-count any request when diffed against the /recover-stats snapshot.
+    rid_date_tokens: dict[str, tuple[str, int, int]] = field(default_factory=dict)
     earliest_global_ts: str | None = None
 
     def _note_ts_and_date(self, ts: str, rid: str, inp: int, out: int) -> None:
-        if not ts:
+        if not ts or not rid:
             return
         if self.earliest_global_ts is None or ts < self.earliest_global_ts:
             self.earliest_global_ts = ts
         date = ts[:10]
         if len(date) != 10:
             return
-        bucket = self.seen_global_by_date.setdefault(date, {})
-        prev = bucket.get(rid)
-        if prev is None or out > prev[1]:
-            bucket[rid] = (inp, out)
+        prev = self.rid_date_tokens.get(rid)
+        if prev is None:
+            self.rid_date_tokens[rid] = (date, inp, out)
+            return
+        new_date = min(prev[0], date)
+        new_out = max(prev[2], out)
+        new_inp = inp if out > prev[2] else prev[1]
+        self.rid_date_tokens[rid] = (new_date, new_inp, new_out)
 
     def ingest(self, requests: Iterable[Request], work_type: str, payer: str,
                challenge_start: str) -> None:
@@ -452,10 +456,10 @@ class Aggregates:
                 _remember_max_out(self.seen_today, rid, tup)
 
     def scanned_tokens_by_date(self) -> dict[str, int]:
-        return {
-            date: sum(inp + out for inp, out in rids.values())
-            for date, rids in self.seen_global_by_date.items()
-        }
+        out: dict[str, int] = {}
+        for date, inp, oo in self.rid_date_tokens.values():
+            out[date] = out.get(date, 0) + inp + oo
+        return out
 
     def roll_over_midnight_if_needed(self) -> bool:
         """If the local day has changed, reset the 'today' bucket. Returns True on rollover."""

@@ -402,6 +402,24 @@ class TestPreScanRecovery(ScanTokensTestCase):
         self.assertEqual(summary["recovered_pre_scan_tokens"], 1_000_000)
         self.assertIsNone(summary["earliest_scanned_ts"])
 
+    def test_cross_midnight_request_buckets_to_earliest_date_only(self):
+        # Same rid streamed across midnight: must count once, not in both dates,
+        # else recovery diff would over-count by the second-bucket tokens.
+        self._write_stats_cache([
+            ("2026-04-22", {"claude-opus-4-7": 1000}),
+            ("2026-04-23", {"claude-opus-4-7": 0}),
+        ])
+        write_session(self.projects_dir, "acme", "00000000-0000-0000-0000-000000000094", [
+            make_assistant_line("rstream", "2026-04-22T23:59:30Z", 100, 200),
+            make_assistant_line("rstream", "2026-04-23T00:00:30Z", 100, 800),
+        ])
+        summary = self.run_oneshot()
+        # Request counted once globally with max output (800 + 100 = 900),
+        # bucketed under 2026-04-22 (the earliest ts seen for this rid).
+        # 2026-04-22 scanner=900 > cache=1000? No, cache=1000 > 900, recover 100.
+        self.assertEqual(summary["global"]["total_tokens"], 900)
+        self.assertEqual(summary["recovered_pre_scan_tokens"], 100)
+
 
 # ---------------------------------------------------------------------------
 # Codex parsing tests
