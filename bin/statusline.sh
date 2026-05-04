@@ -611,6 +611,7 @@ if [ -n "$SESSION_ID" ]; then
             "G_PERSONAL=" + (.global.personal_tokens // 0 | tostring),
             "G_UNKNOWN=" + (.global.unknown_tokens // 0 | tostring),
             "G_TOTAL=" + (.global.total_tokens // 0 | tostring),
+            "G_RECOVERED=" + (.recovered_pre_scan_tokens // 0 | tostring),
             "C_WORK=" + (.challenge.work_tokens // 0 | tostring),
             "C_PERSONAL=" + (.challenge.personal_tokens // 0 | tostring),
             "C_TOTAL=" + (.challenge.total_tokens // 0 | tostring),
@@ -719,7 +720,8 @@ if [ -n "$SESSION_ID" ]; then
     [ "$_today_src" -eq 0 ] && _today_src=${DAILY_TOKENS:-0}
     _today_fmt=$(_usage_fmt "$_today_src")
     _session_fmt=$(_usage_fmt "${SESSION_DELTA:-0}")
-    _lifetime_fmt=$(_usage_fmt "${G_TOTAL:-0}")
+    _lifetime_total=$(( ${G_TOTAL:-0} + ${G_RECOVERED:-0} ))
+    _lifetime_fmt=$(_usage_fmt "$_lifetime_total")
     USAGE_DISPLAY="${dim}today${reset} ${cyan}${_today_fmt}${reset} ${dim}·${reset} ${dim}session${reset} ${magenta}${_session_fmt}${reset} ${dim}·${reset} ${dim}lifetime${reset} ${green}${_lifetime_fmt}${reset}"
 
     # ── Redaction indicator (only when ranges > 0) ──

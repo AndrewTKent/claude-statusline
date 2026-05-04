@@ -353,6 +353,56 @@ class TestSummaryContract(ScanTokensTestCase):
         self.assertEqual(summary["challenge"]["total_tokens"], 150)
 
 
+class TestPreScanRecovery(ScanTokensTestCase):
+    """Recover token counts for dates the scanner undercounts vs stats-cache."""
+
+    def _write_stats_cache(self, days: list[tuple[str, dict[str, int]]]) -> None:
+        payload = {
+            "dailyModelTokens": [
+                {"date": date, "tokensByModel": tokens} for date, tokens in days
+            ],
+        }
+        (self.claude_dir / "stats-cache.json").write_text(json.dumps(payload))
+
+    def test_recovers_per_date_delta(self):
+        # Jan 15: scanner 0, cache 1M → recover 1M.
+        # Feb 10: scanner 0, cache 2.5M → recover 2.5M.
+        # Apr 23: scanner 150 (from session below), cache 9999999 → recover 9999849.
+        self._write_stats_cache([
+            ("2026-01-15", {"claude-opus-4-6": 1_000_000}),
+            ("2026-02-10", {"claude-opus-4-6": 2_000_000, "claude-haiku-4-5": 500_000}),
+            ("2026-04-23", {"claude-opus-4-7": 9_999_999}),
+        ])
+        write_session(self.projects_dir, "acme", "00000000-0000-0000-0000-000000000091", [
+            make_assistant_line("r1", "2026-04-23T10:00:00Z", 100, 50),
+        ])
+        summary = self.run_oneshot()
+        self.assertEqual(summary["recovered_pre_scan_tokens"], 1_000_000 + 2_500_000 + 9_999_849)
+        self.assertEqual(summary["earliest_scanned_ts"][:10], "2026-04-23")
+
+    def test_skips_dates_where_scanner_exceeds_cache(self):
+        # Scanner has 1M for Apr 23, cache has 800k → no recovery for that date.
+        self._write_stats_cache([("2026-04-23", {"claude-opus-4-7": 800_000})])
+        write_session(self.projects_dir, "acme", "00000000-0000-0000-0000-000000000093", [
+            make_assistant_line("r1", "2026-04-23T10:00:00Z", 600_000, 400_000),
+        ])
+        summary = self.run_oneshot()
+        self.assertEqual(summary["recovered_pre_scan_tokens"], 0)
+
+    def test_no_stats_cache_yields_zero(self):
+        write_session(self.projects_dir, "acme", "00000000-0000-0000-0000-000000000092", [
+            make_assistant_line("r1", "2026-04-23T10:00:00Z", 100, 50),
+        ])
+        summary = self.run_oneshot()
+        self.assertEqual(summary["recovered_pre_scan_tokens"], 0)
+
+    def test_no_scanned_data_recovers_full_cache(self):
+        self._write_stats_cache([("2026-01-15", {"claude-opus-4-6": 1_000_000})])
+        summary = self.run_oneshot()
+        self.assertEqual(summary["recovered_pre_scan_tokens"], 1_000_000)
+        self.assertIsNone(summary["earliest_scanned_ts"])
+
+
 # ---------------------------------------------------------------------------
 # Codex parsing tests
 # ---------------------------------------------------------------------------

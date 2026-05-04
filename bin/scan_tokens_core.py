@@ -401,6 +401,24 @@ class Aggregates:
     seen_challenge: dict[str, tuple] = field(default_factory=dict)
     seen_today: dict[str, tuple] = field(default_factory=dict)
     today_start: str = field(default_factory=today_start_iso)
+    # input+output tokens per local-day (YYYY-MM-DD), keyed by requestId so
+    # duplicates aren't double-counted across files. Used to diff against the
+    # /recover-stats snapshot for dates where scanner data is incomplete.
+    seen_global_by_date: dict[str, dict[str, tuple[int, int]]] = field(default_factory=dict)
+    earliest_global_ts: str | None = None
+
+    def _note_ts_and_date(self, ts: str, rid: str, inp: int, out: int) -> None:
+        if not ts:
+            return
+        if self.earliest_global_ts is None or ts < self.earliest_global_ts:
+            self.earliest_global_ts = ts
+        date = ts[:10]
+        if len(date) != 10:
+            return
+        bucket = self.seen_global_by_date.setdefault(date, {})
+        prev = bucket.get(rid)
+        if prev is None or out > prev[1]:
+            bucket[rid] = (inp, out)
 
     def ingest(self, requests: Iterable[Request], work_type: str, payer: str,
                challenge_start: str) -> None:
@@ -408,6 +426,7 @@ class Aggregates:
             rid, ts, inp, out = row[0], row[1], row[2], row[3]
             tup = (inp, out, work_type, payer)
             _remember_max_out(self.seen_global, rid, tup)
+            self._note_ts_and_date(ts, rid, inp, out)
             if challenge_start and ts >= challenge_start:
                 _remember_max_out(self.seen_challenge, rid, tup)
             if ts >= self.today_start:
@@ -426,10 +445,17 @@ class Aggregates:
             payer = payer_for(payer_spans_for_sid, ts)
             tup = (inp, out, wt, payer)
             _remember_max_out(self.seen_global, rid, tup)
+            self._note_ts_and_date(ts, rid, inp, out)
             if challenge_start and ts >= challenge_start:
                 _remember_max_out(self.seen_challenge, rid, tup)
             if ts >= self.today_start:
                 _remember_max_out(self.seen_today, rid, tup)
+
+    def scanned_tokens_by_date(self) -> dict[str, int]:
+        return {
+            date: sum(inp + out for inp, out in rids.values())
+            for date, rids in self.seen_global_by_date.items()
+        }
 
     def roll_over_midnight_if_needed(self) -> bool:
         """If the local day has changed, reset the 'today' bucket. Returns True on rollover."""
@@ -939,6 +965,55 @@ def _scan_subagent_file(filepath: str, prev: dict | None, cfg: Config,
 
 
 # ---------------------------------------------------------------------------
+# Pre-scan recovery
+# ---------------------------------------------------------------------------
+def _load_stats_cache_daily_totals(cfg: Config) -> dict[str, int]:
+    """Read ~/.claude/stats-cache.json and return {date: input+output_tokens}."""
+    stats_path = cfg.claude_dir / "stats-cache.json"
+    try:
+        with open(stats_path) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    daily = data.get("dailyModelTokens")
+    if not isinstance(daily, list):
+        return {}
+    out: dict[str, int] = {}
+    for day in daily:
+        if not isinstance(day, dict):
+            continue
+        date = day.get("date")
+        if not isinstance(date, str):
+            continue
+        total = 0
+        for v in (day.get("tokensByModel") or {}).values():
+            if isinstance(v, (int, float)):
+                total += int(v)
+        out[date] = out.get(date, 0) + total
+    return out
+
+
+def compute_pre_scan_recovery(cfg: Config, scanned_by_date: dict[str, int]) -> int:
+    """Per-date diff against /recover-stats snapshot for dates scanner undercounts.
+
+    Claude Code deleted most pre-April JSONLs during a March 2026 storage
+    migration. Surviving subagent files leave per-date scanner data nonzero
+    but incomplete. For each date in the recovered stats-cache.json, recover
+    max(0, stats_cache_total - scanner_total). Yields zero on dates the
+    scanner already covers in full.
+    """
+    cache_daily = _load_stats_cache_daily_totals(cfg)
+    if not cache_daily:
+        return 0
+    delta = 0
+    for date, cache_total in cache_daily.items():
+        scanned = scanned_by_date.get(date, 0)
+        if cache_total > scanned:
+            delta += cache_total - scanned
+    return delta
+
+
+# ---------------------------------------------------------------------------
 # Summary assembly
 # ---------------------------------------------------------------------------
 def build_cache_payload(cfg: Config, new_files: dict, aggregates: Aggregates,
@@ -950,6 +1025,8 @@ def build_cache_payload(cfg: Config, new_files: dict, aggregates: Aggregates,
         "challenge_start": cfg.challenge_start or None,
         "global": aggregates.build_summary_block(aggregates.seen_global, payer_labels),
         "today": aggregates.build_summary_block(aggregates.seen_today, payer_labels),
+        "earliest_scanned_ts": aggregates.earliest_global_ts,
+        "scanned_tokens_by_date": aggregates.scanned_tokens_by_date(),
         "files_scanned": len(new_files),
         "files_rescanned": files_rescanned,
         "files": new_files,
@@ -982,12 +1059,16 @@ def build_cache_payload(cfg: Config, new_files: dict, aggregates: Aggregates,
 
 def build_summary_payload(cfg: Config, cache_payload: dict, overrides: dict) -> dict:
     r_sessions, r_ranges = count_redactions(overrides)
+    scanned_by_date = cache_payload.get("scanned_tokens_by_date") or {}
+    recovered = compute_pre_scan_recovery(cfg, scanned_by_date)
     summary = {
         "timestamp": cache_payload.get("timestamp"),
         "scan_duration_s": cache_payload.get("scan_duration_s"),
         "global": cache_payload["global"],
         "today": cache_payload.get("today"),
         "redactions": {"sessions": r_sessions, "ranges": r_ranges},
+        "earliest_scanned_ts": cache_payload.get("earliest_scanned_ts"),
+        "recovered_pre_scan_tokens": recovered,
     }
     if "challenge" in cache_payload:
         summary["challenge"] = cache_payload["challenge"]
