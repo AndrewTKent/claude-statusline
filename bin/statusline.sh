@@ -1680,12 +1680,18 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     tdisp="—"
                 fi
                 # Display name: friendly title-cased per-tag label, overriding
-                # the lowercase tag used internally for lookups.
+                # the lowercase tag used internally for lookups. Fallback
+                # title-cases the tag so config-defined tags ("gmail",
+                # "poynting", "coram-max") render cleanly without needing a
+                # hardcoded case here.
                 case "$tag" in
-                    work)     display_name="Coram"   ;;
-                    alumni)   display_name="Brown"   ;;
-                    personal) display_name="Andrew"  ;;
-                    *)        display_name="$tag"    ;;
+                    work|coram|coram-work) display_name="Coram"     ;;
+                    coram-max)             display_name="Coram-Max" ;;
+                    alumni)                display_name="Brown"     ;;
+                    personal)              display_name="Andrew"    ;;
+                    poynting)              display_name="Poynting"  ;;
+                    gmail)                 display_name="Gmail"     ;;
+                    *) display_name="$(tr '[:lower:]' '[:upper:]' <<< "${tag:0:1}")${tag:1}" ;;
                 esac
                 # All account tags render white; only the leading marker
                 # distinguishes the current account (◉) from the others.
@@ -1907,7 +1913,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 pct_pad=$(( 4 - ${#pct_raw} ))
                 [ "$pct_pad" -lt 0 ] && pct_pad=0
                 pct_col=$(printf '%*s%s' "$pct_pad" '' "$pct_raw")
-                row_line="${marker}${white}$(_pad_to_cols "$display_name" 8)${reset} ${white}${tdisp_padded}${reset}${pct_color}${pct_col}${reset}  ${extra_seg}  ${dim}${extra_reset_col}${reset}"
+                row_line="${marker}${white}$(_pad_to_cols "$display_name" 9)${reset} ${white}${tdisp_padded}${reset}${pct_color}${pct_col}${reset}  ${extra_seg}  ${dim}${extra_reset_col}${reset}"
                 # Annotate with hard-wall warning when applicable. (Windfall
                 # is implicit from the hrs_col — no extra note needed.)
                 if [ "$has_wall" = "1" ]; then
