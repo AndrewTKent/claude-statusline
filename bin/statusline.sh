@@ -1606,13 +1606,14 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
             [(.value.email // (.key | split("|") | .[0])),
              (.value.org_uuid // ((.key | split("|") | .[1]) // "")),
              (.value.five_hour_reset // ""),
-             (.value.five_hour_pct // 0 | tostring)] |
+             (.value.five_hour_pct // 0 | tostring),
+             (.value.seven_day_reset // "")] |
             join("")' "$ledger_file" 2>/dev/null)
         if [ -n "$entries" ]; then
             # Parse + compute projected epochs, find soonest
             parsed=""
             soonest_epoch=""
-            while IFS=$'\x1f' read -r em uuid iso pct; do
+            while IFS=$'\x1f' read -r em uuid iso pct seven_day_iso; do
                 [ -z "$em" ] && continue
                 ep=""
                 # pct_state: ok = use stored pct; reset = fresh window, show 0%;
@@ -1640,7 +1641,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     fi
                 fi
                 tag=$(resolve_account_label "$em" "$uuid")
-                parsed+="${em}|${uuid}|${tag}|${ep}|${pct}|${pct_state}"$'\n'
+                parsed+="${em}|${uuid}|${tag}|${ep}|${pct}|${pct_state}|${seven_day_iso}"$'\n'
                 if [ -n "$ep" ]; then
                     if [ -z "$soonest_epoch" ] || [ "$ep" -lt "$soonest_epoch" ] 2>/dev/null; then
                         soonest_epoch="$ep"
@@ -1649,11 +1650,11 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
             done <<< "$entries"
 
             # Sort by projected reset epoch (soonest first). Entries with no
-            # epoch sort to the end. Epoch is now field 4 (was 3).
-            parsed=$(printf '%s' "$parsed" | awk -F'|' 'NF>=6 { key=($4==""?"9999999999":$4); print key"\t"$0 }' | sort -n | cut -f2-)
+            # epoch sort to the end. Epoch is field 4; row now has 7 fields.
+            parsed=$(printf '%s' "$parsed" | awk -F'|' 'NF>=7 { key=($4==""?"9999999999":$4); print key"\t"$0 }' | sort -n | cut -f2-)
 
             rendered=""
-            while IFS='|' read -r em uuid tag ep pct pct_state; do
+            while IFS='|' read -r em uuid tag ep pct pct_state seven_day_iso; do
                 [ -z "$em" ] && continue
                 # Match the active account on (email, org_uuid). Legacy ledger
                 # entries with empty uuid only match when ACCT_ORG_UUID is also
@@ -1885,21 +1886,32 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 # Stash the row so we can emit after we know the best_em.
                 tdisp_padded=$(_pad_to_cols "$tdisp" 11)
 
-                # Trailing column: extra-usage reset date (1st of next month
-                # local — matches Anthropic's monthly rollover policy and the
-                # dashboard's "Resets May 1"). Only shown when the account has
-                # extra usage enabled; otherwise a dash. Replaces the
-                # redundant "hours to 5h reset" — tdisp already shows that
-                # moment as a local time.
-                if [ -n "$extra_pct" ] && [ -n "$extra_limit_cents" ] && awk "BEGIN{exit !(${extra_limit_cents:-0} > 0)}"; then
-                    # First of next month, in local TZ.
-                    extra_reset_col=$(date -v1d -v+1m +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]' || \
-                                      date -d "$(date +%Y-%m-01) +1 month" +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+                # Trailing column: weekly "all models" reset (the regular
+                # plan-included usage refresh, NOT extra-usage's monthly $-cap
+                # reset — that one's calendar-monthly and uniform, so it
+                # carried no per-account info). `seven_day_iso` is the API's
+                # `seven_day.resets_at`, plumbed through the ledger.
+                # Format: "today 5pm" if same calendar day, else "may 11".
+                if [ -n "$seven_day_iso" ] && [ "$seven_day_iso" != "null" ]; then
+                    seven_day_ep=$(iso_to_epoch "$seven_day_iso")
+                    if [ -n "$seven_day_ep" ]; then
+                        _today_ymd=$(date +%Y-%m-%d)
+                        _reset_ymd=$(date -j -r "$seven_day_ep" +"%Y-%m-%d" 2>/dev/null || date -d "@$seven_day_ep" +"%Y-%m-%d" 2>/dev/null)
+                        if [ "$_reset_ymd" = "$_today_ymd" ]; then
+                            extra_reset_col=$(date -j -r "$seven_day_ep" +"today %-l%p" 2>/dev/null | sed 's/\.//g' | tr '[:upper:]' '[:lower:]' || \
+                                              date -d "@$seven_day_ep" +"today %-l%P" 2>/dev/null | sed 's/\.//g')
+                        else
+                            extra_reset_col=$(date -j -r "$seven_day_ep" +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]' || \
+                                              date -d "@$seven_day_ep" +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+                        fi
+                    else
+                        extra_reset_col="—"
+                    fi
                 else
                     extra_reset_col="—"
                 fi
                 reset_n=${#extra_reset_col}
-                reset_pad=$(( 6 - reset_n ))
+                reset_pad=$(( 9 - reset_n ))
                 [ "$reset_pad" -lt 0 ] && reset_pad=0
                 extra_reset_col=$(printf '%*s%s' "$reset_pad" '' "$extra_reset_col")
                 # Right-align to 4 display cols. printf %4s counts bytes, not
