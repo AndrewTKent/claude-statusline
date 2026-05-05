@@ -300,20 +300,36 @@ jq_update() {
 # Checks ACCOUNT_LABELS config first, then hardcoded fallbacks
 resolve_account_label() {
     local email="$1"
+    local org_uuid="${2:-}"
     [ -z "$email" ] && return
 
-    # Check ACCOUNT_LABELS config: "work:*@company.com personal:me@gmail.com"
+    # Patterns: "tag:email" matches by email; "tag:email|uuid" requires an
+    # exact uuid match (for emails shared across orgs, e.g. company seat +
+    # personal Max plan). UUID-qualified hits beat bare hits.
     if [ -n "$ACCOUNT_LABELS" ]; then
-        local pair label pattern
+        local pair label pattern pat_email pat_uuid bare_match=""
         for pair in $ACCOUNT_LABELS; do
             label="${pair%%:*}"
             pattern="${pair#*:}"
-            # shellcheck disable=SC2254
-            case "$email" in $pattern) echo "$label"; return ;; esac
+            if [[ "$pattern" == *"|"* ]]; then
+                pat_email="${pattern%%|*}"
+                pat_uuid="${pattern#*|}"
+                # shellcheck disable=SC2254
+                case "$email" in $pat_email)
+                    [ "$org_uuid" = "$pat_uuid" ] && { echo "$label"; return; }
+                    ;;
+                esac
+            else
+                # shellcheck disable=SC2254
+                case "$email" in $pattern)
+                    [ -z "$bare_match" ] && bare_match="$label"
+                    ;;
+                esac
+            fi
         done
+        [ -n "$bare_match" ] && { echo "$bare_match"; return; }
     fi
 
-    # No config match — use email as label
     echo "$email"
 }
 
@@ -525,10 +541,12 @@ eval "$(echo "$input" | jq -r '
 # ── Early account resolution (needed before ledger writes) ──
 ACCT_TAG=""
 ACCT_EMAIL=""
+ACCT_ORG_UUID=""
 profile_cache_file="/tmp/claude/statusline-profile-cache.json"
 if [ -f "$profile_cache_file" ]; then
     ACCT_EMAIL=$(jq -r '.account.email // empty' "$profile_cache_file" 2>/dev/null)
-    ACCT_TAG=$(resolve_account_label "$ACCT_EMAIL")
+    ACCT_ORG_UUID=$(jq -r '.organization.uuid // empty' "$profile_cache_file" 2>/dev/null)
+    ACCT_TAG=$(resolve_account_label "$ACCT_EMAIL" "$ACCT_ORG_UUID")
 fi
 
 # ── Daily cost ledger ──────────────────────────────────
@@ -611,6 +629,7 @@ if [ -n "$SESSION_ID" ]; then
             "G_PERSONAL=" + (.global.personal_tokens // 0 | tostring),
             "G_UNKNOWN=" + (.global.unknown_tokens // 0 | tostring),
             "G_TOTAL=" + (.global.total_tokens // 0 | tostring),
+            "G_RECOVERED=" + (.recovered_pre_scan_tokens // 0 | tostring),
             "C_WORK=" + (.challenge.work_tokens // 0 | tostring),
             "C_PERSONAL=" + (.challenge.personal_tokens // 0 | tostring),
             "C_TOTAL=" + (.challenge.total_tokens // 0 | tostring),
@@ -719,7 +738,8 @@ if [ -n "$SESSION_ID" ]; then
     [ "$_today_src" -eq 0 ] && _today_src=${DAILY_TOKENS:-0}
     _today_fmt=$(_usage_fmt "$_today_src")
     _session_fmt=$(_usage_fmt "${SESSION_DELTA:-0}")
-    _lifetime_fmt=$(_usage_fmt "${G_TOTAL:-0}")
+    _lifetime_total=$(( ${G_TOTAL:-0} + ${G_RECOVERED:-0} ))
+    _lifetime_fmt=$(_usage_fmt "$_lifetime_total")
     USAGE_DISPLAY="${dim}today${reset} ${cyan}${_today_fmt}${reset} ${dim}·${reset} ${dim}session${reset} ${magenta}${_session_fmt}${reset} ${dim}·${reset} ${dim}lifetime${reset} ${green}${_lifetime_fmt}${reset}"
 
     # ── Redaction indicator (only when ranges > 0) ──
@@ -1069,23 +1089,33 @@ if $needs_refresh || $needs_profile_refresh; then
                         # Cross-account reset ledger: record the active account's
                         # 5h/7d reset times + utilization so other sessions can
                         # render "when does X reset" even when not logged in.
-                        # Keyed by email. Eventually consistent — only the
-                        # active account is updated per poll.
+                        # Keyed by "email|org_uuid" so a single email shared
+                        # across orgs (work seat + personal Max) tracks two
+                        # rows independently. Eventually consistent — only
+                        # the active account is updated per poll. Writes also
+                        # drop legacy email-only keys for the same email.
                         ledger_email=""
-                        [ -f "$profile_cache_file" ] && ledger_email=$(jq -r '.account.email // empty' "$profile_cache_file" 2>/dev/null)
+                        ledger_org_uuid=""
+                        if [ -f "$profile_cache_file" ]; then
+                            ledger_email=$(jq -r '.account.email // empty' "$profile_cache_file" 2>/dev/null)
+                            ledger_org_uuid=$(jq -r '.organization.uuid // empty' "$profile_cache_file" 2>/dev/null)
+                        fi
                         if [ -n "$ledger_email" ]; then
                             ledger_file="$HOME/.claude/account-resets.json"
                             ledger_now=$(date +%s)
                             [ -f "$ledger_file" ] || echo '{}' > "$ledger_file"
                             tmp_ledger=$(mktemp "/tmp/claude/acct-resets.XXXXXX")
-                            jq --arg e "$ledger_email" --argjson ts "$ledger_now" --argjson u "$response" \
-                                '.[$e] = {
+                            jq --arg e "$ledger_email" --arg uuid "$ledger_org_uuid" --argjson ts "$ledger_now" --argjson u "$response" \
+                                '.[$e + "|" + $uuid] = {
+                                    "email":           $e,
+                                    "org_uuid":        $uuid,
                                     "five_hour_reset": ($u.five_hour.resets_at // null),
                                     "five_hour_pct":   ($u.five_hour.utilization // 0),
                                     "seven_day_reset": ($u.seven_day.resets_at // null),
                                     "seven_day_pct":   ($u.seven_day.utilization // 0),
                                     "last_seen":       $ts
-                                }' "$ledger_file" > "$tmp_ledger" 2>/dev/null && mv "$tmp_ledger" "$ledger_file" || rm -f "$tmp_ledger"
+                                }
+                                | with_entries(select(.key != $e))' "$ledger_file" > "$tmp_ledger" 2>/dev/null && mv "$tmp_ledger" "$ledger_file" || rm -f "$tmp_ledger"
 
                             # Append to history log — one JSON line per poll.
                             # This is the dataset we'll regress (util, token_spend)
@@ -1093,10 +1123,11 @@ if $needs_refresh || $needs_profile_refresh; then
                             # Cheap (~120 bytes/line, ~60 polls/hr → ~7KB/hr).
                             # Rotate if file exceeds ~5MB (keep last ~half).
                             hist_file="$HOME/.claude/utilization-history.jsonl"
-                            jq -c --arg e "$ledger_email" --argjson ts "$ledger_now" --argjson u "$response" -n \
+                            jq -c --arg e "$ledger_email" --arg uuid "$ledger_org_uuid" --argjson ts "$ledger_now" --argjson u "$response" -n \
                                 '{
                                     ts: $ts,
                                     email: $e,
+                                    org_uuid: $uuid,
                                     five_hour_pct:   ($u.five_hour.utilization // 0),
                                     five_hour_reset: ($u.five_hour.resets_at // null),
                                     seven_day_pct:   ($u.seven_day.utilization // 0),
@@ -1496,31 +1527,9 @@ if [ "${extra_enabled:-false}" = "true" ]; then
     EXTRA_BAR_LINE="${white}$(printf "%-7s" "extra")${reset} ${_extra_bar} ${_extra_color}$(fmt_pct "$_extra_pct_display")${reset}  ${dim}\$${reset}${white}${_extra_used}${dim}/\$${reset}${white}${_extra_limit}${reset}"
 fi
 
-# Survive bar: shows buffer (finishes window) or downtime (caps early).
-# Bar length is full-minutes/total-window-minutes so the filled portion
-# represents how much of the 5h window your current pace covers.
-if [ -n "${CUR_FULL_DISPLAY:-}" ]; then
-    # Burn bar: % of 5h window you'll CONSUME at current pace (the inverse
-    # of "% covered"). Fills up as you burn faster. High = cap early = bad.
-    # Display gets 2-dec precision (derived from minute-granular mins_to_full);
-    # the integer form feeds the bar + color_for_pct which both need ints.
-    _burn_display=$(awk -v m="${mins_to_full:-0}" 'BEGIN {
-        p = m * 100 / 300;
-        if (p > 100) p = 100;
-        if (p < 0)   p = 0;
-        printf "%.2f", 100 - p
-    }')
-    _burn_pct="${_burn_display%.*}"
-    [ "$_burn_pct" -lt 0 ] 2>/dev/null && _burn_pct=0
-    [ "$_burn_pct" -gt 100 ] 2>/dev/null && _burn_pct=100
-    _burn_bar=$(build_bar "$_burn_pct" 15)
-    _burn_color=$(color_for_pct "$_burn_pct")
-    SURVIVE_BAR_LINE="${white}$(printf "%-7s" "burn")${reset} ${_burn_bar} ${_burn_color}$(fmt_pct "$_burn_display")${reset}  "
-    if [ -n "${CUR_SURVIVE_DISPLAY:-}" ]; then
-        SURVIVE_BAR_LINE+="${CUR_SURVIVE_COLOR}${CUR_SURVIVE_DISPLAY}${reset} "
-    fi
-    SURVIVE_BAR_LINE+="${dim}full in ${CUR_FULL_DISPLAY}${reset}"
-fi
+# Burn row removed — kept SURVIVE_BAR_LINE empty for the renderer's `elif`
+# at the emit site. Upstream projection vars (CUR_FULL_DISPLAY etc.) still
+# build but no longer drive a row.
 
 # ── Daily budget line ──────────────────────────────────
 BUDGET_DISPLAY=""
@@ -1573,29 +1582,38 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
         # `tail -c` slices mid-line, so the first line of the window is a
         # fragment that makes jq abort the whole stream. Drop it with `awk
         # NR>1`. Backfill limit from used/pct when the older log format
-        # omitted it.
+        # omitted it. Lookup key is "email|org_uuid" (uuid may be empty for
+        # legacy history entries). Pipe separator avoids tab-collapse on
+        # empty uuid fields.
         EXTRA_PCT_LOOKUP=$(tail -c 200000 "$hist_file" 2>/dev/null | awk 'NR>1' | \
-            jq -r 'select(.email) | [.email, (.extra_pct // 0), (.extra_used // 0), (.extra_limit // 0)] | @tsv' 2>/dev/null | \
-            awk -F'\t' '{pct[$1]=$2; used[$1]=$3; lim[$1]=$4}
+            jq -r 'select(.email) | [.email, (.org_uuid // ""), (.extra_pct // 0 | tostring), (.extra_used // 0 | tostring), (.extra_limit // 0 | tostring)] | join("|")' 2>/dev/null | \
+            awk -F'|' '{k=$1"|"$2; pct[k]=$3; used[k]=$4; lim[k]=$5}
                 END{for(k in pct) {
                     l=lim[k];
                     if (l==0 && pct[k]>0) l=used[k]*100/pct[k];
-                    print k"\t"pct[k]"\t"used[k]"\t"l
+                    print k"|"pct[k]"|"used[k]"|"l
                 }}')
     fi
     if [ -f "$ledger_file" ] && [ -n "$ACCT_EMAIL" ]; then
-        # Collect entries: email|tag|reset_epoch|pct per line. Project past
-        # reset times forward in 5h increments (18000s).
+        # Collect entries: email\x1Fuuid\x1Fiso\x1Fpct per line. Use US (0x1F)
+        # as the field separator — @tsv collapses consecutive tabs because
+        # IFS=$'\t' is whitespace, eating empty uuids on legacy entries.
+        # Legacy entries (bare email key, no .value.email) fall back to
+        # splitting the key on "|".
         now_ar=$(date +%s)
         entries=$(jq -r --argjson now "$now_ar" '
             to_entries[] |
-            [.key, (.value.five_hour_reset // ""), (.value.five_hour_pct // 0)] |
-            @tsv' "$ledger_file" 2>/dev/null)
+            [(.value.email // (.key | split("|") | .[0])),
+             (.value.org_uuid // ((.key | split("|") | .[1]) // "")),
+             (.value.five_hour_reset // ""),
+             (.value.five_hour_pct // 0 | tostring),
+             (.value.seven_day_reset // "")] |
+            join("")' "$ledger_file" 2>/dev/null)
         if [ -n "$entries" ]; then
             # Parse + compute projected epochs, find soonest
             parsed=""
             soonest_epoch=""
-            while IFS=$'\t' read -r em iso pct; do
+            while IFS=$'\x1f' read -r em uuid iso pct seven_day_iso; do
                 [ -z "$em" ] && continue
                 ep=""
                 # pct_state: ok = use stored pct; reset = fresh window, show 0%;
@@ -1622,8 +1640,8 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                         done
                     fi
                 fi
-                tag=$(resolve_account_label "$em")
-                parsed+="${em}|${tag}|${ep}|${pct}|${pct_state}"$'\n'
+                tag=$(resolve_account_label "$em" "$uuid")
+                parsed+="${em}|${uuid}|${tag}|${ep}|${pct}|${pct_state}|${seven_day_iso}"$'\n'
                 if [ -n "$ep" ]; then
                     if [ -z "$soonest_epoch" ] || [ "$ep" -lt "$soonest_epoch" ] 2>/dev/null; then
                         soonest_epoch="$ep"
@@ -1632,12 +1650,20 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
             done <<< "$entries"
 
             # Sort by projected reset epoch (soonest first). Entries with no
-            # epoch sort to the end.
-            parsed=$(printf '%s' "$parsed" | awk -F'|' 'NF>=5 { key=($3==""?"9999999999":$3); print key"\t"$0 }' | sort -n | cut -f2-)
+            # epoch sort to the end. Epoch is field 4; row now has 7 fields.
+            parsed=$(printf '%s' "$parsed" | awk -F'|' 'NF>=7 { key=($4==""?"9999999999":$4); print key"\t"$0 }' | sort -n | cut -f2-)
 
             rendered=""
-            while IFS='|' read -r em tag ep pct pct_state; do
+            while IFS='|' read -r em uuid tag ep pct pct_state seven_day_iso; do
                 [ -z "$em" ] && continue
+                # Match the active account on (email, org_uuid). Legacy ledger
+                # entries with empty uuid only match when ACCT_ORG_UUID is also
+                # empty (no profile cache) — degrades to old email-only behavior.
+                if [ "$em" = "$ACCT_EMAIL" ] && [ "$uuid" = "$ACCT_ORG_UUID" ]; then
+                    is_current=1
+                else
+                    is_current=0
+                fi
                 # Reset per-iteration cap vars so stale values don't leak across
                 # accounts when jq returns empty for this email.
                 ci_status="" ci_cur="0" ci_cap=""
@@ -1655,12 +1681,18 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     tdisp="—"
                 fi
                 # Display name: friendly title-cased per-tag label, overriding
-                # the lowercase tag used internally for lookups.
+                # the lowercase tag used internally for lookups. Fallback
+                # title-cases the tag so config-defined tags ("gmail",
+                # "poynting", "coram-max") render cleanly without needing a
+                # hardcoded case here.
                 case "$tag" in
-                    work)     display_name="Coram"   ;;
-                    alumni)   display_name="Brown"   ;;
-                    personal) display_name="Andrew"  ;;
-                    *)        display_name="$tag"    ;;
+                    work|coram|coram-work) display_name="Coram"     ;;
+                    coram-max)             display_name="Coram-Max" ;;
+                    alumni)                display_name="Brown"     ;;
+                    personal)              display_name="Andrew"    ;;
+                    poynting)              display_name="Poynting"  ;;
+                    gmail)                 display_name="Gmail"     ;;
+                    *) display_name="$(tr '[:lower:]' '[:upper:]' <<< "${tag:0:1}")${tag:1}" ;;
                 esac
                 # All account tags render white; only the leading marker
                 # distinguishes the current account (◉) from the others.
@@ -1669,7 +1701,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 # Leading marker: * for current, · for others. Using a visible
                 # dim dot for non-current rows prevents Claude Code's status
                 # panel from trimming leading whitespace and shifting columns.
-                if [ "$em" = "$ACCT_EMAIL" ]; then
+                if [ "$is_current" = "1" ]; then
                     marker="${white}*${reset} "
                 else
                     marker="${dim}·${reset} "
@@ -1679,7 +1711,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 # "current" row exactly). For other accounts, fall back to
                 # the ledger value (no interpolation possible — we're not
                 # logged into them).
-                if [ "$em" = "$ACCT_EMAIL" ] && [ -n "${five_hour_pct_display:-}" ]; then
+                if [ "$is_current" = "1" ] && [ -n "${five_hour_pct_display:-}" ]; then
                     pct_disp="$five_hour_pct_display"
                     pct_state="ok"
                 else
@@ -1699,7 +1731,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     pct_show="$(_pad_to_cols '—' 4)"
                     pct_color="$dim"
                     pct_int=0
-                elif [ "$em" = "$ACCT_EMAIL" ]; then
+                elif [ "$is_current" = "1" ]; then
                     pct_show=$(fmt_pct "$pct_disp")
                 else
                     pct_show=$(printf "%d%%" "$pct_int")
@@ -1756,7 +1788,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 # Skip dead-weight rows: non-current accounts with no usage
                 # signal (0% and no observed wu). These just bloat the line
                 # past Claude Code's status-panel width budget and cause collapse.
-                if [ "$em" != "$ACCT_EMAIL" ] && [ "$pct_int" = "0" ] && { [ -z "$cap_suffix" ] || [ "${ci_cur:-0}" = "0" ]; }; then
+                if [ "$is_current" = "0" ] && [ "$pct_int" = "0" ] && { [ -z "$cap_suffix" ] || [ "${ci_cur:-0}" = "0" ]; }; then
                     continue
                 fi
 
@@ -1771,7 +1803,15 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 extra_cents=""
                 extra_limit_cents=""
                 if [ -n "$EXTRA_PCT_LOOKUP" ]; then
-                    IFS=$'\t' read -r extra_pct extra_cents extra_limit_cents < <(printf '%s\n' "$EXTRA_PCT_LOOKUP" | awk -F'\t' -v e="$em" '$1==e {print $2"\t"$3"\t"$4; exit}')
+                    # Prefer (email, uuid) exact match; fall back to email-only
+                    # match for legacy history entries that lack org_uuid.
+                    IFS='|' read -r extra_pct extra_cents extra_limit_cents < <(printf '%s\n' "$EXTRA_PCT_LOOKUP" | awk -F'|' -v e="$em" -v u="$uuid" '
+                        $1==e && $2==u { ep=$3; eu=$4; el=$5; exact=1 }
+                        $1==e && $2=="" { fp=$3; fu=$4; fl=$5; fall=1 }
+                        END {
+                            if (exact) print ep"|"eu"|"el
+                            else if (fall) print fp"|"fu"|"fl
+                        }')
                 fi
                 # Account tags appear in title-case for display (Coram / Brown
                 # / Andrew) but we still key on the lowercased name for lookups.
@@ -1838,7 +1878,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 [ "$has_wall" = "1" ] && score=0
 
                 # Track best non-current account for the "✓ use now" marker.
-                if [ "$em" != "$ACCT_EMAIL" ] && [ "$score" -gt "${_best_score:-0}" ]; then
+                if [ "$is_current" = "0" ] && [ "$score" -gt "${_best_score:-0}" ]; then
                     _best_score=$score
                     _best_em=$em
                 fi
@@ -1846,21 +1886,42 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 # Stash the row so we can emit after we know the best_em.
                 tdisp_padded=$(_pad_to_cols "$tdisp" 11)
 
-                # Trailing column: extra-usage reset date (1st of next month
-                # local — matches Anthropic's monthly rollover policy and the
-                # dashboard's "Resets May 1"). Only shown when the account has
-                # extra usage enabled; otherwise a dash. Replaces the
-                # redundant "hours to 5h reset" — tdisp already shows that
-                # moment as a local time.
-                if [ -n "$extra_pct" ] && [ -n "$extra_limit_cents" ] && awk "BEGIN{exit !(${extra_limit_cents:-0} > 0)}"; then
-                    # First of next month, in local TZ.
-                    extra_reset_col=$(date -v1d -v+1m +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]' || \
-                                      date -d "$(date +%Y-%m-01) +1 month" +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+                # Trailing column: weekly "all models" reset (the regular
+                # plan-included usage refresh, NOT extra-usage's monthly $-cap
+                # reset — that one's calendar-monthly and uniform, so it
+                # carried no per-account info). `seven_day_iso` is the API's
+                # `seven_day.resets_at`, plumbed through the ledger.
+                # Format: "today 5pm" if same calendar day, else "may 11".
+                if [ -n "$seven_day_iso" ] && [ "$seven_day_iso" != "null" ]; then
+                    seven_day_ep=$(iso_to_epoch "$seven_day_iso")
+                    if [ -n "$seven_day_ep" ]; then
+                        _today_ymd=$(date +%Y-%m-%d)
+                        _reset_ymd=$(date -j -r "$seven_day_ep" +"%Y-%m-%d" 2>/dev/null || date -d "@$seven_day_ep" +"%Y-%m-%d" 2>/dev/null)
+                        if [ "$_reset_ymd" = "$_today_ymd" ]; then
+                            extra_reset_col=$(date -j -r "$seven_day_ep" +"today %-l%p" 2>/dev/null | sed 's/\.//g' | tr '[:upper:]' '[:lower:]' || \
+                                              date -d "@$seven_day_ep" +"today %-l%P" 2>/dev/null | sed 's/\.//g')
+                        else
+                            extra_reset_col=$(date -j -r "$seven_day_ep" +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]' || \
+                                              date -d "@$seven_day_ep" +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+                        fi
+                        # Append time-to-reset in parens. Hours within 24h, day(s) past.
+                        _delta=$(( seven_day_ep - now_ar ))
+                        if [ "$_delta" -gt 0 ]; then
+                            if [ "$_delta" -lt 86400 ]; then
+                                _until="$(( _delta / 3600 ))h"
+                            else
+                                _until="$(( _delta / 86400 )) day"
+                            fi
+                            extra_reset_col="${extra_reset_col} (${_until})"
+                        fi
+                    else
+                        extra_reset_col="—"
+                    fi
                 else
                     extra_reset_col="—"
                 fi
                 reset_n=${#extra_reset_col}
-                reset_pad=$(( 6 - reset_n ))
+                reset_pad=$(( 9 - reset_n ))
                 [ "$reset_pad" -lt 0 ] && reset_pad=0
                 extra_reset_col=$(printf '%*s%s' "$reset_pad" '' "$extra_reset_col")
                 # Right-align to 4 display cols. printf %4s counts bytes, not
@@ -1874,7 +1935,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 pct_pad=$(( 4 - ${#pct_raw} ))
                 [ "$pct_pad" -lt 0 ] && pct_pad=0
                 pct_col=$(printf '%*s%s' "$pct_pad" '' "$pct_raw")
-                row_line="${marker}${white}$(_pad_to_cols "$display_name" 8)${reset} ${white}${tdisp_padded}${reset}${pct_color}${pct_col}${reset}  ${extra_seg}  ${dim}${extra_reset_col}${reset}"
+                row_line="${marker}${white}$(_pad_to_cols "$display_name" 9)${reset} ${white}${tdisp_padded}${reset}${pct_color}${pct_col}${reset}  ${extra_seg}  ${dim}${extra_reset_col}${reset}"
                 # Annotate with hard-wall warning when applicable. (Windfall
                 # is implicit from the hrs_col — no extra note needed.)
                 if [ "$has_wall" = "1" ]; then
@@ -2068,13 +2129,7 @@ render_default() {
         printf "\n%b" "$used_line"
     fi
     [ -n "$WEEKLY_BAR_LINE"  ] && printf "\n%b" "$WEEKLY_BAR_LINE"
-    # Prefer extra-credits bar over burn line; fall through to burn when
-    # extra usage isn't enabled on this account.
-    if [ -n "$EXTRA_BAR_LINE" ]; then
-        printf "\n%b" "$EXTRA_BAR_LINE"
-    elif [ -n "$SURVIVE_BAR_LINE" ]; then
-        printf "\n%b" "$SURVIVE_BAR_LINE"
-    fi
+    [ -n "$EXTRA_BAR_LINE" ] && printf "\n%b" "$EXTRA_BAR_LINE"
     [ -n "$BUDGET_DISPLAY" ] && printf "\n%b" "$BUDGET_DISPLAY"
     # Each opt-out defaults to 1 (show); set to 0 in statusline.conf to hide.
     [ -n "$TOKEN_DISPLAY" ] && [ "${SHOW_TOKENS_ROW:-1}" = "1" ] && printf "\n${white}$(printf "%-7s" "tokens")${reset} %b" "$TOKEN_DISPLAY"
