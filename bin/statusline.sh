@@ -1904,6 +1904,16 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                             extra_reset_col=$(date -j -r "$seven_day_ep" +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]' || \
                                               date -d "@$seven_day_ep" +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]')
                         fi
+                        # Append time-to-reset in parens. Hours within 24h, day(s) past.
+                        _delta=$(( seven_day_ep - now_ar ))
+                        if [ "$_delta" -gt 0 ]; then
+                            if [ "$_delta" -lt 86400 ]; then
+                                _until="$(( _delta / 3600 ))h"
+                            else
+                                _until="$(( _delta / 86400 )) day"
+                            fi
+                            extra_reset_col="${extra_reset_col} (${_until})"
+                        fi
                     else
                         extra_reset_col="—"
                     fi
