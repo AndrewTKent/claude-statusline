@@ -1785,13 +1785,6 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     fi
                 fi
 
-                # Skip dead-weight rows: non-current accounts with no usage
-                # signal (0% and no observed wu). These just bloat the line
-                # past Claude Code's status-panel width budget and cause collapse.
-                if [ "$is_current" = "0" ] && [ "$pct_int" = "0" ] && { [ -z "$cap_suffix" ] || [ "${ci_cur:-0}" = "0" ]; }; then
-                    continue
-                fi
-
                 rendered+="${marker}${seg} ${white}${tdisp}${reset} ${pct_color}${pct_show}${reset}${cap_suffix}   "
 
                 # ── Per-account row (new stacked layout) ──
