@@ -1607,13 +1607,14 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
              (.value.org_uuid // ((.key | split("|") | .[1]) // "")),
              (.value.five_hour_reset // ""),
              (.value.five_hour_pct // 0 | tostring),
-             (.value.seven_day_reset // "")] |
+             (.value.seven_day_reset // ""),
+             (.value.seven_day_pct // 0 | tostring)] |
             join("")' "$ledger_file" 2>/dev/null)
         if [ -n "$entries" ]; then
             # Parse + compute projected epochs, find soonest
             parsed=""
             soonest_epoch=""
-            while IFS=$'\x1f' read -r em uuid iso pct seven_day_iso; do
+            while IFS=$'\x1f' read -r em uuid iso pct seven_day_iso weekly_pct_ledger; do
                 [ -z "$em" ] && continue
                 ep=""
                 # pct_state: ok = use stored pct; reset = fresh window, show 0%;
@@ -1641,7 +1642,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     fi
                 fi
                 tag=$(resolve_account_label "$em" "$uuid")
-                parsed+="${em}|${uuid}|${tag}|${ep}|${pct}|${pct_state}|${seven_day_iso}"$'\n'
+                parsed+="${em}|${uuid}|${tag}|${ep}|${pct}|${pct_state}|${seven_day_iso}|${weekly_pct_ledger}"$'\n'
                 if [ -n "$ep" ]; then
                     if [ -z "$soonest_epoch" ] || [ "$ep" -lt "$soonest_epoch" ] 2>/dev/null; then
                         soonest_epoch="$ep"
@@ -1650,11 +1651,11 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
             done <<< "$entries"
 
             # Sort by projected reset epoch (soonest first). Entries with no
-            # epoch sort to the end. Epoch is field 4; row now has 7 fields.
-            parsed=$(printf '%s' "$parsed" | awk -F'|' 'NF>=7 { key=($4==""?"9999999999":$4); print key"\t"$0 }' | sort -n | cut -f2-)
+            # epoch sort to the end. Epoch is field 4; row now has 8 fields.
+            parsed=$(printf '%s' "$parsed" | awk -F'|' 'NF>=8 { key=($4==""?"9999999999":$4); print key"\t"$0 }' | sort -n | cut -f2-)
 
             rendered=""
-            while IFS='|' read -r em uuid tag ep pct pct_state seven_day_iso; do
+            while IFS='|' read -r em uuid tag ep pct pct_state seven_day_iso weekly_pct_ledger; do
                 [ -z "$em" ] && continue
                 # Match the active account on (email, org_uuid). Legacy ledger
                 # entries with empty uuid only match when ACCT_ORG_UUID is also
@@ -1809,25 +1810,47 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 # Account tags appear in title-case for display (Coram / Brown
                 # / Andrew) but we still key on the lowercased name for lookups.
                 # Handled in the rendering block below.
-                # Build the inner "$NNN/$NNNN" (or "—") text and pad it to a
-                # fixed 11 display columns so every row's hrs_col aligns.
+                # extra_int still feeds the hard-wall warning + best-next score
+                # below, even though the visible column now shows weekly util.
                 if [ -n "$extra_pct" ] && [ -n "$extra_limit_cents" ] && awk "BEGIN{exit !(${extra_limit_cents:-0} > 0)}"; then
                     extra_int=$(printf "%.0f" "$extra_pct" 2>/dev/null || echo 0)
-                    extra_color=$(color_for_pct "$extra_int")
-                    # Show spent/limit to match the dashboard ("$455.52 spent,
-                    # 46% used, $1000 cap") and the rest of the statusline's
-                    # fill-up-as-you-consume framing.
-                    extra_spent=$(awk -v u="${extra_cents:-0}" 'BEGIN { printf "%.0f", u/100 }')
-                    extra_limit_dollars=$(awk -v l="${extra_limit_cents:-0}" 'BEGIN { printf "%.0f", l/100 }')
-                    # left-padded 3 digits, right-padded 4 digits → "$  0/$1000" is 10.
-                    extra_inner=$(printf '$%3d/$%d' "$extra_spent" "$extra_limit_dollars")
-                    extra_inner_padded=$(_pad_to_cols "$extra_inner" 11)
-                    # Color the whole inner segment by util (emitted at once so
-                    # we don't have to handle partial coloring around the "/").
-                    extra_seg="${dim}extra${reset} ${extra_color}${extra_inner_padded}${reset}"
                 else
                     extra_int=0
-                    extra_seg="${dim}extra${reset} $(_pad_to_cols '—' 11)"
+                fi
+
+                # Weekly per-account util column. Current account uses the
+                # live interpolated value (matches the standalone "weekly"
+                # bar row); others fall back to the ledger snapshot. If the
+                # seven-day reset has already elapsed, the snapshot is from
+                # a prior window — show "—" instead of stale data.
+                if [ "$is_current" = "1" ] && [ -n "${seven_day_pct_display:-}" ]; then
+                    weekly_pct_disp="$seven_day_pct_display"
+                    weekly_state="ok"
+                else
+                    weekly_pct_disp="${weekly_pct_ledger:-0}"
+                    weekly_state="ok"
+                    if [ -n "$seven_day_iso" ] && [ "$seven_day_iso" != "null" ]; then
+                        sd_ep=$(iso_to_epoch "$seven_day_iso")
+                        if [ -n "$sd_ep" ] && [ "$sd_ep" -le "$now_ar" ] 2>/dev/null; then
+                            weekly_state="unknown"
+                        fi
+                    fi
+                fi
+                weekly_int=$(printf "%.0f" "$weekly_pct_disp" 2>/dev/null || echo 0)
+                # Pad inner segment to 11 cols to keep the trailing reset
+                # column aligned with the old "extra" layout.
+                if [ "$weekly_state" = "unknown" ]; then
+                    weekly_inner_padded=$(_pad_to_cols '—' 11)
+                    weekly_seg="${dim}weekly${reset} ${dim}${weekly_inner_padded}${reset}"
+                else
+                    weekly_color=$(color_for_pct "$weekly_int")
+                    if [ "$is_current" = "1" ]; then
+                        weekly_inner=$(fmt_pct "$weekly_pct_disp")
+                    else
+                        weekly_inner=$(printf "%d%%" "$weekly_int")
+                    fi
+                    weekly_inner_padded=$(_pad_to_cols "$weekly_inner" 11)
+                    weekly_seg="${dim}weekly${reset} ${weekly_color}${weekly_inner_padded}${reset}"
                 fi
 
                 # Hours-to-reset (computed from ep above, if known).
@@ -1928,7 +1951,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 pct_pad=$(( 4 - ${#pct_raw} ))
                 [ "$pct_pad" -lt 0 ] && pct_pad=0
                 pct_col=$(printf '%*s%s' "$pct_pad" '' "$pct_raw")
-                row_line="${marker}${white}$(_pad_to_cols "$display_name" 9)${reset} ${white}${tdisp_padded}${reset}${pct_color}${pct_col}${reset}  ${extra_seg}  ${dim}${extra_reset_col}${reset}"
+                row_line="${marker}${white}$(_pad_to_cols "$display_name" 9)${reset} ${white}${tdisp_padded}${reset}${pct_color}${pct_col}${reset}  ${weekly_seg}  ${dim}${extra_reset_col}${reset}"
                 # Annotate with hard-wall warning when applicable. (Windfall
                 # is implicit from the hrs_col — no extra note needed.)
                 if [ "$has_wall" = "1" ]; then
