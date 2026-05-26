@@ -564,11 +564,10 @@ TOKEN_DISPLAY=""
 
 IDLE_DISPLAY=""
 if [ -n "$SESSION_ID" ]; then
-    # Include cache_read + cache_creation so the "today" ledger reflects
-    # total Anthropic-billable tokens, not just input+output. Cache reads
-    # dominate heavy sessions (often 100x input+output) so omitting them
-    # under-reports daily usage by ~99%.
-    SESSION_TOKENS=$((INPUT_TOKENS + OUTPUT_TOKENS + CACHE_READ + CACHE_CREATE))
+    # total_input_tokens already includes cache reads (Anthropic API contract).
+    # current_usage.cache_* are per-window, not cumulative — mixing them in
+    # made SESSION_TOKENS non-monotonic and caused negative session deltas.
+    SESSION_TOKENS=$((INPUT_TOKENS + OUTPUT_TOKENS))
     get_subagent_tokens "$SESSION_ID" "$CWD"
 
     # Time since last user message — signals how long the current turn has been running.
