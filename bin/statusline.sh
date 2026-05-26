@@ -334,9 +334,76 @@ resolve_account_label() {
 }
 
 # ── Reusable ledger function ─────────────────────────────
+# Usage: update_token_ledger <file> <session_id> <value> <today> [acct]
+# Like update_ledger but for non-monotonic values (context window tokens).
+# Accumulates positive deltas: when value grows, adds the increment; when
+# value drops (compaction), adds 0. Stores {last_seen, accumulated} per session.
+# Returns daily total via TOKEN_LEDGER_RESULT and session total via TOKEN_LEDGER_SESSION.
+TOKEN_LEDGER_RESULT=0
+TOKEN_LEDGER_SESSION=0
+update_token_ledger() {
+    local file="$1" sid="$2" value="$3" today="$4" acct="${5:-}"
+
+    if [ -f "$file" ]; then
+        local ledger_date
+        ledger_date=$(jq -r '.date // ""' "$file" 2>/dev/null)
+
+        if [ "$ledger_date" = "$today" ]; then
+            # Single jq call: read last_seen, compute delta, accumulate, write back.
+            if [ -n "$acct" ]; then
+                jq_update "$file" --arg sid "$sid" --argjson val "$value" --arg acct "$acct" '
+                    (.sessions[$sid].last_seen // $val) as $prev |
+                    (if $val > $prev then $val - $prev else 0 end) as $delta |
+                    .sessions[$sid] = ((.sessions[$sid] // {}) + {
+                        "last_seen": $val,
+                        "accumulated": ((.sessions[$sid].accumulated // 0) + $delta),
+                        "acct": $acct
+                    })'
+            else
+                jq_update "$file" --arg sid "$sid" --argjson val "$value" '
+                    (.sessions[$sid].last_seen // $val) as $prev |
+                    (if $val > $prev then $val - $prev else 0 end) as $delta |
+                    .sessions[$sid] = ((.sessions[$sid] // {}) + {
+                        "last_seen": $val,
+                        "accumulated": ((.sessions[$sid].accumulated // 0) + $delta)
+                    })'
+            fi
+            eval "$(jq -r --arg sid "$sid" '
+                "TOKEN_LEDGER_RESULT=" + ([.sessions[] | .accumulated // 0] | add // 0 | tostring),
+                "TOKEN_LEDGER_SESSION=" + (.sessions[$sid].accumulated // 0 | tostring)
+            ' "$file" 2>/dev/null)"
+            [ -z "$TOKEN_LEDGER_RESULT" ] && TOKEN_LEDGER_RESULT=0
+            [ -z "$TOKEN_LEDGER_SESSION" ] && TOKEN_LEDGER_SESSION=0
+        else
+            # New day — reset all sessions
+            if [ -n "$acct" ]; then
+                printf '{"date":"%s","sessions":{"%s":{"last_seen":%s,"accumulated":0,"acct":"%s"}}}' \
+                    "$today" "$sid" "$value" "$acct" > "$file"
+            else
+                printf '{"date":"%s","sessions":{"%s":{"last_seen":%s,"accumulated":0}}}' \
+                    "$today" "$sid" "$value" > "$file"
+            fi
+            TOKEN_LEDGER_RESULT=0
+            TOKEN_LEDGER_SESSION=0
+        fi
+    else
+        # First ever write
+        if [ -n "$acct" ]; then
+            printf '{"date":"%s","sessions":{"%s":{"last_seen":%s,"accumulated":0,"acct":"%s"}}}' \
+                "$today" "$sid" "$value" "$acct" > "$file"
+        else
+            printf '{"date":"%s","sessions":{"%s":{"last_seen":%s,"accumulated":0}}}' \
+                "$today" "$sid" "$value" > "$file"
+        fi
+        TOKEN_LEDGER_RESULT=0
+        TOKEN_LEDGER_SESSION=0
+    fi
+}
+
 # Usage: update_ledger <file> <session_id> <value> <today> [acct]
 # Returns daily delta (sum of all session deltas) via LEDGER_RESULT
 # and this session's delta (current - baseline) via LEDGER_SESSION_DELTA.
+# For monotonic values only (e.g., cost). Use update_token_ledger for tokens.
 LEDGER_RESULT=0
 LEDGER_SESSION_DELTA=0
 update_ledger() {
@@ -642,12 +709,10 @@ if [ -n "$SESSION_ID" ]; then
         ' "$scan_src" 2>/dev/null)"
     fi
 
-    # Daily ledger + session delta (shared by both displays).
-    # update_ledger emits both totals — no follow-up jq read needed.
     DAILY_TOKEN_LEDGER="$HOME/.claude/daily-tokens.json"
-    update_ledger "$DAILY_TOKEN_LEDGER" "$SESSION_ID" "$SESSION_TOKENS" "$TODAY" "$ACCT_TAG"
-    DAILY_TOKENS="${LEDGER_RESULT:-0}"
-    SESSION_DELTA="${LEDGER_SESSION_DELTA:-0}"
+    update_token_ledger "$DAILY_TOKEN_LEDGER" "$SESSION_ID" "$SESSION_TOKENS" "$TODAY" "$ACCT_TAG"
+    DAILY_TOKENS="${TOKEN_LEDGER_RESULT:-0}"
+    SESSION_DELTA="${TOKEN_LEDGER_SESSION:-0}"
     SESSION_TOKEN_FMT=$(awk "BEGIN {
         t=$SESSION_DELTA;
         if (t >= 1000000) printf \"%.1fM\", t/1000000;
