@@ -789,9 +789,9 @@ if [ -n "$SESSION_ID" ]; then
     USAGE_DISPLAY=""
     _usage_fmt() {
         awk -v t="$1" 'BEGIN {
-            if (t >= 1e9) printf "%.1fB", t/1e9;
-            else if (t >= 1e6) printf "%.1fM", t/1e6;
-            else if (t >= 1e3) printf "%.1fk", t/1e3;
+            if (t >= 1e9) printf "%.2fB", t/1e9;
+            else if (t >= 1e6) printf "%.2fM", t/1e6;
+            else if (t >= 1e3) printf "%.2fk", t/1e3;
             else printf "%d", t
         }'
     }
