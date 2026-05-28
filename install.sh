@@ -43,7 +43,7 @@ else
 fi
 
 # ── Patch settings.json ────────────────────────────────
-STATUSLINE_CONFIG='{"type":"command","command":"~/.claude/statusline.sh"}'
+STATUSLINE_CONFIG='{"type":"command","command":"~/.claude/statusline.sh","padding":0}'
 
 if [ ! -f "$SETTINGS_FILE" ]; then
     echo "{\"statusLine\":$STATUSLINE_CONFIG}" | jq . > "$SETTINGS_FILE"
@@ -55,7 +55,7 @@ elif jq -e '.statusLine' "$SETTINGS_FILE" >/dev/null 2>&1; then
     else
         warn "settings.json has a different statusLine command: $CURRENT_CMD"
         warn "Not overwriting. To use claude-statusline, manually set:"
-        printf "${dim}  \"statusLine\": {\"type\": \"command\", \"command\": \"~/.claude/statusline.sh\"}${reset}\n"
+        printf "${dim}  \"statusLine\": {\"type\": \"command\", \"command\": \"~/.claude/statusline.sh\", \"padding\": 0}${reset}\n"
     fi
 else
     # Backup, then merge

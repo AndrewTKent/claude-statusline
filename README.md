@@ -43,7 +43,7 @@ Or manually — copy the script, add one key to settings:
 cp bin/statusline.sh ~/.claude/statusline.sh && chmod +x ~/.claude/statusline.sh
 ```
 ```json
-{ "statusLine": { "type": "command", "command": "~/.claude/statusline.sh" } }
+{ "statusLine": { "type": "command", "command": "~/.claude/statusline.sh", "padding": 0 } }
 ```
 
 Restart Claude Code. Done.
