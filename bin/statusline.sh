@@ -2000,10 +2000,9 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 else
                     extra_reset_col="—"
                 fi
-                reset_n=${#extra_reset_col}
-                reset_pad=$(( 9 - reset_n ))
-                [ "$reset_pad" -lt 0 ] && reset_pad=0
-                extra_reset_col=$(printf '%*s%s' "$reset_pad" '' "$extra_reset_col")
+                # Left-align: right-aligning this variable 6-13 char final column
+                # to 9 pushed short dates ("may 18") past the "(N day)" ones.
+                extra_reset_col=$(_pad_to_cols "$extra_reset_col" 9)
                 # Right-align to 4 display cols. printf %4s counts bytes, not
                 # cols — em-dash is 3 bytes / 1 col, which knocks alignment
                 # off. Build the padding manually with ${#} (display width).
