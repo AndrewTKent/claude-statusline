@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 
 const SETTINGS_PATH = path.join(process.env.HOME, '.claude', 'settings.json');
-const STATUSLINE_CONFIG = { type: 'command', command: '~/.claude/statusline.sh' };
+const STATUSLINE_CONFIG = { type: 'command', command: '~/.claude/statusline.sh', padding: 0 };
 
 function patchSettings() {
   let data = {};

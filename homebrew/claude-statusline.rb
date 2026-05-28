@@ -37,6 +37,7 @@ class ClaudeStatusline < Formula
           data["statusLine"] = {
             "type" => "command",
             "command" => "~/.claude/statusline.sh",
+            "padding" => 0,
           }
           settings.atomic_write(JSON.pretty_generate(data) + "\n")
         end
