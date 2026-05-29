@@ -1990,7 +1990,8 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                             if [ "$_delta" -lt 86400 ]; then
                                 _until="$(( _delta / 3600 ))h"
                             else
-                                _until="$(( _delta / 86400 )) day"
+                                _days=$(( _delta / 86400 ))
+                                if [ "$_days" -eq 1 ]; then _until="${_days} day"; else _until="${_days} days"; fi
                             fi
                             extra_reset_col="${extra_reset_col} (${_until})"
                         fi
