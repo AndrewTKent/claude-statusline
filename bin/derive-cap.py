@@ -28,6 +28,14 @@ weights and apply them universally. Each account still gets its own cap,
 computed from its own observed (util, spend) pairs once the weights are
 known.
 
+Performance
+-----------
+Transcript events are read ONCE into a time-sorted, requestId-deduped
+index (build_event_index); per-window lookups bisect that index instead of
+re-walking ~/.claude/projects/**/*.jsonl on every call. The previous design
+re-scanned the entire corpus once per (account, window) pair — O(windows ×
+corpus) — which pegged a core for minutes as both grew.
+
 Files
 -----
 Reads:
@@ -48,6 +56,7 @@ Quality gates
 """
 from __future__ import annotations
 
+import bisect
 import json
 import os
 import sys
@@ -63,8 +72,9 @@ import numpy as np
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_DIR", str(Path.home() / ".claude")))
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 HISTORY_FILE = CLAUDE_DIR / "utilization-history.jsonl"
-WEIGHTS_FILE = CLAUDE_DIR / "work-unit-weights.json"
-CAPS_FILE = CLAUDE_DIR / "account-caps.json"
+# Output paths honor env overrides so a dry run can write elsewhere for diffing.
+WEIGHTS_FILE = Path(os.environ.get("WU_WEIGHTS_OUT") or (CLAUDE_DIR / "work-unit-weights.json"))
+CAPS_FILE = Path(os.environ.get("WU_CAPS_OUT") or (CLAUDE_DIR / "account-caps.json"))
 RESETS_FILE = CLAUDE_DIR / "account-resets.json"
 SESSION_ACCOUNTS_FILE = CLAUDE_DIR / "session-accounts.json"
 
@@ -168,24 +178,58 @@ def email_for(spans: list, ts_iso: str) -> str | None:
     return None
 
 
-def bucket_window_events(window_start: datetime, window_end: datetime
-                         ) -> list[tuple[float, int, int, int, int, str | None]]:
-    """Return (ts_epoch, inp, out, cr, cc, email) for every dedup'd request.
+class EventIndex:
+    """All transcript usage events as 7-tuples (ts, in, out, cr, cc, email, rid),
+    sorted by ts. Built once per process (build_event_index); per-window queries
+    bisect the parallel `ts` list rather than re-reading the corpus.
 
-    Email is resolved via session-accounts.json — the account logged in at
-    the exact request timestamp. None if session has no recorded spans.
+    Dedup is deferred to the per-window slice() — NOT done globally at build
+    time — so it reproduces the old per-window dedup scope exactly. A single
+    requestId emits multiple usage records with different timestamps; when those
+    straddle a 5h boundary the old code counted the request once in EACH window
+    it touched (fresh `seen` per window). Global dedup would keep only one copy
+    and silently drop the others, so we keep every record here and dedup within
+    the window in slice().
     """
-    seen = set()
-    events = []
-    start_ts = window_start.timestamp()
+    __slots__ = ("events", "ts")
+
+    def __init__(self, events: list[tuple[float, int, int, int, int, str | None, str]]):
+        self.events = events
+        self.ts = [e[0] for e in events]
+
+    def slice(self, t0: float, t1: float) -> list[tuple[float, int, int, int, int, str | None]]:
+        """Events with t0 <= ts <= t1 (inclusive both ends), deduped by requestId
+        within the window (first occurrence kept), returned as 6-tuples sorted by ts.
+        Matches the old per-call bucket_window_events dedup scope.
+        """
+        lo = bisect.bisect_left(self.ts, t0)
+        hi = bisect.bisect_right(self.ts, t1)
+        seen: set = set()
+        out: list[tuple[float, int, int, int, int, str | None]] = []
+        for e in self.events[lo:hi]:
+            rid = e[6]
+            if rid in seen:
+                continue
+            seen.add(rid)
+            out.append(e[:6])
+        return out
+
+
+def build_event_index(min_start_ts: float = 0.0) -> EventIndex:
+    """Single pass over ~/.claude/projects/**/*.jsonl → time-sorted events.
+
+    Each event is (ts_epoch, in, out, cr, cc, email, rid). Email is resolved via
+    session-accounts.json — the account logged in at the request timestamp; None
+    if the session has no recorded span. Events before min_start_ts (the earliest
+    window start we'll ever query) are dropped to bound memory. Records with no
+    requestId/message-id are dropped, matching the old scan.
+
+    Dedup is NOT done here — it's per-window in EventIndex.slice() — so a request
+    whose records straddle a 5h boundary is counted in each window, as before.
+    """
+    events: list[tuple[float, int, int, int, int, str | None, str]] = []
     email_spans = load_session_email_spans()
     for jf in PROJECTS_DIR.rglob("*.jsonl"):
-        try:
-            st = jf.stat()
-        except OSError:
-            continue
-        if st.st_mtime < start_ts - 3600:
-            continue
         sid = jf.stem
         spans = email_spans.get(sid, [])
         try:
@@ -199,51 +243,68 @@ def bucket_window_events(window_start: datetime, window_end: datetime
                     if not isinstance(ts_str, str):
                         continue
                     tsv = parse_iso(ts_str)
-                    if not tsv or not (window_start <= tsv <= window_end):
+                    if not tsv:
+                        continue
+                    te = tsv.timestamp()
+                    if te < min_start_ts:
                         continue
                     msg = j.get("message") or {}
                     usage = msg.get("usage") if isinstance(msg, dict) else None
                     if not usage:
                         continue
                     rid = j.get("requestId") or msg.get("id")
-                    if not rid or rid in seen:
+                    if not rid:
                         continue
-                    seen.add(rid)
-                    email = email_for(spans, ts_str)
                     events.append((
-                        tsv.timestamp(),
+                        te,
                         usage.get("input_tokens", 0) or 0,
                         usage.get("output_tokens", 0) or 0,
                         usage.get("cache_read_input_tokens", 0) or 0,
                         usage.get("cache_creation_input_tokens", 0) or 0,
-                        email,
+                        email_for(spans, ts_str),
+                        rid,
                     ))
         except OSError:
             continue
     events.sort(key=lambda e: e[0])
-    return events
+    return EventIndex(events)
 
 
-def tokens_in_range(events: list, t0: float, t1: float,
-                    email_filter: str | None = None) -> tuple[int, int, int, int]:
-    inp = out = cr = cc = 0
-    for row in events:
-        ts, i, o, r, c = row[0], row[1], row[2], row[3], row[4]
-        em = row[5] if len(row) > 5 else None
-        if email_filter is not None and em != email_filter:
-            continue
-        if ts < t0:
-            continue
-        if ts > t1:
-            break
-        inp += i; out += o; cr += r; cc += c
-    return inp, out, cr, cc
+def bucket_window_events(window_start: datetime, window_end: datetime,
+                         index: EventIndex
+                         ) -> list[tuple[float, int, int, int, int, str | None]]:
+    """Events in [window_start, window_end], sliced from the prebuilt index."""
+    return index.slice(window_start.timestamp(), window_end.timestamp())
+
+
+def min_window_start(history: list[dict]) -> float:
+    """Earliest 5h-window start we'll ever query (history + current resets).
+
+    Used to bound the event index: events before this can't fall in any window.
+    """
+    starts: list[float] = []
+    for row in history:
+        dt = parse_iso(row.get("five_hour_reset"))
+        if dt:
+            starts.append(dt.timestamp() - 5 * 3600)
+    if RESETS_FILE.exists():
+        try:
+            resets = json.loads(RESETS_FILE.read_text())
+            for cur in resets.values():
+                if not isinstance(cur, dict):
+                    continue
+                dt = parse_iso(cur.get("five_hour_reset"))
+                if dt:
+                    starts.append(dt.timestamp() - 5 * 3600)
+        except (OSError, json.JSONDecodeError):
+            pass
+    return min(starts) if starts else 0.0
 
 
 # ---------------------------------------------------------------------------
 # Weight fit (once, across all accounts' observations)
 # ---------------------------------------------------------------------------
-def collect_samples(history: list[dict]) -> dict[str, list[tuple[float, int, int, int, int]]]:
+def collect_samples(history: list[dict], index: EventIndex) -> dict[str, list[tuple[float, int, int, int, int]]]:
     """Return {email: [(Δutil, Δin, Δout, Δcr, Δcc), ...]}."""
     window_map: dict[tuple[str, str], list[tuple[int, float]]] = defaultdict(list)
     window_reset: dict[tuple[str, str], datetime] = {}
@@ -268,7 +329,7 @@ def collect_samples(history: list[dict]) -> dict[str, list[tuple[float, int, int
         if not reset_dt:
             continue
         start = datetime.fromtimestamp(reset_dt.timestamp() - 5*3600, tz=timezone.utc)
-        events = bucket_window_events(start, reset_dt)
+        events = bucket_window_events(start, reset_dt, index)
         if not events:
             continue
         # For regression, include events attributed to THIS account OR
@@ -420,7 +481,7 @@ def work_units(inp: int, out: int, cr: int, cc: int, w: dict) -> float:
     ) / w_out
 
 
-def current_window_spend(email: str, reset_iso: str) -> tuple[int, int, int, int]:
+def current_window_spend(email: str, reset_iso: str, index: EventIndex) -> tuple[int, int, int, int]:
     """Sum tokens in the current 5h window for this email.
 
     Attributes each request to the account that was logged in at the exact
@@ -431,7 +492,7 @@ def current_window_spend(email: str, reset_iso: str) -> tuple[int, int, int, int
     if not reset_dt:
         return 0, 0, 0, 0
     start = datetime.fromtimestamp(reset_dt.timestamp() - 5*3600, tz=timezone.utc)
-    events = bucket_window_events(start, reset_dt)
+    events = bucket_window_events(start, reset_dt, index)
     total = [0, 0, 0, 0]
     for row in events:
         i, o, r, c = row[1], row[2], row[3], row[4]
@@ -445,7 +506,7 @@ def current_window_spend(email: str, reset_iso: str) -> tuple[int, int, int, int
     return tuple(total)
 
 
-def build_account_caps(weights_rec: dict, samples: dict) -> dict:
+def build_account_caps(weights_rec: dict, samples: dict, index: EventIndex) -> dict:
     """For each account: compute current window wu spend and cap in wu.
 
     Cap in wu = observed_wu_at_observed_util × (100 / observed_util).
@@ -491,7 +552,7 @@ def build_account_caps(weights_rec: dict, samples: dict) -> dict:
         if not reset_dt:
             continue
         start = datetime.fromtimestamp(reset_dt.timestamp() - 5*3600, tz=timezone.utc)
-        events = bucket_window_events(start, reset_dt)
+        events = bucket_window_events(start, reset_dt, index)
         if not events:
             continue
         # Attribute to THIS account only (same as current_window_spend).
@@ -512,7 +573,7 @@ def build_account_caps(weights_rec: dict, samples: dict) -> dict:
     for email, cur in resets.items():
         util_now = cur.get("five_hour_pct") or 0
         reset_iso = cur.get("five_hour_reset")
-        inp, outv, cr, cc = current_window_spend(email, reset_iso) if reset_iso else (0, 0, 0, 0)
+        inp, outv, cr, cc = current_window_spend(email, reset_iso, index) if reset_iso else (0, 0, 0, 0)
         wu_now = work_units(inp, outv, cr, cc, w)
 
         anchor = anchor_by_email.get(email)
@@ -565,13 +626,16 @@ def build_account_caps(weights_rec: dict, samples: dict) -> dict:
 # ---------------------------------------------------------------------------
 def main():
     history = load_history()
-    samples = collect_samples(history)
+    # Build the transcript event index ONCE, then reuse for every window query
+    # (collect_samples, build_account_caps, current_window_spend).
+    index = build_event_index(min_window_start(history))
+    samples = collect_samples(history, index)
     weights_rec = fit_weights(samples)
 
     # Persist weights
     WEIGHTS_FILE.write_text(json.dumps(weights_rec, indent=2, sort_keys=True))
 
-    caps = build_account_caps(weights_rec, samples)
+    caps = build_account_caps(weights_rec, samples, index)
     CAPS_FILE.write_text(json.dumps(caps, indent=2, sort_keys=True))
 
     if "--quiet" in sys.argv:
