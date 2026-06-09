@@ -6,7 +6,7 @@
     "name": "Andrew Kent",
     "url": "https://github.com/AndrewTKent"
   },
-  "homepage": "https://github.com/AndrewTKent/claude-statusline",
+  "homepage": "https://github.com/AndrewTKent/statusline",
   "category": "productivity",
   "license": "MIT",
   "keywords": ["statusline", "status-bar", "cost-tracking", "rate-limits", "dashboard"],

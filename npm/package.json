@@ -14,9 +14,9 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/AndrewTKent/claude-statusline.git"
+    "url": "https://github.com/AndrewTKent/statusline.git"
   },
-  "homepage": "https://github.com/AndrewTKent/claude-statusline",
+  "homepage": "https://github.com/AndrewTKent/statusline",
   "bin": {
     "claude-statusline": "./bin/cli.js"
   },
