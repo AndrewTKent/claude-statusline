@@ -1,5 +1,5 @@
 <p align="center">
-  <strong>claude-statusline</strong><br>
+  <strong>statusline</strong><br>
   <em>The cockpit for Claude Code.</em>
 </p>
 
@@ -30,7 +30,7 @@ Everything you need to not get rate-limited, blow your budget, or lose context m
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/AndrewTKent/claude-statusline/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/AndrewTKent/statusline/main/install.sh | bash
 ```
 
 Or via npm:
@@ -311,7 +311,7 @@ Claude Code                    statusline.sh
 
 ```bash
 # curl install
-curl -fsSL https://raw.githubusercontent.com/AndrewTKent/claude-statusline/main/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/AndrewTKent/statusline/main/uninstall.sh | bash
 
 # npm
 npx @andrewkent/claude-statusline uninstall

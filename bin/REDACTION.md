@@ -47,11 +47,11 @@ cp ~/.claude/token-scan-overrides.json \
 ```bash
 # Regex pass for legal/personal/PII patterns — writes to
 # ~/.claude/token-scan-autoflag-staging.json
-python3 ~/personal/code/claude-statusline/bin/scan-tokens-autoflag.py
+python3 ~/personal/code/statusline/bin/scan-tokens-autoflag.py
 
 # Coworker-name pass — writes to
 # ~/.claude/token-scan-coworker-staging.json
-python3 ~/personal/code/claude-statusline/bin/scan-tokens-coworker-scrub.py
+python3 ~/personal/code/statusline/bin/scan-tokens-coworker-scrub.py
 ```
 
 Both scripts only **stage** their output — they never touch the live
@@ -123,27 +123,27 @@ each pointed at one batch file. Agents write results to
 Dry-run first:
 
 ```bash
-python3 ~/personal/code/claude-statusline/bin/scan-tokens-merge.py
+python3 ~/personal/code/statusline/bin/scan-tokens-merge.py
 ```
 
 Then apply:
 
 ```bash
-python3 ~/personal/code/claude-statusline/bin/scan-tokens-merge.py --write
+python3 ~/personal/code/statusline/bin/scan-tokens-merge.py --write
 ```
 
 Each new range gets a `source` field (e.g., `autoflag`, `coworker-scan`,
 `agent-batch-07`) so it's traceable. Revert a bad source with:
 
 ```bash
-python3 ~/personal/code/claude-statusline/bin/scan-tokens-merge.py \
+python3 ~/personal/code/statusline/bin/scan-tokens-merge.py \
     --revert-source agent-batch-07
 ```
 
 ### 5. Export the redacted copy
 
 ```bash
-python3 ~/personal/code/claude-statusline/bin/scan-tokens-export.py \
+python3 ~/personal/code/statusline/bin/scan-tokens-export.py \
     ~/Desktop/redacted-export
 ```
 
@@ -207,11 +207,11 @@ invalid categories to `other` and warns.
 | `~/.claude/token-scan-coworker-staging.json` | Coworker-name pass output |
 | `~/.claude/bounty-redaction-batches/` | Per-agent session assignments |
 | `~/.claude/bounty-redaction-output/` | Per-agent flag results |
-| `~/personal/code/claude-statusline/bin/scan-tokens-autoflag.py` | Regex scanner |
-| `~/personal/code/claude-statusline/bin/scan-tokens-coworker-scrub.py` | Coworker name scanner |
-| `~/personal/code/claude-statusline/bin/scan-tokens-redactions.py` | Read-only reporter |
-| `~/personal/code/claude-statusline/bin/scan-tokens-merge.py` | Merges sources into overrides |
-| `~/personal/code/claude-statusline/bin/scan-tokens-export.py` | Applies redactions to an export copy |
+| `~/personal/code/statusline/bin/scan-tokens-autoflag.py` | Regex scanner |
+| `~/personal/code/statusline/bin/scan-tokens-coworker-scrub.py` | Coworker name scanner |
+| `~/personal/code/statusline/bin/scan-tokens-redactions.py` | Read-only reporter |
+| `~/personal/code/statusline/bin/scan-tokens-merge.py` | Merges sources into overrides |
+| `~/personal/code/statusline/bin/scan-tokens-export.py` | Applies redactions to an export copy |
 
 ---
 

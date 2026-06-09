@@ -1,7 +1,7 @@
 class ClaudeStatusline < Formula
   desc "Rich multi-line status bar for Claude Code terminal"
-  homepage "https://github.com/AndrewTKent/claude-statusline"
-  url "https://github.com/AndrewTKent/claude-statusline/archive/refs/tags/v1.0.0.tar.gz"
+  homepage "https://github.com/AndrewTKent/statusline"
+  url "https://github.com/AndrewTKent/statusline/archive/refs/tags/v1.0.0.tar.gz"
   sha256 "PLACEHOLDER"
   license "MIT"
 

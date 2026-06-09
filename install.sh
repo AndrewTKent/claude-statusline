@@ -1,9 +1,9 @@
 #!/bin/bash
 # Claude Code Status Line — One-liner Installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/AndrewTKent/claude-statusline/main/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/AndrewTKent/statusline/main/install.sh | bash
 set -euo pipefail
 
-REPO="AndrewTKent/claude-statusline"
+REPO="AndrewTKent/statusline"
 BRANCH="main"
 INSTALL_DIR="$HOME/.claude"
 SCRIPT_NAME="statusline.sh"
@@ -54,7 +54,7 @@ elif jq -e '.statusLine' "$SETTINGS_FILE" >/dev/null 2>&1; then
         info "settings.json already configured — skipping"
     else
         warn "settings.json has a different statusLine command: $CURRENT_CMD"
-        warn "Not overwriting. To use claude-statusline, manually set:"
+        warn "Not overwriting. To use statusline, manually set:"
         printf "${dim}  \"statusLine\": {\"type\": \"command\", \"command\": \"~/.claude/statusline.sh\", \"padding\": 0}${reset}\n"
     fi
 else
