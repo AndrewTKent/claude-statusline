@@ -294,6 +294,7 @@ Claude Code                    statusline.sh
 | `~/.claude/daily-cost.json` | Daily cost ledger (account-tagged) | Resets daily |
 | `~/.claude/daily-tokens.json` | Daily token tracker (account-tagged) | Resets daily |
 | `~/.claude/stats-cache.json` | Token challenge source (Claude Code managed) | Persistent |
+| `~/.claude/usage-ledger.json` | Durable per-day/per-model token ledger (`bin/usage-ledger.py`) | Permanent — rows never pruned |
 | `~/.claude/session-history.jsonl` | Sparkline history (w/ account + subagent fields) | Rolling 100 entries |
 | `~/.claude/rprompt.txt` | Zsh RPROMPT (rprompt format) | Updated each render |
 | `/tmp/claude/statusline-usage-cache.json` | Rate limit API cache | 5min TTL |

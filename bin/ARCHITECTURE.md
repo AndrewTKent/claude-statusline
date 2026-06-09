@@ -20,6 +20,7 @@
       writes:
         ~/.claude/token-scan-summary.json            outputs (modes):
         ~/.claude/token-scan-cache.json                kv | --render | --json
+        ~/.claude/usage-ledger.json (durable)
 
       knows: per-request work/personal split          knows: this-instant 5h%,
              across both backends, payer attribution,        codex rate_limit %,
@@ -131,6 +132,29 @@ fields) trigger a full reparse once, then self-heal.
 
 Read by `statusline.sh` every render. Schema stable; adding fields is safe,
 removing or renaming requires a bump.
+
+### Durable ledger: `~/.claude/usage-ledger.json`
+
+Written by `bin/usage-ledger.py`. The cache above follows the live transcript
+set — a session file deleted by Claude Code's retention drops out of it. The
+ledger is the layer that doesn't: per-(local day, model) token sums, deduped
+by message id, merged monotonically (a row is only added or raised, never
+removed), so usage history survives transcript cleanup and cache rebuilds.
+Self-throttled to one scan per `USAGE_LEDGER_INTERVAL_H` hours (default 6),
+so it can chain after `scan-tokens.py` in the 60s launchd poll for free.
+
+```json
+{
+  "version": 1,
+  "updated_at": "2026-06-09T20:00:00+00:00",
+  "days": {
+    "2026-06-08": {
+      "claude-opus-4-7": {"input": ..., "output": ..., "cache_write": ...,
+                           "cache_write_1h": ..., "cache_read": ..., "messages": ...}
+    }
+  }
+}
+```
 
 ## Classification precedence
 
