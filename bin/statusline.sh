@@ -1336,7 +1336,10 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
         "extra_enabled=" + (.extra_usage.is_enabled // false | tostring | @sh),
         "extra_pct_raw=" + (.extra_usage.utilization // 0 | tostring | @sh),
         "extra_used_raw=" + (.extra_usage.used_credits // 0 | tostring | @sh),
-        "extra_limit_raw=" + (.extra_usage.monthly_limit // 0 | tostring | @sh)
+        "extra_limit_raw=" + (.extra_usage.monthly_limit // 0 | tostring | @sh),
+        "fable_pct_raw=" + ([.limits[]? | select(.kind == "weekly_scoped") | .percent][0] // "" | tostring | @sh),
+        "fable_reset_iso=" + ([.limits[]? | select(.kind == "weekly_scoped") | .resets_at][0] // "" | @sh),
+        "fable_label=" + ([.limits[]? | select(.kind == "weekly_scoped") | .scope.model.display_name][0] // "" | @sh)
     ' 2>/dev/null)"
 
     # Interpolate between polls for fractional precision
@@ -1610,6 +1613,7 @@ fi
 # no longer appended to the current-account row.
 CURRENT_RATE_TAIL=""
 WEEKLY_BAR_LINE=""
+FABLE_BAR_LINE=""
 SURVIVE_BAR_LINE=""
 EXTRA_BAR_LINE=""
 if [ -n "${WEEK_PCT_DISPLAY:-}" ] && [ "${WEEK_PCT_DISPLAY:-0}" -gt 0 ] 2>/dev/null; then
@@ -1617,7 +1621,22 @@ if [ -n "${WEEK_PCT_DISPLAY:-}" ] && [ "${WEEK_PCT_DISPLAY:-0}" -gt 0 ] 2>/dev/n
     # fmt_pct on the fractional display preserves interpolated sub-percent
     # precision; the int WEEK_PCT_DISPLAY still drives bar fill + color.
     WEEKLY_BAR_LINE="${white}$(printf "%-7s" "weekly")${reset} ${_wk_bar} ${WEEK_PCT_COLOR}$(fmt_pct "${seven_day_pct_display:-$WEEK_PCT_DISPLAY}")${reset}"
-    [ -n "${WEEK_RESET_SHORT:-}" ] && WEEKLY_BAR_LINE+="  ${dim}resets ${WEEK_RESET_SHORT}${reset}"
+    _week_reset_full="${seven_day_reset:-$WEEK_RESET_SHORT}"
+    [ -n "$_week_reset_full" ] && WEEKLY_BAR_LINE+="  ${dim}resets ${_week_reset_full}${reset}"
+fi
+
+# Per-model weekly cap (the API's "weekly_scoped" limit, e.g. Fable). Its own
+# labeled row under weekly; label tracks the scoped model's display_name.
+if [ -n "${fable_pct_raw:-}" ]; then
+    _fb_pct_int=$(printf "%.0f" "$fable_pct_raw" 2>/dev/null || echo 0)
+    [ "$_fb_pct_int" -lt 0 ] 2>/dev/null && _fb_pct_int=0
+    [ "$_fb_pct_int" -gt 100 ] 2>/dev/null && _fb_pct_int=100
+    _fb_bar=$(build_bar "$_fb_pct_int" 15)
+    _fb_color=$(color_for_pct "$_fb_pct_int")
+    _fb_label=$(printf "%s" "${fable_label:-fable}" | tr '[:upper:]' '[:lower:]' | cut -c1-7)
+    FABLE_BAR_LINE="${white}$(printf "%-7s" "$_fb_label")${reset} ${_fb_bar} ${_fb_color}$(fmt_pct "$_fb_pct_int")${reset}"
+    _fb_reset_full=$(format_reset_time "$fable_reset_iso" "datetime" 2>/dev/null || echo "")
+    [ -n "$_fb_reset_full" ] && FABLE_BAR_LINE+="  ${dim}resets ${_fb_reset_full}${reset}"
 fi
 
 # Extra-credits bar: $-spent / $-cap on the current account's monthly bucket.
@@ -2250,6 +2269,7 @@ render_default() {
         printf "\n%b" "$used_line"
     fi
     [ -n "$WEEKLY_BAR_LINE"  ] && printf "\n%b" "$WEEKLY_BAR_LINE"
+    [ -n "$FABLE_BAR_LINE" ] && [ "${SHOW_FABLE_ROW:-1}" = "1" ] && printf "\n%b" "$FABLE_BAR_LINE"
     [ -n "$EXTRA_BAR_LINE" ] && printf "\n%b" "$EXTRA_BAR_LINE"
     [ -n "$BUDGET_DISPLAY" ] && printf "\n%b" "$BUDGET_DISPLAY"
     # Each opt-out defaults to 1 (show); set to 0 in statusline.conf to hide.
