@@ -555,11 +555,25 @@ if date -d @0 +%s >/dev/null 2>&1; then
 else
     _DATE_IS_GNU=0
 fi
-fmt_epoch() {  # $1=epoch  $2=strftime format
+
+# Display timezone for reset times. The Claude session may run on a host whose
+# system clock is UTC (e.g. remote-host), so resolve a real zone rather than showing
+# UTC. Precedence: $STATUSLINE_TZ  →  ~/.claude/statusline-tz file  →  $TZ  →
+# home default. When travelling, set the zone for "where you are", e.g.:
+#   echo Europe/Rome    > ~/.claude/statusline-tz   # Portofino
+#   echo America/Denver > ~/.claude/statusline-tz   # Jackson Hole
+#   rm ~/.claude/statusline-tz                       # back to home (PT)
+_SL_TZ="${STATUSLINE_TZ:-}"
+if [ -z "$_SL_TZ" ] && [ -f "$HOME/.claude/statusline-tz" ]; then
+    _SL_TZ=$(tr -d '[:space:]' < "$HOME/.claude/statusline-tz" 2>/dev/null)
+fi
+[ -z "$_SL_TZ" ] && _SL_TZ="${TZ:-America/Los_Angeles}"
+
+fmt_epoch() {  # $1=epoch  $2=strftime format — rendered in $_SL_TZ
     if [ "$_DATE_IS_GNU" = 1 ]; then
-        date -d "@$1" +"$2" 2>/dev/null
+        TZ="$_SL_TZ" date -d "@$1" +"$2" 2>/dev/null
     else
-        date -j -r "$1" +"$2" 2>/dev/null
+        TZ="$_SL_TZ" date -r "$1" +"$2" 2>/dev/null
     fi
 }
 
@@ -2004,7 +2018,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 if [ -n "$seven_day_iso" ] && [ "$seven_day_iso" != "null" ]; then
                     seven_day_ep=$(iso_to_epoch "$seven_day_iso")
                     if [ -n "$seven_day_ep" ]; then
-                        _today_ymd=$(date +%Y-%m-%d)
+                        _today_ymd=$(TZ="$_SL_TZ" date +%Y-%m-%d)
                         _reset_ymd=$(fmt_epoch "$seven_day_ep" "%Y-%m-%d")
                         if [ "$_reset_ymd" = "$_today_ymd" ]; then
                             extra_reset_col=$(fmt_epoch "$seven_day_ep" "today %-l%p" | sed 's/\.//g' | tr '[:upper:]' '[:lower:]')
