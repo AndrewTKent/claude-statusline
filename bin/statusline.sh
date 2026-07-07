@@ -109,10 +109,8 @@ secs_since_last_user() {
     local ts
     ts=$(tail -n 200 "$session_file" 2>/dev/null | grep '"type":"user"' | tail -1 | jq -r '.timestamp // empty' 2>/dev/null)
     [ -z "$ts" ] && return
-    local clean="${ts%.*}"
-    clean="${clean%Z}"
     local ts_epoch
-    ts_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%S" "$clean" +%s 2>/dev/null)
+    ts_epoch=$(iso_to_epoch "$ts")
     [ -z "$ts_epoch" ] && return
     echo $(( $(date +%s) - ts_epoch ))
 }
@@ -547,6 +545,24 @@ iso_to_epoch() {
     return 1
 }
 
+# Format an epoch as a strftime string, portable across GNU (Linux) and BSD
+# (macOS) date. GNU takes `-d @<epoch>`, BSD takes `-r <epoch>`. Detected once.
+# Prior code chained `date -j -r ... | sed | tr || date -d ...`, but the pipe
+# made the pipeline exit status tr's (0), so the GNU fallback never fired on
+# Linux and every formatted time rendered blank.
+if date -d @0 +%s >/dev/null 2>&1; then
+    _DATE_IS_GNU=1
+else
+    _DATE_IS_GNU=0
+fi
+fmt_epoch() {  # $1=epoch  $2=strftime format
+    if [ "$_DATE_IS_GNU" = 1 ]; then
+        date -d "@$1" +"$2" 2>/dev/null
+    else
+        date -j -r "$1" +"$2" 2>/dev/null
+    fi
+}
+
 format_reset_time() {
     local iso_str="$1"
     local style="$2"
@@ -566,24 +582,21 @@ format_reset_time() {
     done
 
     local tz
-    tz=$(date -j -r "$epoch" +"%Z" 2>/dev/null || date -d "@$epoch" +"%Z" 2>/dev/null)
+    tz=$(fmt_epoch "$epoch" "%Z")
 
     case "$style" in
         time)
             local raw
-            raw=$(date -j -r "$epoch" +"%l:%M%p" 2>/dev/null | sed 's/^ //; s/\.//g' | tr '[:upper:]' '[:lower:]') || \
-            raw=$(date -d "@$epoch" +"%l:%M%P" 2>/dev/null | sed 's/^ //; s/\.//g')
+            raw=$(fmt_epoch "$epoch" "%l:%M%p" | sed 's/^ //; s/\.//g' | tr '[:upper:]' '[:lower:]')
             [ -n "$raw" ] && printf '%s %s' "$raw" "$tz"
             ;;
         datetime)
             local raw
-            raw=$(date -j -r "$epoch" +"%b %-d, %l:%M%p" 2>/dev/null | sed 's/  / /g; s/^ //; s/\.//g' | tr '[:upper:]' '[:lower:]') || \
-            raw=$(date -d "@$epoch" +"%b %-d, %l:%M%P" 2>/dev/null | sed 's/  / /g; s/^ //; s/\.//g')
+            raw=$(fmt_epoch "$epoch" "%b %-d, %l:%M%p" | sed 's/  / /g; s/^ //; s/\.//g' | tr '[:upper:]' '[:lower:]')
             [ -n "$raw" ] && printf '%s %s' "$raw" "$tz"
             ;;
         date)
-            date -j -r "$epoch" +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]' || \
-            date -d "@$epoch" +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]'
+            fmt_epoch "$epoch" "%b %-d" | tr '[:upper:]' '[:lower:]'
             ;;
     esac
 }
@@ -1130,6 +1143,20 @@ if $needs_refresh || $needs_profile_refresh; then
             trap 'rm -f "$lock_file"' EXIT
             token=$(get_oauth_token)
             if [ -n "$token" ] && [ "$token" != "null" ]; then
+                # Write profile cache FIRST — on short-lived parents the trailing
+                # write gets reaped behind the slow usage curl, leaving no account row.
+                if $needs_profile_refresh; then
+                    p_response=$(curl -s --max-time 5 \
+                        -H "Accept: application/json" \
+                        -H "Content-Type: application/json" \
+                        -H "Authorization: Bearer $token" \
+                        -H "anthropic-beta: oauth-2025-04-20" \
+                        -H "User-Agent: claude-code/2.1.34" \
+                        "https://api.anthropic.com/api/oauth/profile" 2>/dev/null)
+                    if [ -n "$p_response" ] && echo "$p_response" | jq -e '.account' >/dev/null 2>&1; then
+                        echo "$p_response" > "$profile_cache_file"
+                    fi
+                fi
                 if $needs_refresh; then
                     response=$(curl -s --max-time 5 \
                         -H "Accept: application/json" \
@@ -1211,18 +1238,6 @@ if $needs_refresh || $needs_profile_refresh; then
                         fi
                     fi
                 fi
-                if $needs_profile_refresh; then
-                    p_response=$(curl -s --max-time 5 \
-                        -H "Accept: application/json" \
-                        -H "Content-Type: application/json" \
-                        -H "Authorization: Bearer $token" \
-                        -H "anthropic-beta: oauth-2025-04-20" \
-                        -H "User-Agent: claude-code/2.1.34" \
-                        "https://api.anthropic.com/api/oauth/profile" 2>/dev/null)
-                    if [ -n "$p_response" ] && echo "$p_response" | jq -e '.account' >/dev/null 2>&1; then
-                        echo "$p_response" > "$profile_cache_file"
-                    fi
-                fi
             fi
         ) &
     fi
@@ -1231,6 +1246,21 @@ fi
 # Always read from cache (may be stale by one cycle — imperceptible)
 usage_data=""
 [ -f "$cache_file" ] && usage_data=$(cat "$cache_file" 2>/dev/null)
+
+# Fallback when the live usage poll is rate-limited (429 → no cache, common on
+# multi-session hosts): rebuild the 5h/7d bars from the current account's ledger row.
+if [ -z "$usage_data" ] && [ -n "$ACCT_EMAIL" ]; then
+    _ledger_file="$HOME/.claude/account-resets.json"
+    if [ -f "$_ledger_file" ]; then
+        usage_data=$(jq -c --arg key "${ACCT_EMAIL}|${ACCT_ORG_UUID}" --arg email "$ACCT_EMAIL" '
+            (.[$key] // (to_entries | map(.value) | map(select(.email == $email)) | .[0])) as $e
+            | if $e == null then empty
+              else {
+                  five_hour: { utilization: ($e.five_hour_pct // 0), resets_at: ($e.five_hour_reset // null) },
+                  seven_day: { utilization: ($e.seven_day_pct // 0), resets_at: ($e.seven_day_reset // null) }
+                } end' "$_ledger_file" 2>/dev/null)
+    fi
+fi
 
 # ── Account display — show full email with a color chosen by tag ──
 # ACCT_EMAIL is the authenticated email; ACCT_TAG is its resolved label (from
@@ -1734,9 +1764,8 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 ci_status="" ci_cur="0" ci_cap=""
                 # Display time (respects the projected epoch)
                 if [ -n "$ep" ]; then
-                    ep_tz=$(date -j -r "$ep" +"%Z" 2>/dev/null || date -d "@$ep" +"%Z" 2>/dev/null)
-                    tdisp_raw=$(date -j -r "$ep" +"%l:%M%p" 2>/dev/null | sed 's/^ //; s/\.//g' | tr '[:upper:]' '[:lower:]') || \
-                        tdisp_raw=$(date -d "@$ep" +"%l:%M%P" 2>/dev/null | sed 's/^ //; s/\.//g')
+                    ep_tz=$(fmt_epoch "$ep" "%Z")
+                    tdisp_raw=$(fmt_epoch "$ep" "%l:%M%p" | sed 's/^ //; s/\.//g' | tr '[:upper:]' '[:lower:]')
                     if [ -n "$tdisp_raw" ]; then
                         tdisp="${tdisp_raw} ${ep_tz}"
                     else
@@ -1976,13 +2005,11 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     seven_day_ep=$(iso_to_epoch "$seven_day_iso")
                     if [ -n "$seven_day_ep" ]; then
                         _today_ymd=$(date +%Y-%m-%d)
-                        _reset_ymd=$(date -j -r "$seven_day_ep" +"%Y-%m-%d" 2>/dev/null || date -d "@$seven_day_ep" +"%Y-%m-%d" 2>/dev/null)
+                        _reset_ymd=$(fmt_epoch "$seven_day_ep" "%Y-%m-%d")
                         if [ "$_reset_ymd" = "$_today_ymd" ]; then
-                            extra_reset_col=$(date -j -r "$seven_day_ep" +"today %-l%p" 2>/dev/null | sed 's/\.//g' | tr '[:upper:]' '[:lower:]' || \
-                                              date -d "@$seven_day_ep" +"today %-l%P" 2>/dev/null | sed 's/\.//g')
+                            extra_reset_col=$(fmt_epoch "$seven_day_ep" "today %-l%p" | sed 's/\.//g' | tr '[:upper:]' '[:lower:]')
                         else
-                            extra_reset_col=$(date -j -r "$seven_day_ep" +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]' || \
-                                              date -d "@$seven_day_ep" +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+                            extra_reset_col=$(fmt_epoch "$seven_day_ep" "%b %-d" | tr '[:upper:]' '[:lower:]')
                         fi
                         # Append time-to-reset in parens. Hours within 24h, day(s) past.
                         _delta=$(( seven_day_ep - now_ar ))
