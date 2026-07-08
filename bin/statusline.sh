@@ -1218,6 +1218,9 @@ if $needs_refresh || $needs_profile_refresh; then
                                     "five_hour_pct":   ($u.five_hour.utilization // 0),
                                     "seven_day_reset": ($u.seven_day.resets_at // null),
                                     "seven_day_pct":   ($u.seven_day.utilization // 0),
+                                    "fable_pct":       ([$u.limits[]? | select(.kind == "weekly_scoped") | .percent][0] // null),
+                                    "fable_reset":     ([$u.limits[]? | select(.kind == "weekly_scoped") | .resets_at][0] // null),
+                                    "fable_label":     ([$u.limits[]? | select(.kind == "weekly_scoped") | .scope.model.display_name][0] // null),
                                     "last_seen":       $ts
                                 }
                                 | with_entries(select(.key != $e))' "$ledger_file" > "$tmp_ledger" 2>/dev/null && mv "$tmp_ledger" "$ledger_file" || rm -f "$tmp_ledger"
@@ -1271,7 +1274,13 @@ if [ -z "$usage_data" ] && [ -n "$ACCT_EMAIL" ]; then
             | if $e == null then empty
               else {
                   five_hour: { utilization: ($e.five_hour_pct // 0), resets_at: ($e.five_hour_reset // null) },
-                  seven_day: { utilization: ($e.seven_day_pct // 0), resets_at: ($e.seven_day_reset // null) }
+                  seven_day: { utilization: ($e.seven_day_pct // 0), resets_at: ($e.seven_day_reset // null) },
+                  limits: (
+                    if ($e.fable_pct // null) != null then
+                      [{ kind: "weekly_scoped", percent: $e.fable_pct, resets_at: ($e.fable_reset // null),
+                         scope: { model: { display_name: ($e.fable_label // "fable") } } }]
+                    else [] end
+                  )
                 } end' "$_ledger_file" 2>/dev/null)
     fi
 fi
