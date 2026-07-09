@@ -1570,52 +1570,6 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
         fi
     fi
 
-    # Extra usage credits
-    if [ "$extra_enabled" = "true" ]; then
-        extra_pct_display=$(printf "%.2f" "$extra_pct_raw" 2>/dev/null || echo "0.00")
-        extra_pct=$(printf "%.0f" "$extra_pct_raw" 2>/dev/null || echo 0)
-        extra_used=$(awk "BEGIN {printf \"%.2f\", $extra_used_raw / 100}" 2>/dev/null)
-        extra_limit=$(awk "BEGIN {printf \"%.2f\", $extra_limit_raw / 100}" 2>/dev/null)
-        extra_bar=$(build_bar "$extra_pct" "$bar_width")
-        extra_pct_color=$(color_for_pct "$extra_pct")
-
-        rate_lines+="\n${white}$(printf "%-7s" "extra")${reset} ${extra_bar} ${extra_pct_color}$(fmt_pct "$extra_pct_display")${reset}    ${white}\$${extra_used}${dim}/${reset}${white}\$${extra_limit}${reset}"
-
-        # Project extra $ spend until current window resets (only when at 100% current)
-        if [ "$five_hour_pct" -ge 100 ] 2>/dev/null && [ -f "$prev_poll_file" ] && [ -n "$five_hour_reset_iso" ]; then
-            proj_reset_epoch=$(iso_to_epoch "$five_hour_reset_iso")
-            if [ -n "$proj_reset_epoch" ]; then
-                proj_now=$(date +%s)
-                proj_secs_to_reset=$(( proj_reset_epoch - proj_now ))
-                [ "$proj_secs_to_reset" -lt 0 ] && proj_secs_to_reset=0
-
-                proj_poll_ts=$(stat -f %m "$cache_file" 2>/dev/null || stat -c %Y "$cache_file" 2>/dev/null)
-                # One jq pull — saves 1 spawn per render.
-                eval "$(jq -r '"proj_prev_ts=" + (.ts // 0 | tostring),
-                               "proj_prev_extra=" + (.extra_used // 0 | tostring)' "$prev_poll_file" 2>/dev/null)"
-                : "${proj_prev_ts:=0}" "${proj_prev_extra:=0}"
-                proj_poll_interval=$(( proj_poll_ts - proj_prev_ts ))
-
-                if [ "$proj_poll_interval" -gt 10 ] 2>/dev/null; then
-                    # extra_used_raw is in cents, proj_prev_extra is in cents
-                    proj_extra_spend=$(awk "BEGIN {
-                        delta = $extra_used_raw - $proj_prev_extra;
-                        if (delta <= 0) { print \"\"; exit }
-                        rate_per_sec = delta / $proj_poll_interval;
-                        secs_since = $proj_now - $proj_poll_ts;
-                        spent_since = rate_per_sec * secs_since;
-                        remaining_secs = $proj_secs_to_reset;
-                        projected = (rate_per_sec * remaining_secs) / 100;
-                        if (projected < 0.01) { print \"\"; exit }
-                        printf \"~\$%.0f\", projected
-                    }")
-                    if [ -n "$proj_extra_spend" ]; then
-                        rate_lines+=" ${orange}${proj_extra_spend} until reset${reset}"
-                    fi
-                fi
-            fi
-        fi
-    fi
 fi
 
 # Weekly and survive are rendered as their own labeled rows now;
@@ -1643,24 +1597,8 @@ if [ -n "${fable_pct_raw:-}" ]; then
     _fb_bar=$(build_bar "$_fb_pct_int" 15)
     _fb_color=$(color_for_pct "$_fb_pct_int")
     _fb_label=$(printf "%s" "${fable_label:-fable}" | tr '[:upper:]' '[:lower:]' | cut -c1-7)
+    # No reset timestamp: fable shares the 5h window shown on the row above.
     FABLE_BAR_LINE="${white}$(printf "%-7s" "$_fb_label")${reset} ${_fb_bar} ${_fb_color}$(fmt_pct "$_fb_pct_int")${reset}"
-    _fb_reset_full=$(format_reset_time "$fable_reset_iso" "datetime" 2>/dev/null || echo "")
-    [ -n "$_fb_reset_full" ] && FABLE_BAR_LINE+="  ${dim}resets ${_fb_reset_full}${reset}"
-fi
-
-# Extra-credits bar: $-spent / $-cap on the current account's monthly bucket.
-# Renders only when extra usage is enabled on the account; otherwise the
-# survive/burn line below takes the slot.
-if [ "${extra_enabled:-false}" = "true" ]; then
-    _extra_pct_display=$(printf "%.2f" "${extra_pct_raw:-0}" 2>/dev/null || echo "0.00")
-    _extra_pct_int=$(printf "%.0f" "${extra_pct_raw:-0}" 2>/dev/null || echo 0)
-    [ "$_extra_pct_int" -lt 0 ] 2>/dev/null && _extra_pct_int=0
-    [ "$_extra_pct_int" -gt 100 ] 2>/dev/null && _extra_pct_int=100
-    _extra_used=$(awk "BEGIN {printf \"%.0f\", ${extra_used_raw:-0} / 100}" 2>/dev/null)
-    _extra_limit=$(awk "BEGIN {printf \"%.0f\", ${extra_limit_raw:-0} / 100}" 2>/dev/null)
-    _extra_bar=$(build_bar "$_extra_pct_int" 15)
-    _extra_color=$(color_for_pct "$_extra_pct_int")
-    EXTRA_BAR_LINE="${white}$(printf "%-7s" "extra")${reset} ${_extra_bar} ${_extra_color}$(fmt_pct "$_extra_pct_display")${reset}  ${dim}\$${reset}${white}${_extra_used}${dim}/\$${reset}${white}${_extra_limit}${reset}"
 fi
 
 # Burn row removed — kept SURVIVE_BAR_LINE empty for the renderer's `elif`
@@ -1701,6 +1639,14 @@ _pad_to_cols() {
     else
         printf '%s' "$s"
     fi
+}
+
+# Right-align by display columns (${#} counts chars, not bytes — keeps "—" aligned).
+_ralign() {
+    local s=$1 want=$2
+    local pad=$(( want - ${#s} ))
+    [ "$pad" -lt 0 ] && pad=0
+    printf '%*s%s' "$pad" '' "$s"
 }
 
 ACCOUNT_RESETS_DISPLAY=""
@@ -1972,21 +1918,15 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     fi
                 fi
                 weekly_int=$(printf "%.0f" "$weekly_pct_disp" 2>/dev/null || echo 0)
-                # Pad inner segment to 11 cols to keep the trailing reset
-                # column aligned with the old "extra" layout.
+                # Bare colored % — the header row labels the column.
                 if [ "$weekly_state" = "unknown" ]; then
-                    weekly_inner_padded=$(_pad_to_cols '—' 11)
-                    weekly_seg="${dim}weekly${reset} ${dim}${weekly_inner_padded}${reset}"
+                    weekly_color="$dim"
+                    wk_raw="—"
                 else
                     weekly_color=$(color_for_pct "$weekly_int")
-                    if [ "$is_current" = "1" ]; then
-                        weekly_inner=$(fmt_pct "$weekly_pct_disp")
-                    else
-                        weekly_inner=$(printf "%d%%" "$weekly_int")
-                    fi
-                    weekly_inner_padded=$(_pad_to_cols "$weekly_inner" 11)
-                    weekly_seg="${dim}weekly${reset} ${weekly_color}${weekly_inner_padded}${reset}"
+                    wk_raw="${weekly_int}%"
                 fi
+                weekly_seg="${weekly_color}$(_ralign "$wk_raw" 4)${reset}"
 
                 # Hours-to-reset (computed from ep above, if known).
                 _now_ep=$(date +%s)
@@ -2034,57 +1974,48 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     _best_em=$em
                 fi
 
-                # Stash the row so we can emit after we know the best_em.
-                tdisp_padded=$(_pad_to_cols "$tdisp" 11)
+                # 5h reset as relative time — the header labels the column;
+                # absolute clock times duplicated the session row above.
+                if [ -n "$ep" ] && [ "${_secs_to_reset:-0}" -gt 0 ] 2>/dev/null; then
+                    if [ "$_secs_to_reset" -ge 3600 ]; then
+                        five_reset_rel="$(( _secs_to_reset / 3600 ))h$(( (_secs_to_reset % 3600) / 60 ))m"
+                    else
+                        five_reset_rel="$(( _secs_to_reset / 60 ))m"
+                    fi
+                else
+                    five_reset_rel="—"
+                fi
 
-                # Trailing column: weekly "all models" reset (the regular
-                # plan-included usage refresh, NOT extra-usage's monthly $-cap
-                # reset — that one's calendar-monthly and uniform, so it
-                # carried no per-account info). `seven_day_iso` is the API's
-                # `seven_day.resets_at`, plumbed through the ledger.
-                # Format: "today 5pm" if same calendar day, else "may 11".
+                # Weekly reset, relative only ("6d" / "12h" / "45m").
+                # `seven_day_iso` is the API's seven_day.resets_at via the ledger.
                 if [ -n "$seven_day_iso" ] && [ "$seven_day_iso" != "null" ]; then
                     seven_day_ep=$(iso_to_epoch "$seven_day_iso")
                     if [ -n "$seven_day_ep" ]; then
-                        _today_ymd=$(TZ="$_SL_TZ" date +%Y-%m-%d)
-                        _reset_ymd=$(fmt_epoch "$seven_day_ep" "%Y-%m-%d")
-                        if [ "$_reset_ymd" = "$_today_ymd" ]; then
-                            extra_reset_col=$(fmt_epoch "$seven_day_ep" "today %-l%p" | sed 's/\.//g' | tr '[:upper:]' '[:lower:]')
-                        else
-                            extra_reset_col=$(fmt_epoch "$seven_day_ep" "%b %-d" | tr '[:upper:]' '[:lower:]')
-                        fi
-                        # Append time-to-reset in parens. Hours within 24h, day(s) past.
                         _delta=$(( seven_day_ep - now_ar ))
-                        if [ "$_delta" -gt 0 ]; then
-                            if [ "$_delta" -lt 86400 ]; then
-                                _until="$(( _delta / 3600 ))h"
-                            else
-                                _days=$(( _delta / 86400 ))
-                                if [ "$_days" -eq 1 ]; then _until="${_days} day"; else _until="${_days} days"; fi
-                            fi
-                            extra_reset_col="${extra_reset_col} (${_until})"
+                        if [ "$_delta" -le 0 ]; then
+                            wk_reset_rel="now"
+                        elif [ "$_delta" -lt 3600 ]; then
+                            wk_reset_rel="$(( _delta / 60 ))m"
+                        elif [ "$_delta" -lt 86400 ]; then
+                            wk_reset_rel="$(( _delta / 3600 ))h"
+                        else
+                            wk_reset_rel="$(( _delta / 86400 ))d"
                         fi
                     else
-                        extra_reset_col="—"
+                        wk_reset_rel="—"
                     fi
                 else
-                    extra_reset_col="—"
+                    wk_reset_rel="—"
                 fi
-                # Left-align: right-aligning this variable 6-13 char final column
-                # to 9 pushed short dates ("may 18") past the "(N day)" ones.
-                extra_reset_col=$(_pad_to_cols "$extra_reset_col" 9)
-                # Right-align to 4 display cols. printf %4s counts bytes, not
-                # cols — em-dash is 3 bytes / 1 col, which knocks alignment
-                # off. Build the padding manually with ${#} (display width).
                 if [ "${pct_state:-ok}" = "unknown" ]; then
                     pct_raw="—"
                 else
                     pct_raw="${pct_int}%"
                 fi
-                pct_pad=$(( 4 - ${#pct_raw} ))
-                [ "$pct_pad" -lt 0 ] && pct_pad=0
-                pct_col=$(printf '%*s%s' "$pct_pad" '' "$pct_raw")
-                row_line="${marker}${white}$(_pad_to_cols "$display_name" 9)${reset} ${white}${tdisp_padded}${reset}${pct_color}${pct_col}${reset}  ${weekly_seg}  ${dim}${extra_reset_col}${reset}"
+                # Weekly-capped accounts are unusable regardless of 5h state — dim the name.
+                name_color="$white"
+                [ "$weekly_int" -ge 100 ] 2>/dev/null && name_color="$dim"
+                row_line="${marker}${name_color}$(_pad_to_cols "$display_name" 9)${reset} ${pct_color}$(_ralign "$pct_raw" 4)${reset}  ${dim}$(_ralign "$five_reset_rel" 6)${reset}   ${weekly_seg}  ${dim}$(_ralign "$wk_reset_rel" 6)${reset}"
                 # Annotate with hard-wall warning when applicable. (Windfall
                 # is implicit from the hrs_col — no extra note needed.)
                 if [ "$has_wall" = "1" ]; then
@@ -2253,7 +2184,6 @@ render_default() {
     # Detail lines (dimmer for visual hierarchy). CONTEXT_PCT carries the
     # API's sub-percent precision; CONTEXT_INT still drives bar + color.
     ctx_line="${white}$(printf "%-7s" "context")${reset} ${CTX_BAR} ${CTX_COLOR}$(fmt_pct "${CONTEXT_PCT:-$CONTEXT_INT}")${reset}"
-    [ -n "$CTX_ETA_DISPLAY" ] && ctx_line+="  ${dim}${CTX_ETA_DISPLAY}${reset}"
     printf "\n%b" "$ctx_line"
 
     # Headroom bar for the current 5h window — how much you've got LEFT.
@@ -2290,7 +2220,10 @@ render_default() {
         backends_line=$("${BASH_SOURCE[0]%/*}/live-state.py" --render 2>/dev/null)
         [ -n "$backends_line" ] && printf "\n${white}$(printf "%-7s" "stack")${reset} ${dim}%s${reset}" "$backends_line"
     fi
-    [ -n "$FINAL_ACCOUNT_ROWS" ] && printf "\n${dim}·${reset}\n%b" "$FINAL_ACCOUNT_ROWS"
+    if [ -n "$FINAL_ACCOUNT_ROWS" ]; then
+        _acct_header="  $(_pad_to_cols "acct" 9) $(_ralign "5h" 4)  $(_ralign "reset" 6)   $(_ralign "wk" 4)  $(_ralign "reset" 6)"
+        printf "\n${dim}%s${reset}%b" "$_acct_header" "$FINAL_ACCOUNT_ROWS"
+    fi
 }
 
 # ── Render: compact (context + used only) ─────────────────
