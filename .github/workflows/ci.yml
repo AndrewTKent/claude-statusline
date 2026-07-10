@@ -15,7 +15,7 @@ jobs:
         uses: ludeeus/action-shellcheck@master
         with:
           scandir: bin/
-          additional_files: install.sh uninstall.sh
+          additional_files: install.sh uninstall.sh install-codex.sh
           severity: error
 
   test:
@@ -43,3 +43,13 @@ jobs:
           [ -f ~/.claude/statusline.sh ] || { echo "FAIL: script not installed"; exit 1; }
           jq -e '.statusLine' ~/.claude/settings.json || { echo "FAIL: settings not patched"; exit 1; }
           echo "PASS: install script works"
+      - name: Test Codex monitor
+        run: python3 test/test_codex_statusline.py
+      - name: Set up Python 3.9
+        if: runner.os == 'Linux'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Test Codex monitor on Python 3.9
+        if: runner.os == 'Linux'
+        run: python3.9 test/test_codex_statusline.py

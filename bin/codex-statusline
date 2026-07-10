@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC1091
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+if command -v realpath >/dev/null 2>&1; then
+    SOURCE="$(realpath "$SOURCE")"
+fi
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+# shellcheck source=codex-config.sh
+source "$SCRIPT_DIR/codex-config.sh"
+load_codex_statusline_config
+exec python3 "$SCRIPT_DIR/codex_statusline.py" "$@"
