@@ -1,0 +1,36 @@
+# Codex CLI Statusline Configuration
+# Copy to ~/.codex/statusline.conf
+
+# Render format: default | sigil
+# CODEX_STATUSLINE_FORMAT=default
+
+# Live dashboard refresh interval used by bin/codex-watch.
+# CODEX_WATCH_INTERVAL=2
+
+# Top monitor refresh interval used by bin/codex-top.
+# CODEX_TOP_INTERVAL=2
+
+# Inline-style cockpit pane height, refresh interval, and scrollback depth.
+# Minimum cockpit height is 11 rows.
+# CODEX_COCKPIT_HEIGHT=12
+# CODEX_COCKPIT_INTERVAL=1
+# CODEX_COCKPIT_HISTORY_LIMIT=100000
+
+# Cockpit defaults to --dangerously-bypass-approvals-and-sandbox. Set this to 0
+# to inherit Codex permission settings instead; explicit CLI permission flags win.
+# CODEX_COCKPIT_MANAGE_APPROVALS=1
+
+# Pin the cockpit footer to one thread instead of process binding.
+# CODEX_COCKPIT_THREAD_ID=019f0000-0000-7000-8000-000000000000
+
+# Codex binary for the cockpit when `codex` is not on PATH.
+# CODEX_COCKPIT_CODEX_BIN=/usr/local/bin/codex
+
+# Optional aggregate token goals, exposed via `codex-statusline --json`.
+# SESSION_TOKEN_GOAL=1000000
+# DAILY_TOKEN_GOAL=2000000
+# WEEKLY_TOKEN_GOAL=10000000
+# LIFETIME_TOKEN_GOAL=100000000
+
+# Optional: choose a thread explicitly when running outside Codex.
+# CODEX_THREAD_ID=019f0000-0000-7000-8000-000000000000

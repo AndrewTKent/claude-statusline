@@ -30,7 +30,7 @@ Everything you need to not get rate-limited, blow your budget, or lose context m
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/AndrewTKent/claude-statusline/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/AndrewTKent/statusline/main/install.sh | bash
 ```
 
 Or via npm:
@@ -49,6 +49,45 @@ cp bin/statusline.sh ~/.claude/statusline.sh && chmod +x ~/.claude/statusline.sh
 Restart Claude Code. Done.
 
 **Requires:** [`jq`](https://jqlang.github.io/jq/) &middot; Claude Code (logged in) &middot; Optional: [`gh`](https://cli.github.com/) for PR badges
+
+### Codex
+
+**Requires:** Codex CLI &middot; Python 3 &middot; `tmux` &middot; `~/.local/bin` on `PATH`
+
+```bash
+./install-codex.sh
+codex-cockpit
+codex-cockpit --sandbox read-only --ask-for-approval on-request
+```
+
+`codex-cockpit` launches Codex in tmux with a fixed bottom pane matching the
+multi-line Claude Code status view. It shows the current model, elapsed time,
+account, repository, context use, 5-hour and weekly limits, tokens, agents, and
+running tools. It binds each footer to the rollout file opened by its owning Codex
+process, so concurrent and resumed sessions do not exchange context values. Mouse
+wheel scrollback is enabled with a 100,000-line history; tune it with
+`CODEX_COCKPIT_HISTORY_LIMIT`. When launched inside an existing tmux pane, that
+pane keeps the history depth it was created with; the session `mouse` and window
+`history-limit` options are restored when the cockpit exits. When launched outside
+tmux, detaching (prefix d) leaves Codex running — reattach with
+`tmux attach -t codex-cockpit-<pid>`; the session ends when Codex exits.
+
+The launcher defaults to Codex YOLO mode by passing
+`--dangerously-bypass-approvals-and-sandbox`. An explicit `-a/--ask-for-approval`,
+`-s/--sandbox`, or dangerous-bypass flag replaces that default; profile (`-p`) or
+`-c` approval overrides do not. Set
+`CODEX_COCKPIT_MANAGE_APPROVALS=0` to pass no permission default. Cockpit also uses
+`tui.status_line=[]` so Codex keeps only its compact built-in prompt footer while
+the detailed dashboard stays in the fixed pane.
+Settings load from `${CODEX_HOME:-~/.codex}/statusline.conf`; non-empty environment
+variables override file values, and `CODEX_STATUSLINE_CONFIG` points at a
+different file.
+
+`codex-top` is the live fleet view for parent and subagent sessions. Both views
+read `~/.codex/state_5.sqlite` and rollout JSONL files locally; neither calls an
+API. Use `codex-watch --details` for expanded session details or
+`codex-statusline --json` for a machine-readable snapshot. `codex-top` monitors existing sessions; Codex
+launch flags belong on `codex-cockpit`.
 
 ---
 
@@ -311,7 +350,7 @@ Claude Code                    statusline.sh
 
 ```bash
 # curl install
-curl -fsSL https://raw.githubusercontent.com/AndrewTKent/claude-statusline/main/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/AndrewTKent/statusline/main/uninstall.sh | bash
 
 # npm
 npx @andrewkent/claude-statusline uninstall
@@ -319,6 +358,11 @@ npx @andrewkent/claude-statusline uninstall
 # Manual
 rm ~/.claude/statusline.sh
 # Remove "statusLine" key from ~/.claude/settings.json
+
+# Codex monitor
+rm ~/.local/bin/codex-{cockpit,statusline,top,watch} \
+   ~/.local/bin/codex-config.sh ~/.local/bin/codex_statusline.py
+# Optionally: rm ~/.codex/statusline.conf
 ```
 
 ---
