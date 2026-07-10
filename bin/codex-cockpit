@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC1091,SC2016,SC2329
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+if command -v realpath >/dev/null 2>&1; then
+    SOURCE="$(realpath "$SOURCE")"
+fi
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+# shellcheck source=codex-config.sh
+source "$SCRIPT_DIR/codex-config.sh"
+load_codex_statusline_config
+
+shell_join() {
+    local arg quoted command=""
+    for arg in "$@"; do
+        printf -v quoted '%q' "$arg"
+        command+="${command:+ }$quoted"
+    done
+    printf '%s' "$command"
+}
+
+command -v tmux >/dev/null 2>&1 || {
+    printf 'tmux is required for codex-cockpit\n' >&2
+    exit 1
+}
+
+CODEX_BIN="${CODEX_COCKPIT_CODEX_BIN:-$(command -v codex || true)}"
+if [[ -z "$CODEX_BIN" || ! -x "$CODEX_BIN" ]]; then
+    printf 'Codex CLI not found; set CODEX_COCKPIT_CODEX_BIN to its path\n' >&2
+    exit 1
+fi
+
+FOOTER_HEIGHT="${CODEX_COCKPIT_HEIGHT:-12}"
+REFRESH_INTERVAL="${CODEX_COCKPIT_INTERVAL:-1}"
+MANAGE_APPROVALS="${CODEX_COCKPIT_MANAGE_APPROVALS:-1}"
+HISTORY_LIMIT="${CODEX_COCKPIT_HISTORY_LIMIT:-100000}"
+if [[ ! "$FOOTER_HEIGHT" =~ ^[1-9][0-9]*$ ]] || (( FOOTER_HEIGHT < 11 )); then
+    printf 'CODEX_COCKPIT_HEIGHT must be an integer of at least 11\n' >&2
+    exit 1
+fi
+if [[ ! "$REFRESH_INTERVAL" =~ ^[0-9]+([.][0-9]+)?$ || "$REFRESH_INTERVAL" =~ ^0([.]0+)?$ ]]; then
+    printf 'CODEX_COCKPIT_INTERVAL must be a positive number\n' >&2
+    exit 1
+fi
+if [[ "$MANAGE_APPROVALS" != "0" && "$MANAGE_APPROVALS" != "1" ]]; then
+    printf 'CODEX_COCKPIT_MANAGE_APPROVALS must be 0 or 1\n' >&2
+    exit 1
+fi
+if [[ ! "$HISTORY_LIMIT" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'CODEX_COCKPIT_HISTORY_LIMIT must be a positive integer\n' >&2
+    exit 1
+fi
+
+CODEX_ARGS=(-c 'tui.status_line=[]')
+EXPLICIT_PERMISSIONS=0
+for arg in "$@"; do
+    if [[ "$arg" == "--" ]]; then
+        break
+    fi
+    case "$arg" in
+        --dangerously-bypass-approvals-and-sandbox|--yolo|-a|-a=*|-a?*|--ask-for-approval|--ask-for-approval=*|-s|-s=*|-s?*|--sandbox|--sandbox=*)
+            EXPLICIT_PERMISSIONS=1
+            ;;
+    esac
+done
+if [[ "$MANAGE_APPROVALS" == "1" && "$EXPLICIT_PERMISSIONS" == "0" ]]; then
+    CODEX_ARGS+=(--dangerously-bypass-approvals-and-sandbox)
+fi
+CODEX_ARGS+=("$@")
+
+WORKING_DIR="$(pwd -P)"
+CODEX_WORKING_DIR="$WORKING_DIR"
+EXPECT_CWD=0
+RESUME_THREAD_ID="${CODEX_COCKPIT_THREAD_ID:-}"
+for arg in "$@"; do
+    if [[ "$arg" == "--" ]]; then
+        break
+    fi
+    if [[ "$EXPECT_CWD" == "1" ]]; then
+        CODEX_WORKING_DIR="$arg"
+        EXPECT_CWD=0
+        continue
+    fi
+    case "$arg" in
+        -C|--cd) EXPECT_CWD=1 ;;
+        -C=*) CODEX_WORKING_DIR="${arg#-C=}" ;;
+        -C?*) CODEX_WORKING_DIR="${arg#-C}" ;;
+        --cd=*) CODEX_WORKING_DIR="${arg#--cd=}" ;;
+    esac
+done
+if [[ "$CODEX_WORKING_DIR" != /* ]]; then
+    CODEX_WORKING_DIR="$WORKING_DIR/$CODEX_WORKING_DIR"
+fi
+if [[ -d "$CODEX_WORKING_DIR" ]]; then
+    CODEX_WORKING_DIR="$(cd "$CODEX_WORKING_DIR" && pwd -P)"
+fi
+RUNTIME_DIR="$(mktemp -d "${TMPDIR:-/tmp}/codex-cockpit.XXXXXX")"
+OWNER_PID_FILE="$RUNTIME_DIR/owner.pid"
+BIND_ARGS=()
+if [[ -n "$RESUME_THREAD_ID" ]]; then
+    BIND_ARGS+=(--thread-id "$RESUME_THREAD_ID")
+fi
+FOOTER_COMMAND="$(shell_join "$SCRIPT_DIR/codex-statusline" --footer --watch "$REFRESH_INTERVAL" --cwd "$CODEX_WORKING_DIR" --owner-pid-file "$OWNER_PID_FILE" ${BIND_ARGS[@]+"${BIND_ARGS[@]}"})"
+
+if [[ -n "${TMUX:-}" ]]; then
+    footer_pane=""
+    prior_mouse="$(tmux show-options -v mouse 2>/dev/null || true)"
+    prior_history_limit="$(tmux show-options -wv history-limit 2>/dev/null || true)"
+    restore_tmux_options() {
+        if [[ -n "$prior_mouse" ]]; then
+            tmux set-option mouse "$prior_mouse" 2>/dev/null || true
+        else
+            tmux set-option -u mouse 2>/dev/null || true
+        fi
+        if [[ -n "$prior_history_limit" ]]; then
+            tmux set-option -w history-limit "$prior_history_limit" 2>/dev/null || true
+        else
+            tmux set-option -wu history-limit 2>/dev/null || true
+        fi
+    }
+    cleanup_pane() {
+        if [[ -n "$footer_pane" ]]; then
+            tmux kill-pane -t "$footer_pane" 2>/dev/null || true
+        fi
+        restore_tmux_options
+        rm -rf "$RUNTIME_DIR"
+    }
+    trap cleanup_pane EXIT HUP INT TERM
+    printf '%s\n' "$$" > "$OWNER_PID_FILE"
+    tmux set-option mouse on
+    tmux set-option -w history-limit "$HISTORY_LIMIT"
+    footer_pane="$(tmux split-window -v -l "$FOOTER_HEIGHT" -d -P -F '#{pane_id}' -c "$WORKING_DIR" "$FOOTER_COMMAND")"
+    set +e
+    if (( ${#CODEX_ARGS[@]} )); then
+        "$CODEX_BIN" "${CODEX_ARGS[@]}"
+    else
+        "$CODEX_BIN"
+    fi
+    status=$?
+    set -e
+    exit "$status"
+fi
+
+TERMINAL_WIDTH="${COLUMNS:-0}"
+TERMINAL_HEIGHT="${LINES:-0}"
+if [[ ! "$TERMINAL_WIDTH" =~ ^[1-9][0-9]*$ || ! "$TERMINAL_HEIGHT" =~ ^[1-9][0-9]*$ ]]; then
+    terminal_dimensions="$(stty size 2>/dev/null < /dev/tty || true)"
+    if [[ "$terminal_dimensions" =~ ^([1-9][0-9]*)[[:space:]]+([1-9][0-9]*)$ ]]; then
+        TERMINAL_HEIGHT="${BASH_REMATCH[1]}"
+        TERMINAL_WIDTH="${BASH_REMATCH[2]}"
+    else
+        TERMINAL_WIDTH=80
+        TERMINAL_HEIGHT=24
+    fi
+fi
+
+SESSION="codex-cockpit-$$"
+STATUS_FILE="$RUNTIME_DIR/status"
+RUNNER_SCRIPT="$RUNTIME_DIR/runner.sh"
+cat > "$RUNNER_SCRIPT" <<'RUNNER'
+codex_bin=$1
+session=$2
+status_file=$3
+owner_pid_file=$4
+shift 4
+printf "%s\n" "$$" > "$owner_pid_file"
+"$codex_bin" "$@"
+status=$?
+printf "%s\n" "$status" > "$status_file"
+tmux kill-session -t "=$session" 2>/dev/null || true
+exit "$status"
+RUNNER
+if (( ${#CODEX_ARGS[@]} )); then
+    TOP_COMMAND="$(shell_join bash "$RUNNER_SCRIPT" "$CODEX_BIN" "$SESSION" "$STATUS_FILE" "$OWNER_PID_FILE" "${CODEX_ARGS[@]}")"
+else
+    TOP_COMMAND="$(shell_join bash "$RUNNER_SCRIPT" "$CODEX_BIN" "$SESSION" "$STATUS_FILE" "$OWNER_PID_FILE")"
+fi
+
+SETUP_DONE=0
+cleanup_session() {
+    # Preserve a detached session while Codex is still running inside it.
+    if [[ "$SETUP_DONE" == "1" && ! -s "$STATUS_FILE" ]] && tmux has-session -t "=$SESSION" 2>/dev/null; then
+        return 0
+    fi
+    tmux kill-session -t "=$SESSION" 2>/dev/null || true
+    rm -rf "$RUNTIME_DIR"
+}
+trap cleanup_session EXIT HUP INT TERM
+
+bootstrap_pane="$(tmux new-session -d -s "$SESSION" -x "$TERMINAL_WIDTH" -y "$TERMINAL_HEIGHT" -c "$WORKING_DIR" -P -F '#{pane_id}' "sleep 86400")"
+tmux set-option -t "$SESSION" status off
+tmux set-option -t "$SESSION" mouse on
+tmux set-option -w -t "$bootstrap_pane" history-limit "$HISTORY_LIMIT"
+top_pane="$(tmux split-window -t "$bootstrap_pane" -v -l 1 -d -P -F '#{pane_id}' -c "$WORKING_DIR" "sleep 86400")"
+if [[ -z "$top_pane" ]] || [[ "$(tmux display-message -p -t "$top_pane" '#{pane_id}')" != "$top_pane" ]]; then
+    printf 'failed to create Codex cockpit pane\n' >&2
+    exit 1
+fi
+tmux kill-pane -t "$bootstrap_pane"
+tmux split-window -t "$top_pane" -v -l "$FOOTER_HEIGHT" -d -c "$WORKING_DIR" "$FOOTER_COMMAND"
+tmux select-pane -t "$top_pane"
+tmux respawn-pane -k -t "$top_pane" -c "$WORKING_DIR" "$TOP_COMMAND"
+SETUP_DONE=1
+
+set +e
+tmux attach-session -t "=$SESSION"
+attach_status=$?
+set -e
+
+if tmux has-session -t "=$SESSION" 2>/dev/null; then
+    printf "codex-cockpit detached; Codex keeps running. Reattach with: tmux attach -t '=%s'\n" "$SESSION"
+    exit "$attach_status"
+fi
+
+status="$attach_status"
+if [[ -s "$STATUS_FILE" ]]; then
+    read -r status < "$STATUS_FILE"
+fi
+exit "$status"
