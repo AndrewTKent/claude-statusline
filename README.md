@@ -56,27 +56,34 @@ Restart Claude Code. Done.
 
 ```bash
 ./install-codex.sh
-codex-cockpit
-codex-cockpit --sandbox read-only --ask-for-approval on-request
+codex-statusline
+codex-statusline --sandbox read-only --ask-for-approval on-request
 ```
 
-`codex-cockpit` launches Codex in tmux with a fixed bottom pane matching the
+`codex-statusline` launches Codex in tmux with a fixed bottom pane matching the
 multi-line Claude Code status view. It shows the current model, elapsed time,
 account, repository, context use, 5-hour and weekly limits, tokens, agents, and
 running tools. It binds each footer to the rollout file opened by its owning Codex
 process, so concurrent and resumed sessions do not exchange context values. Mouse
 wheel scrollback is enabled with a 100,000-line history; tune it with
-`CODEX_COCKPIT_HISTORY_LIMIT`. When launched inside an existing tmux pane, that
+`CODEX_STATUSLINE_HISTORY_LIMIT`. When launched inside an existing tmux pane, that
 pane keeps the history depth it was created with; the session `mouse` and window
-`history-limit` options are restored when the cockpit exits. When launched outside
+`history-limit` options are restored when the launcher exits. When launched outside
 tmux, detaching (prefix d) leaves Codex running — reattach with
-`tmux attach -t codex-cockpit-<pid>`; the session ends when Codex exits.
+`tmux attach -t codex-statusline-<pid>`; the session ends when Codex exits.
+
+The footer refreshes every 3s (`CODEX_STATUSLINE_INTERVAL`) and backs off to a
+30s poll once its session has been idle for 10 minutes, exits when the owning
+process is gone, and opportunistically truncates `state_5.sqlite`'s WAL when it
+grows past 128 MB — long-lived footers previously starved SQLite checkpoints
+until every Codex query slowed to a crawl. The old `CODEX_COCKPIT_*` variable
+names still work as fallbacks.
 
 The launcher defaults to Codex YOLO mode by passing
 `--dangerously-bypass-approvals-and-sandbox`. An explicit `-a/--ask-for-approval`,
 `-s/--sandbox`, or dangerous-bypass flag replaces that default; profile (`-p`) or
 `-c` approval overrides do not. Set
-`CODEX_COCKPIT_MANAGE_APPROVALS=0` to pass no permission default. Cockpit also uses
+`CODEX_STATUSLINE_MANAGE_APPROVALS=0` to pass no permission default. The launcher also uses
 `tui.status_line=[]` so Codex keeps only its compact built-in prompt footer while
 the detailed dashboard stays in the fixed pane.
 Settings load from `${CODEX_HOME:-~/.codex}/statusline.conf`; non-empty environment
@@ -86,8 +93,8 @@ different file.
 `codex-top` is the live fleet view for parent and subagent sessions. Both views
 read `~/.codex/state_5.sqlite` and rollout JSONL files locally; neither calls an
 API. Use `codex-watch --details` for expanded session details or
-`codex-statusline --json` for a machine-readable snapshot. `codex-top` monitors existing sessions; Codex
-launch flags belong on `codex-cockpit`.
+`codex-statusline --json` for a machine-readable snapshot (renderer-only first flags
+dispatch to the renderer; anything else launches Codex). `codex-top` monitors existing sessions.
 
 ---
 
