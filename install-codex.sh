@@ -30,7 +30,7 @@ elif ! command -v codex >/dev/null 2>&1; then
 fi
 
 mkdir -p "$BIN_DIR"
-for name in codex-cockpit codex-config.sh codex-statusline codex-top codex-watch codex_statusline.py; do
+for name in codex-config.sh codex-statusline codex-top codex-watch codex_statusline.py; do
     target="$BIN_DIR/$name"
     if [ -e "$target" ] && [ "$(readlink "$target" 2>/dev/null || true)" != "$SRC_DIR/bin/$name" ]; then
         printf "Skipping %s: existing file is not managed by this repo (remove it and re-run)\n" "$target" >&2
@@ -45,6 +45,6 @@ fi
 
 printf "Installed Codex monitor commands in %s\n" "$BIN_DIR"
 case ":$PATH:" in
-    *":$BIN_DIR:"*) printf "Run: codex-cockpit\n" ;;
-    *) printf "Run: %s/codex-cockpit (add %s to PATH for the short command)\n" "$BIN_DIR" "$BIN_DIR" ;;
+    *":$BIN_DIR:"*) printf "Run: codex-statusline\n" ;;
+    *) printf "Run: %s/codex-statusline (add %s to PATH for the short command)\n" "$BIN_DIR" "$BIN_DIR" ;;
 esac

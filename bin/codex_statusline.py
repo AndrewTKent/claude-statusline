@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import closing
 import json
 import os
 import re
@@ -222,6 +223,67 @@ def sqlite_connect(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.2)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+IDLE_AFTER_SECONDS = 600
+IDLE_POLL_SECONDS = 30.0
+WAL_GUARD_BYTES = 128 * 1024 * 1024
+WAL_GUARD_MIN_INTERVAL_SECONDS = 60.0
+
+
+def next_sleep_seconds(interval: float, latest_activity_ms: int, now_ms: int) -> float:
+    # Idle sessions back off so forgotten watchers can't starve WAL checkpoints.
+    if latest_activity_ms and now_ms - latest_activity_ms > IDLE_AFTER_SECONDS * 1000:
+        return max(IDLE_POLL_SECONDS, interval)
+    return max(0.5, interval)
+
+
+def owner_alive(owner_pid_file: str) -> bool:
+    """False only for a readable pid whose process is gone; missing/partial files
+    stay True because the launcher writes the pid after the footer pane starts."""
+    try:
+        pid = int(Path(owner_pid_file).read_text().strip())
+    except (OSError, ValueError):
+        return True
+    if pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def maybe_checkpoint_wal(
+    db_path: Path,
+    *,
+    last_attempt: float,
+    now: float,
+    threshold_bytes: int = WAL_GUARD_BYTES,
+) -> float:
+    """Best-effort TRUNCATE checkpoint once the WAL passes the threshold.
+
+    Codex's own passive checkpoints starve under overlapping readers; left alone
+    the WAL grows without bound and every query slows (observed 727 MB)."""
+    wal = Path(f"{db_path}-wal")
+    try:
+        size = wal.stat().st_size
+    except OSError:
+        return last_attempt
+    if size < threshold_bytes or now - last_attempt < WAL_GUARD_MIN_INTERVAL_SECONDS:
+        return last_attempt
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=rw", uri=True, timeout=0.2)
+        try:
+            conn.execute("PRAGMA busy_timeout=200")
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        pass
+    return now
 
 
 THREAD_COLUMNS = (
@@ -1243,7 +1305,7 @@ def snapshot(args: argparse.Namespace) -> dict[str, Any]:
     if not STATE_DB.exists():
         raise RuntimeError(f"missing Codex state database: {STATE_DB}")
 
-    with sqlite_connect(STATE_DB) as conn:
+    with closing(sqlite_connect(STATE_DB)) as conn:
         if not thread_id and args.owner_pid_file:
             thread_id = select_owner_thread_id(conn, args.owner_pid_file)
             if not thread_id:
@@ -1296,7 +1358,7 @@ def all_sessions_snapshot(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError(f"missing Codex state database: {STATE_DB}")
 
     now = datetime.now(timezone.utc)
-    with sqlite_connect(STATE_DB) as conn:
+    with closing(sqlite_connect(STATE_DB)) as conn:
         if args.top and not args.show_inactive and not args.include_archived:
             threads = select_top_threads(conn, args.sessions)
         else:
@@ -1743,11 +1805,22 @@ def watch(args: argparse.Namespace, p: Palette) -> int:
 
 
 def watch_loop(args: argparse.Namespace, p: Palette) -> int:
+    wal_attempt = 0.0
     while True:
+        latest_activity_ms = 0
         try:
+            if args.owner_pid_file and not owner_alive(args.owner_pid_file):
+                return 0
             if args.dynamic_width:
                 args.width = terminal_size().columns
             data = all_sessions_snapshot(args) if args.all or args.top else snapshot(args)
+            if args.all or args.top:
+                latest_activity_ms = max(
+                    (int(s.get("updated_at") or 0) for s in data.get("sessions") or []),
+                    default=0,
+                )
+            else:
+                latest_activity_ms = int(data.get("updated_at") or 0)
             if (
                 (args.bind_after or args.bind_after_ms or args.bind_updated_after_ms)
                 and not args.owner_pid_file
@@ -1774,8 +1847,15 @@ def watch_loop(args: argparse.Namespace, p: Palette) -> int:
             else:
                 print(f"Codex status unavailable: {exc}")
             sys.stdout.flush()
+        wal_attempt = maybe_checkpoint_wal(
+            STATE_DB, last_attempt=wal_attempt, now=time.monotonic()
+        )
         try:
-            time.sleep(max(0.5, args.watch))
+            time.sleep(
+                next_sleep_seconds(
+                    args.watch, latest_activity_ms, int(time.time() * 1000)
+                )
+            )
         except KeyboardInterrupt:
             print()
             return 0
@@ -1806,7 +1886,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--watch", type=float, default=0.0, metavar="SECONDS", help="refresh in place every N seconds")
     parser.add_argument("--all", action="store_true", help="show a single dashboard for all recent Codex sessions")
     parser.add_argument("--top", action="store_true", help="show a btop/nvitop-style all-session monitor")
-    parser.add_argument("--footer", action="store_true", help="show the compact dashboard used by codex-cockpit")
+    parser.add_argument("--footer", action="store_true", help="show the compact dashboard used by the codex-statusline launcher")
     parser.add_argument("--sessions", type=int, default=30, help="number of sessions to load with --all/--top")
     parser.add_argument("--include-archived", action="store_true", help="include archived sessions in --all")
     parser.add_argument("--details", action="store_true", help="include last prompt and command under each session in --all")
