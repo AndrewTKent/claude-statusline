@@ -207,7 +207,13 @@ if [[ -z "$top_pane" ]] || [[ "$(tmux display-message -p -t "$top_pane" '#{pane_
     exit 1
 fi
 tmux kill-pane -t "$bootstrap_pane"
-tmux split-window -t "$top_pane" -v -l "$FOOTER_HEIGHT" -d -c "$WORKING_DIR" "$FOOTER_COMMAND"
+footer_pane="$(tmux split-window -t "$top_pane" -v -l "$FOOTER_HEIGHT" -d -P -F '#{pane_id}' -c "$WORKING_DIR" "$FOOTER_COMMAND")"
+# The session is created at a guessed size and resized on attach; panes scale
+# proportionally then, so re-pin the footer whenever a client attaches/resizes.
+tmux set-option -t "$SESSION" window-size latest
+tmux set-hook -t "$SESSION" client-attached "resize-pane -t '$footer_pane' -y $FOOTER_HEIGHT"
+tmux set-hook -t "$SESSION" client-resized "resize-pane -t '$footer_pane' -y $FOOTER_HEIGHT"
+tmux set-hook -t "$SESSION" window-resized "resize-pane -t '$footer_pane' -y $FOOTER_HEIGHT"
 tmux select-pane -t "$top_pane"
 tmux respawn-pane -k -t "$top_pane" -c "$WORKING_DIR" "$TOP_COMMAND"
 SETUP_DONE=1
