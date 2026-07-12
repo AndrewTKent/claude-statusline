@@ -1352,8 +1352,8 @@ class CodexStatuslineTest(unittest.TestCase):
             [completed_agent],
         )
 
-    def test_cockpit_defaults_to_yolo_without_overriding_explicit_permissions(self) -> None:
-        cockpit = MODULE_PATH.with_name("codex-cockpit")
+    def test_launcher_defaults_to_yolo_without_overriding_explicit_permissions(self) -> None:
+        cockpit = MODULE_PATH.with_name("codex-statusline")
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             capture = tmp / "args"
@@ -1434,7 +1434,7 @@ class CodexStatuslineTest(unittest.TestCase):
             )
 
     def test_cockpit_loads_config_file(self) -> None:
-        cockpit = MODULE_PATH.with_name("codex-cockpit")
+        cockpit = MODULE_PATH.with_name("codex-statusline")
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             codex_home = tmp / ".codex"
@@ -1494,7 +1494,7 @@ class CodexStatuslineTest(unittest.TestCase):
             self.assertNotIn("--thread-id", latest_split)
 
     def test_cockpit_rejects_zero_interval_and_short_footer(self) -> None:
-        cockpit = MODULE_PATH.with_name("codex-cockpit")
+        cockpit = MODULE_PATH.with_name("codex-statusline")
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             fake_codex = tmp / "codex"
@@ -1531,7 +1531,7 @@ class CodexStatuslineTest(unittest.TestCase):
                     self.assertIn(expected, result.stderr)
 
     def test_cockpit_sizes_detached_session_before_split(self) -> None:
-        cockpit = MODULE_PATH.with_name("codex-cockpit")
+        cockpit = MODULE_PATH.with_name("codex-statusline")
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             capture = tmp / "tmux-args"
@@ -1626,7 +1626,7 @@ class CodexStatuslineTest(unittest.TestCase):
         return env
 
     def test_cockpit_detach_leaves_running_session_alive(self) -> None:
-        cockpit = MODULE_PATH.with_name("codex-cockpit")
+        cockpit = MODULE_PATH.with_name("codex-statusline")
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             capture = tmp / "tmux-args"
@@ -1641,12 +1641,12 @@ class CodexStatuslineTest(unittest.TestCase):
                 text=True,
             )
 
-            self.assertIn("Reattach with: tmux attach -t '=codex-cockpit-", result.stdout)
+            self.assertIn("Reattach with: tmux attach -t '=codex-statusline-", result.stdout)
             self.assertNotIn("kill-session", capture.read_text())
-            self.assertEqual(len(list(tmp.glob("codex-cockpit.*"))), 1)
+            self.assertEqual(len(list(tmp.glob("codex-statusline.*"))), 1)
 
     def test_cockpit_cleans_up_when_session_ends_without_status(self) -> None:
-        cockpit = MODULE_PATH.with_name("codex-cockpit")
+        cockpit = MODULE_PATH.with_name("codex-statusline")
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             capture = tmp / "tmux-args"
@@ -1663,7 +1663,7 @@ class CodexStatuslineTest(unittest.TestCase):
 
             self.assertNotIn("Reattach with", result.stdout)
             self.assertIn("kill-session", capture.read_text())
-            self.assertEqual(list(tmp.glob("codex-cockpit.*")), [])
+            self.assertEqual(list(tmp.glob("codex-statusline.*")), [])
 
     def test_install_codex_respects_custom_codex_home(self) -> None:
         installer = MODULE_PATH.parents[1] / "install-codex.sh"
@@ -1692,8 +1692,76 @@ class CodexStatuslineTest(unittest.TestCase):
 
             self.assertTrue((codex_home / "statusline.conf").is_file())
             self.assertEqual(
-                (home / ".local/bin/codex-cockpit").resolve(),
-                MODULE_PATH.with_name("codex-cockpit"),
+                (home / ".local/bin/codex-statusline").resolve(),
+                MODULE_PATH.with_name("codex-statusline"),
+            )
+
+
+class WatchReliabilityTest(unittest.TestCase):
+    def test_next_sleep_uses_interval_while_active(self) -> None:
+        now_ms = 1_000_000_000_000
+        self.assertEqual(codex_statusline.next_sleep_seconds(3.0, now_ms - 5_000, now_ms), 3.0)
+        self.assertEqual(codex_statusline.next_sleep_seconds(0.1, now_ms - 5_000, now_ms), 0.5)
+        self.assertEqual(codex_statusline.next_sleep_seconds(3.0, 0, now_ms), 3.0)
+
+    def test_next_sleep_backs_off_when_thread_idle(self) -> None:
+        now_ms = 1_000_000_000_000
+        idle_ms = now_ms - (codex_statusline.IDLE_AFTER_SECONDS + 1) * 1000
+        self.assertEqual(
+            codex_statusline.next_sleep_seconds(3.0, idle_ms, now_ms),
+            codex_statusline.IDLE_POLL_SECONDS,
+        )
+        self.assertEqual(
+            codex_statusline.next_sleep_seconds(120.0, idle_ms, now_ms), 120.0
+        )
+
+    def test_owner_alive_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pid_file = Path(tmpdir) / "owner.pid"
+            self.assertTrue(codex_statusline.owner_alive(str(pid_file)))
+            pid_file.write_text("not-a-pid")
+            self.assertTrue(codex_statusline.owner_alive(str(pid_file)))
+            pid_file.write_text(str(os.getpid()))
+            self.assertTrue(codex_statusline.owner_alive(str(pid_file)))
+            proc = subprocess.Popen(["sleep", "0.01"])
+            proc.wait()
+            pid_file.write_text(str(proc.pid))
+            self.assertFalse(codex_statusline.owner_alive(str(pid_file)))
+
+    def test_maybe_checkpoint_wal_truncates_oversized_wal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Path(tmpdir) / "state.sqlite"
+            conn = sqlite3.connect(db)
+            conn.execute("PRAGMA journal_mode=WAL")
+            # The writer stays open, matching production (codex holds its
+            # connection); closing it would checkpoint and delete the WAL.
+            conn.execute("CREATE TABLE t (v BLOB)")
+            for _ in range(50):
+                conn.execute("INSERT INTO t VALUES (?)", (b"x" * 65536,))
+            conn.commit()
+            wal = Path(f"{db}-wal")
+            self.assertGreater(wal.stat().st_size, 0)
+            result = codex_statusline.maybe_checkpoint_wal(
+                db, last_attempt=0.0, now=1000.0, threshold_bytes=1
+            )
+            self.assertEqual(result, 1000.0)
+            self.assertEqual(wal.stat().st_size, 0)
+            conn.close()
+
+    def test_maybe_checkpoint_wal_respects_threshold_and_rate_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Path(tmpdir) / "state.sqlite"
+            self.assertEqual(
+                codex_statusline.maybe_checkpoint_wal(db, last_attempt=0.0, now=10.0),
+                0.0,
+            )
+            wal = Path(f"{db}-wal")
+            wal.write_bytes(b"x" * 10)
+            self.assertEqual(
+                codex_statusline.maybe_checkpoint_wal(
+                    db, last_attempt=990.0, now=1000.0, threshold_bytes=1
+                ),
+                990.0,
             )
 
 
