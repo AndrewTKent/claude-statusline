@@ -66,10 +66,12 @@ account, repository, context use, 5-hour and weekly limits, tokens, agents, and
 running tools. It binds each footer to the rollout file opened by its owning Codex
 process, so concurrent and resumed sessions do not exchange context values. Mouse
 wheel scrollback is enabled with a 100,000-line history; tune it with
-`CODEX_STATUSLINE_HISTORY_LIMIT`. When launched inside an existing tmux pane, that
-pane keeps the history depth it was created with; the session `mouse` and window
-`history-limit` options are restored when the launcher exits. When launched outside
-tmux, detaching (prefix d) leaves Codex running — reattach with
+`CODEX_STATUSLINE_HISTORY_LIMIT`. Mouse-dragging output selects it in tmux and
+copies it to the system clipboard on release in OSC 52-capable terminals
+(iTerm2, kitty, WezTerm — not stock macOS Terminal.app). When launched inside an existing
+tmux pane, that pane keeps the history depth it was created with; the session
+`mouse` and window `history-limit` options are restored when the launcher exits.
+When launched outside tmux, detaching (prefix d) leaves Codex running — reattach with
 `tmux attach -t codex-statusline-<pid>`; the session ends when Codex exits.
 
 The footer refreshes every 3s (`CODEX_STATUSLINE_INTERVAL`) and backs off to a
