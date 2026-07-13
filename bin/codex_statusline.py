@@ -1249,6 +1249,53 @@ def render_rate_limit_row(label: str, limit: dict[str, Any], width: int, p: Pale
     return f"{' ' * indent}{label:<7} {bar} {format_pct(used_percent).ljust(7)} {reset}"
 
 
+def rate_limit_window_label(window_minutes: Any, fallback: str) -> str:
+    if window_minutes is None:
+        return fallback
+    if isinstance(window_minutes, bool):
+        return "limit"
+    if isinstance(window_minutes, int):
+        minutes = window_minutes
+    elif isinstance(window_minutes, float):
+        if not window_minutes.is_integer():
+            return "limit"
+        minutes = int(window_minutes)
+    elif isinstance(window_minutes, str):
+        try:
+            minutes = int(window_minutes)
+        except ValueError:
+            return "limit"
+    else:
+        return "limit"
+
+    if minutes <= 0:
+        return "limit"
+    if minutes == 300:
+        return "5-hour"
+    if minutes == 10_080:
+        return "weekly"
+    if minutes % 1_440 == 0:
+        return f"{minutes // 1_440}-day"
+    if minutes % 60 == 0:
+        return f"{minutes // 60}-hour"
+    return f"{minutes}-minute"
+
+
+def labeled_rate_limits(rate_limits: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    limits = []
+    seen_labels = set()
+    for key, fallback_label in (("primary", "5-hour"), ("secondary", "weekly")):
+        limit = rate_limits.get(key)
+        if not isinstance(limit, dict) or limit.get("used_percent") is None:
+            continue
+        label = rate_limit_window_label(limit.get("window_minutes"), fallback_label)
+        if label in seen_labels:
+            continue
+        seen_labels.add(label)
+        limits.append((label, limit))
+    return limits
+
+
 def snapshot_for_thread(
     thread: Thread,
     tokens: TokenSummary,
@@ -1426,12 +1473,8 @@ def render_default(data: dict[str, Any], width: int, p: Palette) -> str:
     if usage["context_window"] > 0:
         lines.append(render_goal_row("context", usage["context_used"], usage["context_window"], DEFAULT_BAR_WIDTH, p))
 
-    primary = rate_limits.get("primary") if isinstance(rate_limits.get("primary"), dict) else {}
-    secondary = rate_limits.get("secondary") if isinstance(rate_limits.get("secondary"), dict) else {}
-    if primary:
-        lines.append(render_rate_limit_row("5-hour", primary, DEFAULT_BAR_WIDTH, p))
-    if secondary:
-        lines.append(render_rate_limit_row("weekly", secondary, DEFAULT_BAR_WIDTH, p))
+    for label, limit in labeled_rate_limits(rate_limits):
+        lines.append(render_rate_limit_row(label, limit, DEFAULT_BAR_WIDTH, p))
 
     lines.extend(
         [
@@ -1453,8 +1496,10 @@ def render_sigil(data: dict[str, Any], p: Palette) -> str:
     usage = data["usage"]
     activity = data["activity"]
     rate_limits = usage.get("rate_limits") or {}
-    primary = rate_limits.get("primary") if isinstance(rate_limits.get("primary"), dict) else {}
-    pct = float(primary.get("used_percent") or 0.0)
+    limits = labeled_rate_limits(rate_limits)
+    limit_label, limit = limits[0] if limits else ("5-hour", {})
+    short_limit_label = {"5-hour": "5h", "weekly": "wk"}.get(limit_label, limit_label)
+    pct = float(limit.get("used_percent") or 0.0)
     bar = build_pct_bar(pct, 10, p)
     effort = f".{data['reasoning_effort']}" if data["reasoning_effort"] else ""
     context = "-"
@@ -1462,7 +1507,7 @@ def render_sigil(data: dict[str, Any], p: Palette) -> str:
         context = f"{format_tokens(usage['context_used'])}/{format_tokens(usage['context_window'])}"
     return (
         f"◈ {data['model_display']}{effort} · {data['repo']} ({data['branch']}) · "
-        f"{bar} {format_pct(pct)} 5h · context {context} · session {format_tokens(usage['session_total'])} · "
+        f"{bar} {format_pct(pct)} {short_limit_label} · context {context} · session {format_tokens(usage['session_total'])} · "
         f"tools {activity['active_tools']} · ⏱ {format_duration(data['session_age_seconds'])}"
     )
 
@@ -1473,8 +1518,6 @@ def render_footer(data: dict[str, Any], width: int, p: Palette) -> str:
     agents = data.get("agents") or {}
     tokens = data["tokens"]
     rate_limits = usage.get("rate_limits") or {}
-    primary = rate_limits.get("primary") if isinstance(rate_limits.get("primary"), dict) else {}
-    secondary = rate_limits.get("secondary") if isinstance(rate_limits.get("secondary"), dict) else {}
 
     def row(label: str, value: str) -> str:
         prefix = f"  {label:<7} "
@@ -1500,16 +1543,11 @@ def render_footer(data: dict[str, Any], width: int, p: Palette) -> str:
                     f"{format_pct(context_pct)} {format_tokens(usage['context_used'])}/{format_tokens(usage['context_window'])}",
                 )
             )
-    if primary:
+    for label, limit in labeled_rate_limits(rate_limits):
         if width >= 64:
-            lines.append(render_rate_limit_row("5-hour", primary, DEFAULT_BAR_WIDTH, p, 2))
+            lines.append(render_rate_limit_row(label, limit, DEFAULT_BAR_WIDTH, p, 2))
         else:
-            lines.append(row("5-hour", f"{format_pct(float(primary.get('used_percent') or 0.0))} {format_reset(primary.get('resets_at'))}"))
-    if secondary:
-        if width >= 64:
-            lines.append(render_rate_limit_row("weekly", secondary, DEFAULT_BAR_WIDTH, p, 2))
-        else:
-            lines.append(row("weekly", f"{format_pct(float(secondary.get('used_percent') or 0.0))} {format_reset(secondary.get('resets_at'))}"))
+            lines.append(row(label, f"{format_pct(float(limit.get('used_percent') or 0.0))} {format_reset(limit.get('resets_at'))}"))
 
     lines.extend(
         [
@@ -1582,12 +1620,8 @@ def render_all_sessions(data: dict[str, Any], width: int, p: Palette, details: b
         f"        account  {data['account']}",
         f"        sessions {len(sessions)} shown · active {active_turns} · tools {active_tools} · shells {active_shells} · tokens {format_tokens(total_tokens)}",
     ]
-    primary = rate_limits.get("primary") if isinstance(rate_limits.get("primary"), dict) else {}
-    secondary = rate_limits.get("secondary") if isinstance(rate_limits.get("secondary"), dict) else {}
-    if primary:
-        lines.append(render_rate_limit_row("5-hour", primary, DEFAULT_BAR_WIDTH, p))
-    if secondary:
-        lines.append(render_rate_limit_row("weekly", secondary, DEFAULT_BAR_WIDTH, p))
+    for label, limit in labeled_rate_limits(rate_limits):
+        lines.append(render_rate_limit_row(label, limit, DEFAULT_BAR_WIDTH, p))
     lines.append("        ·")
     lines.append("        # repo             branch         model            context           session    turn    tools state")
 
@@ -1674,12 +1708,9 @@ def render_top(data: dict[str, Any], args: argparse.Namespace, p: Palette) -> st
     hidden = max(0, len(sessions) - max_rows)
     sessions = sessions[:max_rows]
     rate_limits = data.get("rate_limits") or {}
-    primary = rate_limits.get("primary") if isinstance(rate_limits.get("primary"), dict) else {}
-    secondary = rate_limits.get("secondary") if isinstance(rate_limits.get("secondary"), dict) else {}
+    limits = labeled_rate_limits(rate_limits)
 
     now_text = datetime.now().astimezone().strftime("%H:%M:%S %Z")
-    five_hour = float(primary.get("used_percent") or 0.0)
-    weekly = float(secondary.get("used_percent") or 0.0)
     wide = width >= 132
     medium = width >= 78
     rate_width = 24 if width >= 72 else 10
@@ -1703,13 +1734,15 @@ def render_top(data: dict[str, Any], args: argparse.Namespace, p: Palette) -> st
     else:
         columns = f"{'ST':<5} {'AGENT':<14} {'CTX':>6} {'SESSION':>8} {'ACTION':<10}"
 
-    lines = [
-        summary,
-        f"5h [{build_pct_bar(five_hour, rate_width, p)}] {format_pct(five_hour):>6} {format_reset(primary.get('resets_at')) if primary else 'reset n/a'}",
-        f"wk [{build_pct_bar(weekly, rate_width, p)}] {format_pct(weekly):>6} {format_reset(secondary.get('resets_at')) if secondary else 'reset n/a'}",
-        "─" * min(width, 140),
-        columns,
-    ]
+    lines = [summary]
+    for label, limit in limits:
+        short_label = {"5-hour": "5h", "weekly": "wk"}.get(label, label)
+        used_percent = float(limit.get("used_percent") or 0.0)
+        lines.append(
+            f"{short_label} [{build_pct_bar(used_percent, rate_width, p)}] "
+            f"{format_pct(used_percent):>6} {format_reset(limit.get('resets_at'))}"
+        )
+    lines.extend(["─" * min(width, 140), columns])
 
     for session in sessions:
         usage = session["usage"]

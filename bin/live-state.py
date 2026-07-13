@@ -39,6 +39,53 @@ AGENT_SESSIONS = HOME / ".agent-runner" / "sessions.jsonl"
 WINDOW_5H_SECS = 5 * 60 * 60
 
 
+def rate_limit_window_label(window_minutes: object, fallback: str) -> str:
+    if window_minutes is None:
+        return fallback
+    if isinstance(window_minutes, bool):
+        return "limit"
+    if isinstance(window_minutes, int):
+        minutes = window_minutes
+    elif isinstance(window_minutes, float):
+        if not window_minutes.is_integer():
+            return "limit"
+        minutes = int(window_minutes)
+    elif isinstance(window_minutes, str):
+        try:
+            minutes = int(window_minutes)
+        except ValueError:
+            return "limit"
+    else:
+        return "limit"
+
+    if minutes <= 0:
+        return "limit"
+    if minutes == 300:
+        return "5-hour"
+    if minutes == 10_080:
+        return "weekly"
+    if minutes % 1_440 == 0:
+        return f"{minutes // 1_440}-day"
+    if minutes % 60 == 0:
+        return f"{minutes // 60}-hour"
+    return f"{minutes}-minute"
+
+
+def labeled_rate_limits(rate_limits: dict) -> list[tuple[str, dict]]:
+    limits = []
+    seen_labels = set()
+    for key, fallback_label in (("primary", "5-hour"), ("secondary", "weekly")):
+        limit = rate_limits.get(key)
+        if not isinstance(limit, dict) or limit.get("used_percent") is None:
+            continue
+        label = rate_limit_window_label(limit.get("window_minutes"), fallback_label)
+        if label in seen_labels:
+            continue
+        seen_labels.add(label)
+        limits.append((label, limit))
+    return limits
+
+
 def emit(key: str, value: object) -> None:
     """Print a shell-safe KEY=VALUE line. Skips empty values."""
     if value is None or value == "":
@@ -76,17 +123,27 @@ def collect() -> dict:
             summary = json.loads(CLAUDE_TOKEN_SUMMARY.read_text())
             codex_block = summary.get("codex") or {}
             rl = codex_block.get("rate_limit") or {}
-            primary = rl.get("primary") or {}
-            secondary = rl.get("secondary") or {}
-            if primary.get("used_percent") is not None:
+            limits = labeled_rate_limits(rl)
+            if limits:
                 codex_state = {
-                    "rate_limit_5h_pct": primary.get("used_percent"),
-                    "rate_limit_5h_resets_at": primary.get("resets_at"),
-                    "rate_limit_7d_pct": secondary.get("used_percent"),
-                    "rate_limit_7d_resets_at": secondary.get("resets_at"),
+                    "rate_limits": [
+                        {
+                            "label": label,
+                            "used_percent": limit.get("used_percent"),
+                            "resets_at": limit.get("resets_at"),
+                        }
+                        for label, limit in limits
+                    ],
                     "plan_type": rl.get("plan_type"),
                     "session_count": codex_block.get("session_count", 0),
                 }
+                for label, limit in limits:
+                    if label == "5-hour":
+                        codex_state["rate_limit_5h_pct"] = limit.get("used_percent")
+                        codex_state["rate_limit_5h_resets_at"] = limit.get("resets_at")
+                    elif label == "weekly":
+                        codex_state["rate_limit_7d_pct"] = limit.get("used_percent")
+                        codex_state["rate_limit_7d_resets_at"] = limit.get("resets_at")
         except (OSError, json.JSONDecodeError):
             pass
     # Fallback: raw 5h token sum from sqlite when engine summary is missing.
@@ -155,6 +212,10 @@ def render_kv(state: dict) -> None:
         emit("claude_account_count", c.get("account_count"))
     if "codex" in state:
         c = state["codex"]
+        for index, limit in enumerate(c.get("rate_limits") or [], start=1):
+            emit(f"codex_rate_limit_{index}_label", limit.get("label"))
+            emit(f"codex_rate_limit_{index}_pct", limit.get("used_percent"))
+            emit(f"codex_rate_limit_{index}_resets_at", limit.get("resets_at"))
         # Engine-derived (preferred)
         emit("codex_rate_limit_5h_pct", c.get("rate_limit_5h_pct"))
         emit("codex_rate_limit_5h_resets_at", c.get("rate_limit_5h_resets_at"))
@@ -191,7 +252,15 @@ def render_line(state: dict) -> str:
         parts.append(f"claude 5h: {c['worst_5h_pct']}%")
     if "codex" in state:
         c = state["codex"]
-        if c.get("rate_limit_5h_pct") is not None:
+        limits = c.get("rate_limits") or []
+        if limits:
+            rendered_limits = []
+            for limit in limits:
+                label = {"5-hour": "5h", "weekly": "7d"}.get(limit["label"], limit["label"])
+                used_percent = int(round(float(limit["used_percent"])))
+                rendered_limits.append(f"{label}: {used_percent}%")
+            parts.append("codex " + " · ".join(rendered_limits))
+        elif c.get("rate_limit_5h_pct") is not None:
             five = int(round(float(c["rate_limit_5h_pct"])))
             week = c.get("rate_limit_7d_pct")
             if week is not None:
