@@ -1214,6 +1214,116 @@ class CodexStatuslineTest(unittest.TestCase):
         tiny_lines = codex_statusline.render_footer(data, 8, codex_statusline.Palette(False)).splitlines()
         self.assertTrue(all(len(line) <= 8 for line in tiny_lines))
 
+    def test_render_footer_labels_weekly_only_primary_by_window(self) -> None:
+        data = {
+            "model_display": "GPT-5.6",
+            "reasoning_effort": "max",
+            "session_age_seconds": 180,
+            "account": "andrew@example.com",
+            "repo": "statusline",
+            "branch": "main",
+            "tokens": {"today": 0, "lifetime": 0},
+            "usage": {
+                "context_window": 0,
+                "session_total": 0,
+                "rate_limits": {
+                    "primary": {
+                        "used_percent": 96.0,
+                        "window_minutes": 10_080,
+                        "resets_at": 1784487602,
+                    },
+                    "secondary": {},
+                },
+            },
+            "activity": {"active_tools": 0, "active_shells": 0},
+        }
+
+        rendered = codex_statusline.render_footer(data, 100, codex_statusline.Palette(False))
+
+        self.assertIn("weekly", rendered)
+        self.assertNotIn("5-hour", rendered)
+
+    def test_labeled_rate_limits_uses_reported_window(self) -> None:
+        cases = (
+            (300, "5-hour"),
+            (10_080, "weekly"),
+            ("10080", "weekly"),
+            (1_440, "1-day"),
+            (60, "1-hour"),
+            (90, "90-minute"),
+            (True, "limit"),
+            (1_440.5, "limit"),
+        )
+        for window_minutes, expected in cases:
+            with self.subTest(window_minutes=window_minutes):
+                limits = codex_statusline.labeled_rate_limits(
+                    {"primary": {"used_percent": 10, "window_minutes": window_minutes}}
+                )
+                self.assertEqual(limits[0][0], expected)
+
+        fallback_limits = codex_statusline.labeled_rate_limits(
+            {
+                "primary": {"used_percent": 10},
+                "secondary": {"used_percent": 20},
+            }
+        )
+        self.assertEqual([label for label, _ in fallback_limits], ["5-hour", "weekly"])
+
+    def test_labeled_rate_limits_skips_percentless_bucket(self) -> None:
+        limits = codex_statusline.labeled_rate_limits(
+            {
+                "primary": {"used_percent": None, "window_minutes": 10_080},
+                "secondary": {"used_percent": 50, "window_minutes": 10_080},
+            }
+        )
+
+        self.assertEqual(limits, [("weekly", {"used_percent": 50, "window_minutes": 10_080})])
+
+    def test_labeled_rate_limits_keeps_first_duplicate_window(self) -> None:
+        limits = codex_statusline.labeled_rate_limits(
+            {
+                "primary": {"used_percent": 10, "window_minutes": 10_080},
+                "secondary": {"used_percent": 20, "window_minutes": 10_080},
+            }
+        )
+
+        self.assertEqual(len(limits), 1)
+        self.assertEqual(limits[0][1]["used_percent"], 10)
+
+    def test_live_state_labels_weekly_only_primary_by_window(self) -> None:
+        live_state = MODULE_PATH.with_name("live-state.py")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            claude_home = home / ".claude"
+            claude_home.mkdir()
+            (claude_home / "token-scan-summary.json").write_text(
+                json.dumps(
+                    {
+                        "codex": {
+                            "rate_limit": {
+                                "primary": {
+                                    "used_percent": 96.0,
+                                    "window_minutes": 10_080,
+                                    "resets_at": 1_784_487_602,
+                                },
+                                "secondary": None,
+                            }
+                        }
+                    }
+                )
+            )
+
+            result = subprocess.run(
+                [sys.executable, str(live_state), "--render"],
+                check=True,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "HOME": str(home)},
+            )
+
+        self.assertIn("codex 7d: 96%", result.stdout)
+        self.assertNotIn("codex 5h:", result.stdout)
+
     def test_watch_refreshes_footer_width_from_terminal(self) -> None:
         args = codex_statusline.parse_args(["--footer", "--watch", "1"])
         widths = []
