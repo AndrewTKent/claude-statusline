@@ -1690,13 +1690,15 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
              (.value.five_hour_reset // ""),
              (.value.five_hour_pct // 0 | tostring),
              (.value.seven_day_reset // ""),
-             (.value.seven_day_pct // 0 | tostring)] |
+             (.value.seven_day_pct // 0 | tostring),
+             (.value.fable_reset // ""),
+             (.value.fable_pct // "" | tostring)] |
             join("")' "$ledger_file" 2>/dev/null)
         if [ -n "$entries" ]; then
             # Parse + compute projected epochs, find soonest
             parsed=""
             soonest_epoch=""
-            while IFS=$'\x1f' read -r em uuid iso pct seven_day_iso weekly_pct_ledger; do
+            while IFS=$'\x1f' read -r em uuid iso pct seven_day_iso weekly_pct_ledger fbl_iso fable_pct_ledger; do
                 [ -z "$em" ] && continue
                 ep=""
                 # pct_state: ok = use stored pct; reset = fresh window, show 0%;
@@ -1724,7 +1726,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     fi
                 fi
                 tag=$(resolve_account_label "$em" "$uuid")
-                parsed+="${em}|${uuid}|${tag}|${ep}|${pct}|${pct_state}|${seven_day_iso}|${weekly_pct_ledger}"$'\n'
+                parsed+="${em}|${uuid}|${tag}|${ep}|${pct}|${pct_state}|${seven_day_iso}|${weekly_pct_ledger}|${fbl_iso}|${fable_pct_ledger}"$'\n'
                 if [ -n "$ep" ]; then
                     if [ -z "$soonest_epoch" ] || [ "$ep" -lt "$soonest_epoch" ] 2>/dev/null; then
                         soonest_epoch="$ep"
@@ -1737,7 +1739,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
             parsed=$(printf '%s' "$parsed" | awk -F'|' 'NF>=8 { key=($4==""?"9999999999":$4); print key"\t"$0 }' | sort -n | cut -f2-)
 
             rendered=""
-            while IFS='|' read -r em uuid tag ep pct pct_state seven_day_iso weekly_pct_ledger; do
+            while IFS='|' read -r em uuid tag ep pct pct_state seven_day_iso weekly_pct_ledger fbl_iso fable_pct_ledger; do
                 [ -z "$em" ] && continue
                 # Match the active account on (email, org_uuid). Legacy ledger
                 # entries with empty uuid only match when ACCT_ORG_UUID is also
@@ -1928,6 +1930,27 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 fi
                 weekly_seg="${weekly_color}$(_ralign "$wk_raw" 4)${reset}"
 
+                # Per-account fable (weekly-scoped) util column. Mirrors weekly:
+                # current account uses the live value, others the ledger
+                # snapshot; an elapsed reset or absent data shows "—".
+                if [ "$is_current" = "1" ] && [ -n "${fable_pct_raw:-}" ]; then
+                    fable_disp="$fable_pct_raw"
+                else
+                    fable_disp="${fable_pct_ledger:-}"
+                fi
+                fable_state="ok"
+                if [ -n "$fbl_iso" ] && [ "$fbl_iso" != "null" ]; then
+                    fbl_ep=$(iso_to_epoch "$fbl_iso")
+                    [ -n "$fbl_ep" ] && [ "$fbl_ep" -le "$now_ar" ] 2>/dev/null && fable_state="unknown"
+                fi
+                if [ "$fable_state" = "unknown" ] || [ -z "$fable_disp" ]; then
+                    fable_color="$dim"; fb_raw="—"
+                else
+                    fable_int=$(printf "%.0f" "$fable_disp" 2>/dev/null || echo 0)
+                    fable_color=$(color_for_pct "$fable_int"); fb_raw="${fable_int}%"
+                fi
+                fable_seg="${fable_color}$(_ralign "$fb_raw" 5)${reset}"
+
                 # Hours-to-reset (computed from ep above, if known).
                 _now_ep=$(date +%s)
                 if [ -n "$ep" ]; then
@@ -2015,7 +2038,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 # Weekly-capped accounts are unusable regardless of 5h state — dim the name.
                 name_color="$white"
                 [ "$weekly_int" -ge 100 ] 2>/dev/null && name_color="$dim"
-                row_line="${marker}${name_color}$(_pad_to_cols "$display_name" 9)${reset} ${pct_color}$(_ralign "$pct_raw" 4)${reset}  ${dim}$(_ralign "$five_reset_rel" 6)${reset}   ${weekly_seg}  ${dim}$(_ralign "$wk_reset_rel" 6)${reset}"
+                row_line="${marker}${name_color}$(_pad_to_cols "$display_name" 9)${reset} ${pct_color}$(_ralign "$pct_raw" 4)${reset}  ${dim}$(_ralign "$five_reset_rel" 6)${reset}   ${weekly_seg}   ${fable_seg}  ${dim}$(_ralign "$wk_reset_rel" 6)${reset}"
                 # Annotate with hard-wall warning when applicable. (Windfall
                 # is implicit from the hrs_col — no extra note needed.)
                 if [ "$has_wall" = "1" ]; then
@@ -2221,7 +2244,7 @@ render_default() {
         [ -n "$backends_line" ] && printf "\n${white}$(printf "%-7s" "stack")${reset} ${dim}%s${reset}" "$backends_line"
     fi
     if [ -n "$FINAL_ACCOUNT_ROWS" ]; then
-        _acct_header="  $(_pad_to_cols "acct" 9) $(_ralign "5h" 4)  $(_ralign "reset" 6)   $(_ralign "wk" 4)  $(_ralign "reset" 6)"
+        _acct_header="  $(_pad_to_cols "acct" 9) $(_ralign "5h" 4)  $(_ralign "reset" 6)   $(_ralign "wk" 4)   $(_ralign "fable" 5)  $(_ralign "reset" 6)"
         printf "\n${dim}%s${reset}%b" "$_acct_header" "$FINAL_ACCOUNT_ROWS"
     fi
 }
