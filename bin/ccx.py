@@ -486,6 +486,115 @@ def log_line(msg: str) -> None:
         pass
 
 
+def _perform_switch(meta: dict, target_uuid: str, target_entry: dict) -> None:
+    """Slot-swap core. Caller holds the lock and has already parked the current
+    account. Raises CcxError on failure, rolling the slot back first."""
+    target_blob = kc_read(VAULT_SERVICE, target_uuid)
+    if target_blob is None:
+        raise CcxError("vault entry is missing its credential blob")
+
+    old_blob = kc_read(LIVE_SERVICE)
+    acct_attr = kc_live_account_attr()
+    kc_write(LIVE_SERVICE, acct_attr, target_blob)
+    if kc_read(LIVE_SERVICE) != target_blob:
+        if old_blob is not None:
+            kc_write(LIVE_SERVICE, acct_attr, old_blob)
+        raise CcxError("live slot write verification failed; rolled back")
+
+    try:
+        write_claude_json_oauth(target_entry["oauth_account"])
+    except Exception as exc:
+        if old_blob is not None:
+            kc_write(LIVE_SERVICE, acct_attr, old_blob)
+        raise CcxError(f"~/.claude.json update failed ({exc}); live slot rolled back")
+
+    meta["last_live_sha"] = sha256(target_blob)
+    save_meta(meta)
+
+
+def notify(text: str, title: str) -> None:
+    safe = text.replace('"', "'")
+    subprocess.run(
+        ["osascript", "-e", f'display notification "{safe}" with title "{title}"'],
+        capture_output=True,
+        text=True,
+    )
+
+
+def _route_conf() -> dict:
+    def num(name: str, default: float) -> float:
+        raw = os.environ.get(name) or _conf_var(name)
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return default
+
+    return {
+        "disabled": bool(os.environ.get("CCX_ROUTE_DISABLE") or _conf_var("CCX_ROUTE_DISABLE")),
+        "route_at": num("CCX_ROUTE_AT", 90.0),
+        "margin": num("CCX_ROUTE_MARGIN", 10.0),
+        "cooldown_min": num("CCX_ROUTE_COOLDOWN_MIN", 60.0),
+    }
+
+
+def route_decision(
+    rows: list[dict],
+    conf: dict,
+    excludes: set[str],
+    last_route_ts: float | None,
+    now_ts: float,
+) -> dict | None:
+    """Pure auto-route policy: fire only when the active account is nearly burned,
+    a clearly better candidate exists, and we haven't routed recently. Conservative
+    pacing on purpose — rapid account cycling would look like credential abuse."""
+    if conf["disabled"]:
+        return None
+    if last_route_ts is not None and (now_ts - last_route_ts) < conf["cooldown_min"] * 60:
+        return None
+    active = next((r for r in rows if r["active"]), None)
+    if active is None:
+        return None
+    cur = active["effs"]["five_hour"]
+    if cur is None or cur < conf["route_at"]:
+        return None
+    for row in rows:  # rank-sorted best-first
+        if row["uuid"] == active["uuid"] or row["label"] in excludes:
+            continue
+        eff = row["effs"]["five_hour"]
+        if eff is not None and eff <= cur - conf["margin"]:
+            return row
+    return None
+
+
+def maybe_route(meta: dict) -> None:
+    """One auto-route pass. Caller holds the lock; snapshot ran this tick."""
+    # Never route over a cred that isn't provably parked (e.g. attribution failed).
+    blob = kc_read(LIVE_SERVICE)
+    if blob is None or sha256(blob) != meta.get("last_live_sha"):
+        return
+    rows = _account_rows(meta)
+    last_ts = (meta.get("last_auto_route") or {}).get("ts")
+    pick = route_decision(rows, _route_conf(), excluded_labels(), last_ts, time.time())
+    if pick is None:
+        return
+    active = next(r for r in rows if r["active"])
+    _perform_switch(meta, pick["uuid"], meta["accounts"][pick["uuid"]])
+    meta["last_auto_route"] = {
+        "ts": time.time(),
+        "from": active["label"],
+        "to": pick["label"],
+        "from_eff": active["effs"]["five_hour"],
+        "to_eff": pick["effs"]["five_hour"],
+    }
+    save_meta(meta)
+    msg = (
+        f"ROUTED {active['label']} → {pick['label']} "
+        f"(5h {active['effs']['five_hour']:.0f}% → {pick['effs']['five_hour']:.0f}%)"
+    )
+    log_line(msg)
+    notify(f"{active['label']} → {pick['label']}", "ccx routed")
+
+
 # ── commands ──────────────────────────────────────────────────────────────
 
 
@@ -503,12 +612,22 @@ def cmd_enroll(_args) -> None:
 
 
 def cmd_mirror(args) -> None:
-    log_line(f"ccx mirror started (interval {args.interval}s)")
+    conf = _route_conf()
+    pacing = (
+        "routing disabled"
+        if conf["disabled"]
+        else (
+            f"auto-route at ≥{conf['route_at']:.0f}% 5h, margin {conf['margin']:.0f}pt, "
+            f"cooldown {conf['cooldown_min']:.0f}m"
+        )
+    )
+    log_line(f"ccx mirror started (interval {args.interval}s; {pacing})")
     while True:
         try:
             with locked(blocking=False):
                 meta = load_meta()
                 result = snapshot_live(meta)
+                maybe_route(meta)
             if result is not None:
                 uuid, entry = result
                 pairs = load_label_pairs()
@@ -577,6 +696,14 @@ def cmd_ls(_args) -> None:
         )
     print("\n* = matches live slot   ~ = estimate stale (>3h since that account was live)")
     print("pcts are USED (0% = full headroom), reset-aware; sorted best-first")
+    lar = meta.get("last_auto_route")
+    if lar:
+        when = (
+            datetime.fromtimestamp(lar["ts"], tz=timezone.utc)
+            .astimezone()
+            .strftime("%m-%d %H:%M %Z")
+        )
+        print(f"last auto-route: {lar['from']} → {lar['to']} at {when}")
 
 
 def cmd_best(_args) -> None:
@@ -627,27 +754,7 @@ def cmd_switch(args) -> None:
                 "back). Re-run with --force to switch anyway."
             )
 
-        target_blob = kc_read(VAULT_SERVICE, target_uuid)
-        if target_blob is None:
-            die(f"vault entry for {target_label} is missing its credential blob")
-
-        old_blob = kc_read(LIVE_SERVICE)
-        acct_attr = kc_live_account_attr()
-        kc_write(LIVE_SERVICE, acct_attr, target_blob)
-        if kc_read(LIVE_SERVICE) != target_blob:
-            if old_blob is not None:
-                kc_write(LIVE_SERVICE, acct_attr, old_blob)
-            die("live slot write verification failed; rolled back")
-
-        try:
-            write_claude_json_oauth(target_entry["oauth_account"])
-        except Exception as exc:
-            if old_blob is not None:
-                kc_write(LIVE_SERVICE, acct_attr, old_blob)
-            die(f"~/.claude.json update failed ({exc}); live slot rolled back")
-
-        meta["last_live_sha"] = sha256(target_blob)
-        save_meta(meta)
+        _perform_switch(meta, target_uuid, target_entry)
 
     cur_entry = meta["accounts"].get(cur_uuid, {}) if cur_uuid else {}
     cur_label = resolve_label(cur_entry.get("email"), cur_entry.get("org_uuid"), pairs)
