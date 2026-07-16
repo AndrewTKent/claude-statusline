@@ -151,3 +151,62 @@ class TestResolveTarget:
     def test_missing_dies(self):
         with pytest.raises(SystemExit):
             ccx.resolve_target(self.META, "nope", PAIRS)
+
+
+def _row(uuid, label, eff5, active=False):
+    return {
+        "uuid": uuid,
+        "label": label,
+        "active": active,
+        "effs": {"five_hour": eff5, "seven_day": 0.0, "fable": 0.0},
+    }
+
+
+CONF = {"disabled": False, "route_at": 90.0, "margin": 10.0, "cooldown_min": 60.0}
+T0 = 1_784_000_000.0
+
+
+class TestRouteDecision:
+    def test_fires_when_burned_and_better_exists(self):
+        rows = [_row("b", "gmail", 10.0), _row("a", "ymail", 92.0, active=True)]
+        pick = ccx.route_decision(rows, CONF, set(), None, T0)
+        assert pick is not None and pick["uuid"] == "b"
+
+    def test_below_threshold_stays(self):
+        rows = [_row("b", "gmail", 10.0), _row("a", "ymail", 80.0, active=True)]
+        assert ccx.route_decision(rows, CONF, set(), None, T0) is None
+
+    def test_margin_blocks_marginal_wins(self):
+        rows = [_row("b", "gmail", 85.0), _row("a", "ymail", 92.0, active=True)]
+        assert ccx.route_decision(rows, CONF, set(), None, T0) is None
+
+    def test_cooldown_blocks_recent_route(self):
+        rows = [_row("b", "gmail", 10.0), _row("a", "ymail", 92.0, active=True)]
+        assert ccx.route_decision(rows, CONF, set(), T0 - 10 * 60, T0) is None
+
+    def test_cooldown_expiry_fires(self):
+        rows = [_row("b", "gmail", 10.0), _row("a", "ymail", 92.0, active=True)]
+        pick = ccx.route_decision(rows, CONF, set(), T0 - 61 * 60, T0)
+        assert pick is not None and pick["uuid"] == "b"
+
+    def test_excluded_candidate_skipped(self):
+        rows = [
+            _row("b", "alumni", 5.0),
+            _row("c", "gmail", 20.0),
+            _row("a", "ymail", 95.0, active=True),
+        ]
+        pick = ccx.route_decision(rows, CONF, {"alumni"}, None, T0)
+        assert pick is not None and pick["uuid"] == "c"
+
+    def test_disabled(self):
+        rows = [_row("b", "gmail", 10.0), _row("a", "ymail", 92.0, active=True)]
+        conf = dict(CONF, disabled=True)
+        assert ccx.route_decision(rows, conf, set(), None, T0) is None
+
+    def test_no_active_row(self):
+        rows = [_row("b", "gmail", 10.0)]
+        assert ccx.route_decision(rows, CONF, set(), None, T0) is None
+
+    def test_unknown_active_eff_stays(self):
+        rows = [_row("b", "gmail", 10.0), _row("a", "ymail", None, active=True)]
+        assert ccx.route_decision(rows, CONF, set(), None, T0) is None
