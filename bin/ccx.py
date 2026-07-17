@@ -88,6 +88,32 @@ def kc_read(service: str, account: str | None = None) -> str | None:
     return r.stdout.rstrip("\n")
 
 
+def kc_vault_put(account: str, secret: str) -> None:
+    """Write a vault item with an allow-all ACL (`-A`) so ccx reads it back
+    without a keychain prompt — matching the live "Claude Code-credentials"
+    item's posture (a local attacker reads the live token anyway, so gating
+    the copy stricter than the original only adds friction).
+
+    `-A` requires `-w` (argv), which is fine here where `security -i` is not:
+    the value is one exec arg in list form (no shell), well under ARG_MAX, and
+    only ephemerally in `ps` — an acceptable trade for an allow-all item. This
+    also sidesteps the `-i` line-buffer truncation that mangled MCP-bearing
+    blobs. delete-then-add guarantees the ACL even when replacing a
+    previously-restricted item."""
+    subprocess.run(
+        ["security", "delete-generic-password", "-s", VAULT_SERVICE, "-a", account],
+        capture_output=True,
+        text=True,
+    )
+    r = subprocess.run(
+        ["security", "add-generic-password", "-A", "-s", VAULT_SERVICE, "-a", account, "-w", secret],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        raise CcxError(f"vault write failed: {r.stderr.strip()[:200]}")
+
+
 def kc_write(service: str, account: str, secret: str) -> None:
     """Write via the Security framework in-process: no argv (ps-safe) and no
     length limit (real blobs carry MCP OAuth entries and overflow `security -i`)."""
@@ -416,7 +442,7 @@ def snapshot_live(meta: dict, *, force: bool = False) -> tuple[str, dict] | None
     if not uuid:
         raise CcxError("profile response missing account uuid; not vaulting")
 
-    kc_write(VAULT_SERVICE, uuid, blob)
+    kc_vault_put(uuid, blob)
     if kc_read(VAULT_SERVICE, uuid) != blob:
         raise CcxError("vault write verification failed (read-back mismatch)")
 
