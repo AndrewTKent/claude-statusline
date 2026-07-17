@@ -718,18 +718,109 @@ def cmd_poll(_args) -> None:
     print(f"refreshed usage for {n} account(s)")
 
 
-def cmd_mirror(args) -> None:
-    """Capture-only watcher: whenever the live keychain slot changes (you ran
-    /login, switched, or Claude Code rotated the token), vault the account it
-    now holds. Never switches accounts — routing is a manual `ccx switch`.
+def notify(text: str, title: str) -> None:
+    safe = text.replace('"', "'")
+    subprocess.run(
+        ["osascript", "-e", f'display notification "{safe}" with title "{title}"'],
+        capture_output=True,
+        text=True,
+    )
 
-    On a slower sub-cadence (--poll-all-sec, default 120s) it also refreshes the
-    usage board for the non-active accounts so the statusline isn't frozen on
-    them."""
+
+def _route_conf() -> dict:
+    def num(name: str, default: float) -> float:
+        raw = os.environ.get(name) or _conf_var(name)
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return default
+
+    return {
+        "disabled": bool(os.environ.get("CCX_ROUTE_DISABLE") or _conf_var("CCX_ROUTE_DISABLE")),
+        "route_at": num("CCX_ROUTE_AT", 70.0),
+        "margin": num("CCX_ROUTE_MARGIN", 15.0),
+        "cooldown_min": num("CCX_ROUTE_COOLDOWN_MIN", 60.0),
+    }
+
+
+def route_decision(
+    rows: list[dict],
+    conf: dict,
+    excludes: set[str],
+    last_route_ts: float | None,
+    now_ts: float,
+) -> dict | None:
+    """Pure auto-route policy: fire only when the active account is well burned,
+    a clearly better candidate exists, and we haven't routed recently. Cooldown
+    keeps pacing human — rapid account cycling would look like credential abuse."""
+    if conf["disabled"]:
+        return None
+    if last_route_ts is not None and (now_ts - last_route_ts) < conf["cooldown_min"] * 60:
+        return None
+    active = next((r for r in rows if r["active"]), None)
+    if active is None:
+        return None
+    cur = active["effs"]["five_hour"]
+    if cur is None or cur < conf["route_at"]:
+        return None
+    for row in rows:  # rank-sorted best-first
+        if row["uuid"] == active["uuid"] or row["label"] in excludes or row["expired"]:
+            continue
+        eff = row["effs"]["five_hour"]
+        if eff is not None and eff <= cur - conf["margin"]:
+            return row
+    return None
+
+
+def maybe_route(meta: dict) -> None:
+    """One auto-route pass. Caller holds the lock. Rides the 15s poll, so the
+    decision uses a board at most one poll interval old."""
+    # Never route over a cred that isn't provably parked (e.g. attribution failed).
+    blob = kc_read(LIVE_SERVICE)
+    if blob is None or sha256(blob) != meta.get("last_live_sha"):
+        return
+    rows = _account_rows(meta)
+    last_ts = (meta.get("last_auto_route") or {}).get("ts")
+    pick = route_decision(rows, _route_conf(), excluded_labels(), last_ts, time.time())
+    if pick is None:
+        return
+    active = next(r for r in rows if r["active"])
+    _perform_switch(meta, pick["uuid"], meta["accounts"][pick["uuid"]])
+    meta["last_auto_route"] = {
+        "ts": time.time(),
+        "from": active["label"],
+        "to": pick["label"],
+        "from_eff": active["effs"]["five_hour"],
+        "to_eff": pick["effs"]["five_hour"],
+    }
+    save_meta(meta)
+    msg = (
+        f"ROUTED {active['label']} → {pick['label']} "
+        f"(5h {active['effs']['five_hour']:.0f}% → {pick['effs']['five_hour']:.0f}%)"
+    )
+    log_line(msg)
+    notify(f"{active['label']} → {pick['label']}", "ccx routed")
+
+
+def cmd_mirror(args) -> None:
+    """Vault watcher + auto-router. Each tick: capture the live slot if it
+    changed (/login, switch, rotation), refresh the all-account usage board on
+    the poll sub-cadence, then auto-route when the active account is burned and
+    a clearly better one exists (route_decision). CCX_ROUTE_DISABLE=1 makes it
+    capture-only. A route swaps the keychain slot: new sessions land on the
+    target immediately; a running session adopts it at its next token refresh."""
     poll_every = args.poll_all_sec
+    conf = _route_conf()
+    pacing = (
+        "routing disabled"
+        if conf["disabled"]
+        else (
+            f"auto-route at ≥{conf['route_at']:.0f}% 5h, margin {conf['margin']:.0f}pt, "
+            f"cooldown {conf['cooldown_min']:.0f}m"
+        )
+    )
     log_line(
-        f"ccx mirror started (interval {args.interval}s; capture-only; "
-        f"poll-all every {poll_every}s)"
+        f"ccx mirror started (interval {args.interval}s; poll-all every {poll_every}s; {pacing})"
     )
     last_poll = 0.0
     while True:
@@ -757,6 +848,14 @@ def cmd_mirror(args) -> None:
             except Exception as exc:
                 log_line(f"poll-all error: {type(exc).__name__}: {exc}")
             last_poll = time.monotonic()
+
+        try:
+            with locked(blocking=False):
+                maybe_route(load_meta())
+        except BlockingIOError:
+            pass
+        except Exception as exc:
+            log_line(f"route error: {type(exc).__name__}: {exc}")
 
         if args.once:
             return
@@ -832,6 +931,14 @@ def cmd_ls(_args) -> None:
     print("pcts are USED (0% = full headroom), reset-aware; sorted best-first")
     if any_expired:
         print("EXPIRED = vaulted refresh token dead; switch to it needs a fresh /login")
+    lar = meta.get("last_auto_route")
+    if lar:
+        when = (
+            datetime.fromtimestamp(lar["ts"], tz=timezone.utc)
+            .astimezone()
+            .strftime("%m-%d %H:%M %Z")
+        )
+        print(f"last auto-route: {lar['from']} → {lar['to']} at {when}")
 
 
 def cmd_best(_args) -> None:
