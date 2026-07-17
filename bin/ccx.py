@@ -665,6 +665,79 @@ def pick_route(rows: list[dict], vault: dict, excludes: set[str], now_ts: float,
     return None
 
 
+HOUND_HOSTS = ("hound", "hound-ts")
+HOUND_VAULT = "~/.ccx/vault.json"
+
+
+def hound_host(timeout: int = 3) -> str | None:
+    for host in HOUND_HOSTS:
+        r = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={timeout}", host, "true"],
+            capture_output=True,
+        )
+        if r.returncode == 0:
+            return host
+    return None
+
+
+def merge_token_vaults(a: dict, b: dict) -> dict:
+    """Union by label; the newer mint wins. Both sides keep the full set."""
+    out: dict = {"version": 1, "tokens": {}}
+    for src in (a, b):
+        for label, entry in (src.get("tokens") or {}).items():
+            cur = out["tokens"].get(label)
+            if cur is None or entry.get("minted_at", 0) > cur.get("minted_at", 0):
+                out["tokens"][label] = entry
+    return out
+
+
+def sync_with_hound(quiet: bool = False) -> bool:
+    """Converge the token vault with hound: pull, merge (newest mint per label
+    wins), write local, push the merged set back — both machines end up with
+    the full vault. Best-effort: hound unreachable leaves local untouched.
+    Tokens transit ssh stdio only, never argv."""
+    host = hound_host()
+    if host is None:
+        if not quiet:
+            print("hound unreachable — vault stays local-only (run `ccx sync` later)")
+        return False
+    r = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", host, f"cat {HOUND_VAULT} 2>/dev/null || true"],
+        capture_output=True,
+        text=True,
+    )
+    try:
+        remote = json.loads(r.stdout) if r.stdout.strip() else {"version": 1, "tokens": {}}
+    except json.JSONDecodeError:
+        remote = {"version": 1, "tokens": {}}
+    merged = merge_token_vaults(load_token_vault(), remote)
+    save_token_vault(merged)
+    push = subprocess.run(
+        [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            host,
+            f"mkdir -p ~/.ccx && chmod 700 ~/.ccx && cat > {HOUND_VAULT} && chmod 600 {HOUND_VAULT}",
+        ],
+        input=json.dumps(merged, indent=2, sort_keys=True) + "\n",
+        capture_output=True,
+        text=True,
+    )
+    ok = push.returncode == 0
+    if not quiet:
+        if ok:
+            print(f"synced with {host}: {len(merged['tokens'])} token(s) on both sides")
+        else:
+            print(f"pulled from {host} but push failed: {push.stderr.strip()[:120]}")
+    return ok
+
+
+def cmd_sync(_args) -> None:
+    """Converge ~/.ccx/vault.json between this machine and hound."""
+    sync_with_hound()
+
+
 def cmd_mint(args) -> None:
     """Run `claude setup-token` and pipe the minted token straight into the
     vault — it is never displayed and never transits a transcript. The browser
@@ -684,6 +757,7 @@ def cmd_mint(args) -> None:
     }
     save_token_vault(vault)
     print(f"vaulted token for {label} (expires in ~1 year); it was not displayed")
+    sync_with_hound(quiet=False)
 
 
 def cmd_tokens(_args) -> None:
@@ -948,6 +1022,8 @@ def main(argv: list[str] | None = None) -> None:
     p_mint.set_defaults(fn=cmd_mint)
 
     sub.add_parser("tokens", help="list minted tokens and expiry").set_defaults(fn=cmd_tokens)
+
+    sub.add_parser("sync", help="converge the token vault with hound").set_defaults(fn=cmd_sync)
 
     sub.add_parser(
         "pick-env", help="emit env exports for the best routable account (wrapper hook)"
