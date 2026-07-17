@@ -88,7 +88,7 @@ def kc_read(service: str, account: str | None = None) -> str | None:
     return r.stdout.rstrip("\n")
 
 
-def kc_vault_put(account: str, secret: str) -> None:
+def kc_vault_put(account: str, secret: str, service: str = VAULT_SERVICE) -> None:
     """Write a vault item with an allow-all ACL (`-A`) so ccx reads it back
     without a keychain prompt — matching the live "Claude Code-credentials"
     item's posture (a local attacker reads the live token anyway, so gating
@@ -101,12 +101,12 @@ def kc_vault_put(account: str, secret: str) -> None:
     blobs. delete-then-add guarantees the ACL even when replacing a
     previously-restricted item."""
     subprocess.run(
-        ["security", "delete-generic-password", "-s", VAULT_SERVICE, "-a", account],
+        ["security", "delete-generic-password", "-s", service, "-a", account],
         capture_output=True,
         text=True,
     )
     r = subprocess.run(
-        ["security", "add-generic-password", "-A", "-s", VAULT_SERVICE, "-a", account, "-w", secret],
+        ["security", "add-generic-password", "-A", "-s", service, "-a", account, "-w", secret],
         capture_output=True,
         text=True,
     )
@@ -237,6 +237,20 @@ def identity_from_profile(profile: dict) -> dict:
         "org_type": org.get("organization_type"),
         "rate_limit_tier": org.get("rate_limit_tier"),
     }
+
+
+def vault_key(ident: dict) -> str | None:
+    """Vault key = accountUuid|orgUuid. One email can belong to several orgs
+    (e.g. a personal Max plan and a company seat), each with its own org-scoped
+    token — keying on account alone would collide them into one entry."""
+    uuid, org = ident.get("uuid"), ident.get("org_uuid")
+    return f"{uuid}|{org}" if uuid and org else None
+
+
+def short_key(key: str) -> str:
+    """8-char account|org breadcrumb for display (account alone is not unique)."""
+    parts = key.split("|")
+    return "|".join(p[:8] for p in parts)
 
 
 def synthesize_oauth_account(ident: dict, profile: dict | None) -> dict:
@@ -438,17 +452,19 @@ def snapshot_live(meta: dict, *, force: bool = False) -> tuple[str, dict] | None
     if not profile:
         raise CcxError("profile fetch failed; cannot attribute live credential (will retry)")
     ident = identity_from_profile(profile)
-    uuid = ident.get("uuid")
-    if not uuid:
-        raise CcxError("profile response missing account uuid; not vaulting")
+    key = vault_key(ident)
+    if key is None:
+        raise CcxError("profile response missing account/org uuid; not vaulting")
 
-    kc_vault_put(uuid, blob)
-    if kc_read(VAULT_SERVICE, uuid) != blob:
+    kc_vault_put(key, blob)
+    if kc_read(VAULT_SERVICE, key) != blob:
         raise CcxError("vault write verification failed (read-back mismatch)")
 
-    entry = meta["accounts"].get(uuid, {})
+    entry = meta["accounts"].get(key, {})
     oa = read_claude_json().get("oauthAccount") or {}
-    if oa.get("accountUuid") == uuid:
+    # Trust ~/.claude.json's oauthAccount only when it is for this exact
+    # account AND org — one email can hold several org-scoped tokens.
+    if oa.get("accountUuid") == ident["uuid"] and oa.get("organizationUuid") == ident["org_uuid"]:
         entry["oauth_account"] = oa
     elif "oauth_account" not in entry:
         entry["oauth_account"] = synthesize_oauth_account(ident, profile)
@@ -462,10 +478,10 @@ def snapshot_live(meta: dict, *, force: bool = False) -> tuple[str, dict] | None
             "blob_sha256": blob_sha,
         }
     )
-    meta["accounts"][uuid] = entry
+    meta["accounts"][key] = entry
     meta["last_live_sha"] = blob_sha
     save_meta(meta)
-    return uuid, entry
+    return key, entry
 
 
 def resolve_target(meta: dict, needle: str, pairs) -> tuple[str, dict]:
@@ -482,7 +498,10 @@ def resolve_target(meta: dict, needle: str, pairs) -> tuple[str, dict]:
             "it is active) and it will be captured."
         )
     if len(matches) > 1:
-        die(f"'{needle}' is ambiguous across {len(matches)} vaulted accounts; use the uuid")
+        labels = ", ".join(
+            sorted(resolve_label(e.get("email"), e.get("org_uuid"), pairs) for _, e in matches)
+        )
+        die(f"'{needle}' is ambiguous ({len(matches)} accounts share it); use a label: {labels}")
     return matches[0]
 
 
@@ -549,9 +568,9 @@ def cmd_enroll(_args) -> None:
     if result is None:
         print("nothing to enroll")
         return
-    uuid, entry = result
+    key, entry = result
     label = resolve_label(entry.get("email"), entry.get("org_uuid"), pairs)
-    print(f"vaulted {label} ({entry.get('email')}) [{uuid[:8]}]")
+    print(f"vaulted {label} ({entry.get('email')}) [{short_key(key)}]")
 
 
 def cmd_mirror(args) -> None:
@@ -565,10 +584,10 @@ def cmd_mirror(args) -> None:
                 meta = load_meta()
                 result = snapshot_live(meta)
             if result is not None:
-                uuid, entry = result
+                key, entry = result
                 pairs = load_label_pairs()
                 label = resolve_label(entry.get("email"), entry.get("org_uuid"), pairs)
-                log_line(f"vaulted {label} ({entry.get('email')}) [{uuid[:8]}]")
+                log_line(f"vaulted {label} ({entry.get('email')}) [{short_key(key)}]")
         except BlockingIOError:
             pass  # a switch holds the lock; catch the change on the next tick
         except CcxError as exc:
@@ -708,15 +727,17 @@ def cmd_selftest(_args) -> None:
         separators=(",", ":"),
     )
     try:
-        kc_write(SELFTEST_SERVICE, "selftest", fake)
+        # Exercise the real vault write path (allow-all): write, read-back,
+        # overwrite, read-back. Allow-all means the read never prompts.
+        kc_vault_put("selftest", fake, service=SELFTEST_SERVICE)
         first = kc_read(SELFTEST_SERVICE, "selftest")
-        kc_write(SELFTEST_SERVICE, "selftest", fake + "2")  # exercises -U update
+        kc_vault_put("selftest", fake + "2", service=SELFTEST_SERVICE)
         second = kc_read(SELFTEST_SERVICE, "selftest")
     finally:
         kc_delete(SELFTEST_SERVICE, "selftest")
     if first != fake or second != fake + "2":
         die("selftest FAILED: keychain round-trip mismatch")
-    print("selftest OK: keychain write/read/update/delete verified (scratch item only)")
+    print("selftest OK: allow-all vault write/read/overwrite/delete verified (scratch item only)")
 
 
 def main(argv: list[str] | None = None) -> None:
