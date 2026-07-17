@@ -54,6 +54,7 @@ CONF_PATH = HOME / ".claude" / "statusline.conf"
 BACKUP_DIR = HOME / ".claude" / "backups"
 MIRROR_LOG = HOME / ".claude" / "ccx-mirror.log"
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 STALE_AFTER_S = 3 * 3600
 
 
@@ -227,6 +228,22 @@ def blob_refresh_expiry(blob: str) -> int | None:
         return None
 
 
+def blob_access_expiry(blob: str) -> int | None:
+    """Access-token expiry (epoch seconds). A read against /api/oauth/usage
+    needs a live access token — an expired one just 401s, so the poller skips
+    it rather than trigger a refresh (which would rotate the refresh token)."""
+    try:
+        data = json.loads(blob)
+    except json.JSONDecodeError:
+        return None
+    oauth = data.get("claudeAiOauth") if isinstance(data.get("claudeAiOauth"), dict) else data
+    raw = oauth.get("expiresAt") if isinstance(oauth, dict) else None
+    try:
+        return int(raw) // 1000 if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def fetch_profile(access_token: str, timeout: float = 4.0) -> dict | None:
     req = urllib.request.Request(
         PROFILE_URL,
@@ -244,6 +261,58 @@ def fetch_profile(access_token: str, timeout: float = 4.0) -> dict | None:
     except Exception:
         return None
     return data if isinstance(data, dict) and data.get("account") else None
+
+
+def fetch_usage(access_token: str, timeout: float = 4.0) -> dict | None:
+    """GET /api/oauth/usage as a pure read with the account's access token.
+    Returns the parsed usage dict, or None on any failure (401 on an expired
+    access token, network error, bad JSON). Never uses the refresh token, so
+    it can't rotate a shared account's credential."""
+    req = urllib.request.Request(
+        USAGE_URL,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {access_token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": "claude-code/2.1.34",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception:
+        return None
+    return data if isinstance(data, dict) and "five_hour" in data else None
+
+
+def usage_to_reset_row(email: str, org_uuid: str, usage: dict, now_ts: int) -> dict:
+    """Map an /api/oauth/usage response to an account-resets.json row — the
+    exact schema statusline.sh writes for the active account, so a poller-written
+    row is indistinguishable from a statusline-written one."""
+
+    def weekly(field: str):
+        for lim in usage.get("limits") or []:
+            if isinstance(lim, dict) and lim.get("kind") == "weekly_scoped":
+                if field == "label":
+                    return ((lim.get("scope") or {}).get("model") or {}).get("display_name")
+                return lim.get(field)
+        return None
+
+    five = usage.get("five_hour") or {}
+    seven = usage.get("seven_day") or {}
+    return {
+        "email": email,
+        "org_uuid": org_uuid,
+        "five_hour_reset": five.get("resets_at"),
+        "five_hour_pct": five.get("utilization") or 0,
+        "seven_day_reset": seven.get("resets_at"),
+        "seven_day_pct": seven.get("utilization") or 0,
+        "fable_pct": weekly("percent"),
+        "fable_reset": weekly("resets_at"),
+        "fable_label": weekly("label"),
+        "last_seen": now_ts,
+    }
 
 
 def identity_from_profile(profile: dict) -> dict:
@@ -593,11 +662,76 @@ def cmd_enroll(_args) -> None:
     print(f"vaulted {label} ({entry.get('email')}) [{short_key(key)}]")
 
 
+def merge_reset_rows(rows: dict[str, dict]) -> None:
+    """Write freshly-polled rows into account-resets.json, preserving every row
+    we didn't poll. Re-reads under the ccx lock so a concurrent statusline write
+    (its own atomic mv of the active row) is not lost. Atomic rename."""
+    if not rows:
+        return
+    with locked():
+        current = load_resets()
+        current.update(rows)
+        RESETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = RESETS_PATH.with_suffix(".ccx-tmp")
+        tmp.write_text(json.dumps(current, indent=1) + "\n")
+        os.replace(tmp, RESETS_PATH)
+
+
+def poll_all_usage(meta: dict, *, skip_active: bool = True) -> int:
+    """Refresh account-resets.json for every vaulted account with a live access
+    token — the statusline board only auto-polls the active account, so the
+    other rows would otherwise sit frozen. Pure reads (access token only): no
+    refresh, no rotation. Returns the number of rows refreshed.
+
+    The active account is skipped by default: statusline owns its row at 60s
+    with interpolation, and letting each writer own disjoint rows avoids a
+    two-writer fight over the same one."""
+    now = int(time.time())
+    live_sha = meta.get("last_live_sha")
+    fresh: dict[str, dict] = {}
+    for key, entry in meta["accounts"].items():
+        if skip_active and entry.get("blob_sha256") == live_sha:
+            continue
+        blob = kc_read(VAULT_SERVICE, key)
+        if not blob:
+            continue
+        access_exp = blob_access_expiry(blob)
+        if access_exp is not None and now >= access_exp:
+            continue  # expired access token would 401; leave the row reset-aware
+        token = blob_access_token(blob)
+        if not token:
+            continue
+        usage = fetch_usage(token)
+        if usage is None:
+            continue
+        fresh[f"{entry.get('email')}|{entry.get('org_uuid')}"] = usage_to_reset_row(
+            entry.get("email"), entry.get("org_uuid"), usage, now
+        )
+    merge_reset_rows(fresh)
+    return len(fresh)
+
+
+def cmd_poll(_args) -> None:
+    """Refresh the usage board for every vaulted account now (includes the
+    active one, so a manual `ccx poll` fully repaints)."""
+    n = poll_all_usage(load_meta(), skip_active=False)
+    print(f"refreshed usage for {n} account(s)")
+
+
 def cmd_mirror(args) -> None:
     """Capture-only watcher: whenever the live keychain slot changes (you ran
     /login, switched, or Claude Code rotated the token), vault the account it
-    now holds. Never switches accounts — routing is a manual `ccx switch`."""
-    log_line(f"ccx mirror started (interval {args.interval}s; capture-only)")
+    now holds. Never switches accounts — routing is a manual `ccx switch`.
+
+    On a slower sub-cadence (--poll-all-sec, default 120s) it also refreshes the
+    usage board for the non-active accounts so the statusline isn't frozen on
+    them."""
+    poll_every = args.poll_all_sec
+    log_line(
+        f"ccx mirror started (interval {args.interval}s; capture-only; "
+        f"poll-all every {poll_every}s)"
+    )
+    last_poll = 0.0
     while True:
         try:
             with locked(blocking=False):
@@ -614,6 +748,16 @@ def cmd_mirror(args) -> None:
             log_line(f"warn: {exc}")
         except Exception as exc:  # daemon must survive anything
             log_line(f"error: {type(exc).__name__}: {exc}")
+
+        if poll_every > 0 and (time.monotonic() - last_poll) >= poll_every:
+            try:
+                n = poll_all_usage(load_meta())
+                if n:
+                    log_line(f"polled usage for {n} account(s)")
+            except Exception as exc:
+                log_line(f"poll-all error: {type(exc).__name__}: {exc}")
+            last_poll = time.monotonic()
+
         if args.once:
             return
         time.sleep(args.interval)
@@ -792,7 +936,17 @@ def main(argv: list[str] | None = None) -> None:
     p_mirror = sub.add_parser("mirror", help="watch the live slot and vault every change")
     p_mirror.add_argument("--interval", type=float, default=20.0)
     p_mirror.add_argument("--once", action="store_true", help="single pass (for cron/tests)")
+    p_mirror.add_argument(
+        "--poll-all-sec",
+        type=float,
+        default=120.0,
+        help="refresh usage for all non-active accounts this often (0 disables)",
+    )
     p_mirror.set_defaults(fn=cmd_mirror)
+
+    sub.add_parser(
+        "poll", help="refresh the usage board for all vaulted accounts now"
+    ).set_defaults(fn=cmd_poll)
 
     sub.add_parser("ls", help="list vaulted accounts with headroom").set_defaults(fn=cmd_ls)
     sub.add_parser("best", help="print the highest-headroom account").set_defaults(fn=cmd_best)

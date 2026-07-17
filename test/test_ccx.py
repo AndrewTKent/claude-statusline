@@ -150,6 +150,40 @@ class TestCredExpiry:
         assert ccx.cred_expired(None) is False
 
 
+class TestUsageMapping:
+    USAGE = {
+        "five_hour": {"utilization": 42, "resets_at": "2026-07-17T22:00:00Z"},
+        "seven_day": {"utilization": 18, "resets_at": "2026-07-23T10:00:00Z"},
+        "limits": [
+            {"kind": "weekly_scoped", "percent": 7, "resets_at": "2026-07-23T10:00:00Z",
+             "scope": {"model": {"display_name": "Fable"}}},
+            {"kind": "five_hour", "percent": 99},
+        ],
+    }
+
+    def test_maps_all_fields(self):
+        row = ccx.usage_to_reset_row("e@x.io", "org1", self.USAGE, 1784300000)
+        assert row["email"] == "e@x.io" and row["org_uuid"] == "org1"
+        assert row["five_hour_pct"] == 42
+        assert row["five_hour_reset"] == "2026-07-17T22:00:00Z"
+        assert row["seven_day_pct"] == 18
+        assert row["fable_pct"] == 7
+        assert row["fable_label"] == "Fable"
+        assert row["last_seen"] == 1784300000
+
+    def test_missing_weekly_is_none(self):
+        row = ccx.usage_to_reset_row("e@x.io", "org1", {"five_hour": {}, "seven_day": {}}, 1)
+        assert row["fable_pct"] is None and row["fable_label"] is None
+        assert row["five_hour_pct"] == 0  # None utilization -> 0
+
+    def test_access_expiry_ms_to_s(self):
+        blob = json.dumps({"claudeAiOauth": {"expiresAt": 1784337371728}})
+        assert ccx.blob_access_expiry(blob) == 1784337371
+
+    def test_access_expiry_missing(self):
+        assert ccx.blob_access_expiry(json.dumps({"claudeAiOauth": {}})) is None
+
+
 class TestVaultKey:
     def test_composite_of_account_and_org(self):
         ident = {"uuid": "acct1", "org_uuid": "orgA"}
