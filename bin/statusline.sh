@@ -1683,6 +1683,16 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
         # Legacy entries (bare email key, no .value.email) fall back to
         # splitting the key on "|".
         now_ar=$(date +%s)
+        # ccx vault: which accounts have a dead refresh token (switching to them
+        # needs a fresh /login). Keyed email|org to match the ledger rows below.
+        ccx_vault="$HOME/.claude/ccx-vault.json"
+        CCX_EXPIRED_LOOKUP=""
+        if [ -f "$ccx_vault" ]; then
+            CCX_EXPIRED_LOOKUP=$(jq -r --argjson now "$now_ar" '
+                (.accounts // {}) | to_entries[] | .value |
+                select(.refresh_expires_at != null and .refresh_expires_at <= $now) |
+                "\(.email)|\(.org_uuid)"' "$ccx_vault" 2>/dev/null)
+        fi
         entries=$(jq -r --argjson now "$now_ar" '
             to_entries[] |
             [(.value.email // (.key | split("|") | .[0])),
@@ -1869,7 +1879,13 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     fi
                 fi
 
-                rendered+="${marker}${seg} ${white}${tdisp}${reset} ${pct_color}${pct_show}${reset}${cap_suffix}   "
+                # ccx: flag a dead vaulted refresh token (needs /login to use).
+                exp_suffix=""
+                if [ -n "$CCX_EXPIRED_LOOKUP" ] && \
+                   printf '%s\n' "$CCX_EXPIRED_LOOKUP" | grep -qxF "${em}|${uuid}"; then
+                    exp_suffix=" ${red}⚠login${reset}"
+                fi
+                rendered+="${marker}${seg} ${white}${tdisp}${reset} ${pct_color}${pct_show}${reset}${cap_suffix}${exp_suffix}   "
 
                 # ── Per-account row (new stacked layout) ──
                 # Pull this account's latest extra-credit spend from the lookup
