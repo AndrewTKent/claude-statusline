@@ -208,6 +208,25 @@ def blob_access_token(blob: str) -> str | None:
     return None
 
 
+def blob_refresh_expiry(blob: str) -> int | None:
+    """Refresh-token expiry (epoch seconds) from the blob, or None.
+
+    The access token expires hourly and self-refreshes; the *refresh* token
+    expiring is what actually kills the cred and forces a re-login. Stored so
+    the statusline can flag dead accounts without a network call. Value in the
+    blob is epoch-ms."""
+    try:
+        data = json.loads(blob)
+    except json.JSONDecodeError:
+        return None
+    oauth = data.get("claudeAiOauth") if isinstance(data.get("claudeAiOauth"), dict) else data
+    raw = oauth.get("refreshTokenExpiresAt") if isinstance(oauth, dict) else None
+    try:
+        return int(raw) // 1000 if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def fetch_profile(access_token: str, timeout: float = 4.0) -> dict | None:
     req = urllib.request.Request(
         PROFILE_URL,
@@ -476,6 +495,7 @@ def snapshot_live(meta: dict, *, force: bool = False) -> tuple[str, dict] | None
             "rate_limit_tier": ident.get("rate_limit_tier"),
             "vaulted_at": now_utc().isoformat(),
             "blob_sha256": blob_sha,
+            "refresh_expires_at": blob_refresh_expiry(blob),
         }
     )
     meta["accounts"][key] = entry
@@ -620,10 +640,18 @@ def _account_rows(meta: dict) -> list[dict]:
                 "stale": stale,
                 "active": entry.get("blob_sha256") == live_sha,
                 "vaulted_at": entry.get("vaulted_at"),
+                "expired": cred_expired(entry.get("refresh_expires_at")),
             }
         )
-    rows.sort(key=lambda r: r["rank"])
+    # Dead creds sort last regardless of headroom — you can't route to them.
+    rows.sort(key=lambda r: (r["expired"], r["rank"]))
     return rows
+
+
+def cred_expired(refresh_expires_at: int | None) -> bool:
+    """True when the vaulted refresh token is past expiry — switching to this
+    account would force a re-login. None (older entry, unknown) is not expired."""
+    return refresh_expires_at is not None and time.time() >= refresh_expires_at
 
 
 def _fmt_pct(value: float | None, stale: bool) -> str:
@@ -640,9 +668,16 @@ def cmd_ls(_args) -> None:
         return
     excludes = excluded_labels()
     print(f"{'':2}{'label':<12} {'email':<32} {'5h':>6} {'7d':>6} {'fable':>6}")
+    any_expired = False
     for r in rows:
         mark = "* " if r["active"] else "  "
-        suffix = "  [excluded]" if r["label"] in excludes else ""
+        if r["expired"]:
+            suffix = "  EXPIRED — /login to refresh"
+            any_expired = True
+        elif r["label"] in excludes:
+            suffix = "  [excluded]"
+        else:
+            suffix = ""
         print(
             f"{mark}{r['label']:<12} {r['email'] or '?':<32} "
             f"{_fmt_pct(r['effs']['five_hour'], r['stale']):>6} "
@@ -651,13 +686,19 @@ def cmd_ls(_args) -> None:
         )
     print("\n* = matches live slot   ~ = estimate stale (>3h since that account was live)")
     print("pcts are USED (0% = full headroom), reset-aware; sorted best-first")
+    if any_expired:
+        print("EXPIRED = vaulted refresh token dead; switch to it needs a fresh /login")
 
 
 def cmd_best(_args) -> None:
     meta = load_meta()
-    rows = [r for r in _account_rows(meta) if r["label"] not in excluded_labels()]
+    rows = [
+        r
+        for r in _account_rows(meta)
+        if r["label"] not in excluded_labels() and not r["expired"]
+    ]
     if not rows:
-        die("vault is empty (or everything is excluded)")
+        die("no usable account (vault empty, all excluded, or all expired)")
     top = rows[0]
     effs = top["effs"]
     print(
@@ -679,7 +720,9 @@ def cmd_switch(args) -> None:
             candidates = [
                 r
                 for r in _account_rows(meta)
-                if r["label"] not in excluded_labels() and r["uuid"] != cur_uuid
+                if r["label"] not in excluded_labels()
+                and r["uuid"] != cur_uuid
+                and not r["expired"]
             ]
             if not candidates:
                 die("no other vaulted account to switch to")

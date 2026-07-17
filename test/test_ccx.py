@@ -128,6 +128,28 @@ class TestSynthesizeOauthAccount:
         assert oa["organizationRateLimitTier"] == "default_claude_max_20x"
 
 
+class TestCredExpiry:
+    def test_blob_refresh_expiry_ms_to_seconds(self):
+        blob = json.dumps({"claudeAiOauth": {"refreshTokenExpiresAt": 1784337371728}})
+        assert ccx.blob_refresh_expiry(blob) == 1784337371  # ms floored to s
+
+    def test_blob_refresh_expiry_missing(self):
+        assert ccx.blob_refresh_expiry(json.dumps({"claudeAiOauth": {}})) is None
+        assert ccx.blob_refresh_expiry("not json") is None
+
+    def test_blob_refresh_expiry_flat(self):
+        assert ccx.blob_refresh_expiry(json.dumps({"refreshTokenExpiresAt": 2000000000000})) == 2000000000
+
+    def test_cred_expired_past(self):
+        assert ccx.cred_expired(1) is True  # epoch 1 is long past
+
+    def test_cred_expired_future(self):
+        assert ccx.cred_expired(4000000000) is False  # year 2096
+
+    def test_cred_expired_none_is_not_expired(self):
+        assert ccx.cred_expired(None) is False
+
+
 class TestVaultKey:
     def test_composite_of_account_and_org(self):
         ident = {"uuid": "acct1", "org_uuid": "orgA"}
