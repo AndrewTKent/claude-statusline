@@ -163,6 +163,22 @@ class TestPickRoute:
         assert ccx.pick_route(rows, self.VAULT, set(), self.NOW, None) is None
 
 
+class TestMergeTokenVaults:
+    def test_union(self):
+        a = {"tokens": {"gmail": {"token": "g", "minted_at": 1}}}
+        b = {"tokens": {"ymail": {"token": "y", "minted_at": 2}}}
+        assert set(ccx.merge_token_vaults(a, b)["tokens"]) == {"gmail", "ymail"}
+
+    def test_newer_mint_wins(self):
+        a = {"tokens": {"gmail": {"token": "old", "minted_at": 1}}}
+        b = {"tokens": {"gmail": {"token": "new", "minted_at": 9}}}
+        assert ccx.merge_token_vaults(a, b)["tokens"]["gmail"]["token"] == "new"
+        assert ccx.merge_token_vaults(b, a)["tokens"]["gmail"]["token"] == "new"
+
+    def test_empty_sides(self):
+        assert ccx.merge_token_vaults({}, {})["tokens"] == {}
+
+
 class TestTokenVault:
     def test_round_trip_and_perms(self, tmp_path, monkeypatch):
         monkeypatch.setattr(ccx, "TOKEN_VAULT_PATH", tmp_path / "sub" / "vault.json")
