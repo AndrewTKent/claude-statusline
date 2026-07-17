@@ -124,6 +124,59 @@ class TestCredExpiry:
         assert ccx.cred_expired(None) is False
 
 
+def _route_row(label, eff5, active=False, expired=False):
+    return {
+        "uuid": label,
+        "label": label,
+        "active": active,
+        "expired": expired,
+        "effs": {"five_hour": eff5, "seven_day": 0.0, "fable": 0.0},
+    }
+
+
+class TestPickRoute:
+    NOW = 1_784_000_000.0
+    VAULT = {"tokens": {
+        "gmail": {"token": "sk-ant-gmail-tok", "expires_at": NOW + 1000},
+        "ymail": {"token": "sk-ant-ymail-tok", "expires_at": NOW - 1},  # expired token
+    }}
+
+    def test_best_with_token_wins(self):
+        rows = [_route_row("alumni", 5.0), _route_row("gmail", 20.0), _route_row("ymail", 1.0)]
+        # alumni has no token, ymail's token is expired -> gmail
+        assert ccx.pick_route(rows, self.VAULT, set(), self.NOW, None) == ("gmail", "sk-ant-gmail-tok")
+
+    def test_pin_overrides_headroom(self):
+        rows = [_route_row("alumni", 5.0), _route_row("gmail", 90.0)]
+        assert ccx.pick_route(rows, self.VAULT, set(), self.NOW, "gmail")[0] == "gmail"
+
+    def test_excluded_skipped(self):
+        rows = [_route_row("gmail", 5.0)]
+        assert ccx.pick_route(rows, self.VAULT, {"gmail"}, self.NOW, None) is None
+
+    def test_expired_cred_row_skipped(self):
+        rows = [_route_row("gmail", 5.0, expired=True)]
+        assert ccx.pick_route(rows, self.VAULT, set(), self.NOW, None) is None
+
+    def test_no_tokens_none(self):
+        rows = [_route_row("alumni", 5.0)]
+        assert ccx.pick_route(rows, self.VAULT, set(), self.NOW, None) is None
+
+
+class TestTokenVault:
+    def test_round_trip_and_perms(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ccx, "TOKEN_VAULT_PATH", tmp_path / "sub" / "vault.json")
+        vault = {"version": 1, "tokens": {"x": {"token": "sk-ant-t", "expires_at": 2}}}
+        ccx.save_token_vault(vault)
+        assert ccx.load_token_vault() == vault
+        assert (ccx.TOKEN_VAULT_PATH.stat().st_mode & 0o777) == 0o600
+        assert (ccx.TOKEN_VAULT_PATH.parent.stat().st_mode & 0o777) == 0o700
+
+    def test_missing_file_empty(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ccx, "TOKEN_VAULT_PATH", tmp_path / "none.json")
+        assert ccx.load_token_vault() == {"version": 1, "tokens": {}}
+
+
 class TestUsageMapping:
     USAGE = {
         "five_hour": {"utilization": 42, "resets_at": "2026-07-17T22:00:00Z"},
