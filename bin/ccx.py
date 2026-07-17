@@ -30,6 +30,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -612,6 +613,115 @@ def cmd_poll(_args) -> None:
     print(f"refreshed usage for {n} account(s)")
 
 
+# ── token vault + router (zero keychain) ──────────────────────────────────
+# Long-lived per-account tokens minted by `claude setup-token`, stored in a
+# 0600 file OUTSIDE ~/.claude (the nightly archival chain mirrors ~/.claude
+# to remote-host in plaintext — tokens must never land there). Routing injects
+# CLAUDE_CODE_OAUTH_TOKEN into the child env, which outranks keychain auth;
+# the live keychain slot stays 100% Claude-Code-owned.
+
+TOKEN_VAULT_PATH = HOME / ".ccx" / "vault.json"
+TOKEN_LIFETIME_S = 364 * 24 * 3600
+TOKEN_RE = re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}")
+
+
+def load_token_vault() -> dict:
+    try:
+        return json.loads(TOKEN_VAULT_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"version": 1, "tokens": {}}
+
+
+def save_token_vault(vault: dict) -> None:
+    TOKEN_VAULT_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(TOKEN_VAULT_PATH.parent, 0o700)
+    tmp = TOKEN_VAULT_PATH.with_suffix(".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps(vault, indent=2, sort_keys=True) + "\n")
+    os.replace(tmp, TOKEN_VAULT_PATH)
+
+
+def token_for(vault: dict, label: str, now_ts: float) -> str | None:
+    entry = (vault.get("tokens") or {}).get(label)
+    if not entry:
+        return None
+    if now_ts >= entry.get("expires_at", 0):
+        return None
+    return entry.get("token")
+
+
+def pick_route(rows: list[dict], vault: dict, excludes: set[str], now_ts: float, pin: str | None):
+    """Best-headroom row that has a live minted token. `pin` forces a label.
+    Returns (label, token) or None."""
+    for row in rows:
+        if pin is not None and row["label"] != pin:
+            continue
+        if pin is None and (row["label"] in excludes or row["expired"]):
+            continue
+        token = token_for(vault, row["label"], now_ts)
+        if token:
+            return row["label"], token
+    return None
+
+
+def cmd_mint(args) -> None:
+    """Run `claude setup-token` and pipe the minted token straight into the
+    vault — it is never displayed and never transits a transcript. The browser
+    flow picks the account; the live keychain login is undisturbed."""
+    label = args.label
+    print(f"minting a long-lived token for '{label}' — approve in the browser...")
+    r = subprocess.run(["claude", "setup-token"], stdout=subprocess.PIPE, text=True)
+    m = TOKEN_RE.search(r.stdout or "")
+    if r.returncode != 0 or not m:
+        die("setup-token did not produce a token (browser flow cancelled?)")
+    vault = load_token_vault()
+    now = time.time()
+    vault.setdefault("tokens", {})[label] = {
+        "token": m.group(0),
+        "minted_at": int(now),
+        "expires_at": int(now + TOKEN_LIFETIME_S),
+    }
+    save_token_vault(vault)
+    print(f"vaulted token for {label} (expires in ~1 year); it was not displayed")
+
+
+def cmd_tokens(_args) -> None:
+    vault = load_token_vault()
+    tokens = vault.get("tokens") or {}
+    if not tokens:
+        print("no minted tokens — run `ccx mint <label>` per account you want routable")
+        return
+    now = time.time()
+    for label in sorted(tokens):
+        e = tokens[label]
+        days = int((e.get("expires_at", 0) - now) / 86400)
+        state = f"{days}d left" if days > 0 else "EXPIRED — re-mint"
+        print(f"  {label:<12} minted {datetime.fromtimestamp(e.get('minted_at', 0)).date()}  {state}")
+
+
+def cmd_pick_env(_args) -> None:
+    """Emit `export` lines for the best routable account (consumed by the
+    `claude` shell wrapper). Prints nothing when there is no routable token —
+    the wrapper then falls back to Claude Code's native keychain auth. Never
+    fails: routing must never block launching claude."""
+    try:
+        pick = pick_route(
+            _account_rows(load_meta()),
+            load_token_vault(),
+            excluded_labels(),
+            time.time(),
+            os.environ.get("CCX_ACCOUNT") or None,
+        )
+    except Exception:
+        return
+    if pick is None:
+        return
+    label, token = pick
+    print(f"export CLAUDE_CODE_OAUTH_TOKEN='{token}'")
+    print(f"export CCX_ROUTED_LABEL='{label}'")
+
+
 def cmd_mirror(args) -> None:
     """Capture + poll only. Each tick: vault the live slot if it changed
     (/login or token rotation), and refresh the all-account usage board on the
@@ -832,6 +942,16 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser(
         "poll", help="refresh the usage board for all vaulted accounts now"
     ).set_defaults(fn=cmd_poll)
+
+    p_mint = sub.add_parser("mint", help="mint + vault a 1-year token via claude setup-token")
+    p_mint.add_argument("label", help="account label (from ACCOUNT_LABELS)")
+    p_mint.set_defaults(fn=cmd_mint)
+
+    sub.add_parser("tokens", help="list minted tokens and expiry").set_defaults(fn=cmd_tokens)
+
+    sub.add_parser(
+        "pick-env", help="emit env exports for the best routable account (wrapper hook)"
+    ).set_defaults(fn=cmd_pick_env)
 
     sub.add_parser("ls", help="list vaulted accounts with headroom").set_defaults(fn=cmd_ls)
     sub.add_parser("best", help="print the highest-headroom account").set_defaults(fn=cmd_best)
