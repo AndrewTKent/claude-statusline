@@ -128,6 +128,46 @@ class TestSynthesizeOauthAccount:
         assert oa["organizationRateLimitTier"] == "default_claude_max_20x"
 
 
+class TestVaultKey:
+    def test_composite_of_account_and_org(self):
+        ident = {"uuid": "acct1", "org_uuid": "orgA"}
+        assert ccx.vault_key(ident) == "acct1|orgA"
+
+    def test_shared_account_two_orgs_distinct_keys(self):
+        # acme-max and acme-work: same account, different org -> must not collide
+        maxk = ccx.vault_key({"uuid": "d9eb", "org_uuid": "e1c8"})
+        workk = ccx.vault_key({"uuid": "d9eb", "org_uuid": "52ae"})
+        assert maxk != workk
+
+    def test_missing_org_is_none(self):
+        assert ccx.vault_key({"uuid": "acct1", "org_uuid": None}) is None
+        assert ccx.vault_key({"uuid": None, "org_uuid": "orgA"}) is None
+
+    def test_short_key_shows_both_parts(self):
+        assert ccx.short_key("d9eb92c0-xxxx|52ae57ff-yyyy") == "d9eb92c0|52ae57ff"
+
+
+class TestResolveTargetSharedEmail:
+    META = {
+        "accounts": {
+            "d9eb|e1c8": {"email": "andrew.kent@acme.ai", "org_uuid": "e1c8"},
+            "d9eb|52ae": {"email": "andrew.kent@acme.ai", "org_uuid": "52ae"},
+        }
+    }
+    PAIRS = [
+        ("acme-max", "andrew.kent@acme.ai", "e1c8"),
+        ("acme-work", "andrew.kent@acme.ai", "52ae"),
+    ]
+
+    def test_label_disambiguates_shared_email(self):
+        k, _ = ccx.resolve_target(self.META, "acme-work", self.PAIRS)
+        assert k == "d9eb|52ae"
+
+    def test_shared_email_is_ambiguous(self):
+        with pytest.raises(SystemExit):
+            ccx.resolve_target(self.META, "andrew.kent@acme.ai", self.PAIRS)
+
+
 class TestResolveTarget:
     META = {
         "accounts": {
