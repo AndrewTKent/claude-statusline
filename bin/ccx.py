@@ -939,7 +939,7 @@ def main(argv: list[str] | None = None) -> None:
     p_mirror.add_argument(
         "--poll-all-sec",
         type=float,
-        default=120.0,
+        default=15.0,
         help="refresh usage for all non-active accounts this often (0 disables)",
     )
     p_mirror.set_defaults(fn=cmd_mirror)
