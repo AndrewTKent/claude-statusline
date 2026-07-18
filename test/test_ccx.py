@@ -193,6 +193,43 @@ class TestTokenVault:
         assert ccx.load_token_vault() == {"version": 1, "tokens": {}}
 
 
+class TestRouterCore:
+    NOW = 2_000_000_000.0
+
+    def _blob(self, atok, rt_exp_ms):
+        return json.dumps({"claudeAiOauth": {"accessToken": atok, "refreshToken": "r",
+                                             "refreshTokenExpiresAt": rt_exp_ms}})
+
+    def test_blob_expired_by_refresh_expiry(self):
+        assert ccx.blob_expired(self._blob("a", 1_000_000_000_000), self.NOW) is True   # 2001, past
+        assert ccx.blob_expired(self._blob("a", 3_000_000_000_000), self.NOW) is False  # 2065, future
+        assert ccx.blob_expired('{"claudeAiOauth":{}}', self.NOW) is True               # no refresh expiry
+
+    def _rows(self):
+        return [
+            ccx_row("gmail", 12.0, expired=False, active=False),
+            ccx_row("alumni", 4.0, expired=True, active=False),   # freshest but cred dead
+            ccx_row("ymail", 30.0, expired=False, active=False),
+            ccx_row("acme-max", 88.0, expired=False, active=True),
+        ]
+
+    def test_route_pick_skips_expired_and_active(self):
+        # alumni is lowest but expired -> skip; active acme-max -> skip -> gmail
+        assert ccx.route_pick(self._rows(), set()) == "gmail"
+
+    def test_route_pick_respects_excludes(self):
+        assert ccx.route_pick(self._rows(), {"gmail"}) == "ymail"
+
+    def test_route_pick_none_when_all_blocked(self):
+        rows = [ccx_row("a", 5.0, expired=True), ccx_row("b", 6.0, active=True)]
+        assert ccx.route_pick(rows, set()) is None
+
+
+def ccx_row(label, five_hour, expired=False, active=False):
+    return {"label": label, "email": f"{label}@x", "five_hour": five_hour,
+            "expired": expired, "active": active}
+
+
 class TestUsageMapping:
     USAGE = {
         "five_hour": {"utilization": 42, "resets_at": "2026-07-17T22:00:00Z"},

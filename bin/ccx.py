@@ -607,9 +607,8 @@ def poll_all_usage(meta: dict, *, skip_active: bool = True) -> int:
 
 
 def cmd_poll(_args) -> None:
-    """Refresh the usage board for every vaulted account now (includes the
-    active one, so a manual `ccx poll` fully repaints)."""
-    n = poll_all_usage(load_meta(), skip_active=False)
+    """Query every stored account's remaining limits and repaint the board."""
+    n = poll_blobs_usage(load_blobs())
     print(f"refreshed usage for {n} account(s)")
 
 
@@ -623,6 +622,188 @@ def cmd_poll(_args) -> None:
 TOKEN_VAULT_PATH = HOME / ".ccx" / "vault.json"
 TOKEN_LIFETIME_S = 364 * 24 * 3600
 TOKEN_RE = re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}")
+
+# The switch: cc reads ~/.claude/.credentials.json (verified on macOS). Writing
+# it is a plain FILE write — no keychain, no ACL/partition, so it can never
+# storm. We write the account's static setup-token blob; cc adopts that account.
+# The system, plainly: full OAuth blobs for every account live in a 0600 FILE
+# (~/.ccx/blobs.json). The daemon polls each blob's usage, and when the active
+# account runs low it OVERWRITES the single file cc reads (~/.claude/
+# .credentials.json) with the best account's blob — cc re-reads it and switches.
+# Every write is a plain file write: no keychain, no ACL/partition, cannot storm.
+# Full blobs (not setup-tokens) because only they carry the refresh token cc
+# needs and the scope the usage endpoint needs.
+CRED_FILE = HOME / ".claude" / ".credentials.json"
+MODE_PATH = HOME / ".ccx" / "mode.json"
+BLOBS_PATH = HOME / ".ccx" / "blobs.json"
+
+
+def load_mode() -> dict:
+    try:
+        m = json.loads(MODE_PATH.read_text())
+        if m.get("mode") in ("auto", "set"):
+            return m
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {"mode": "auto", "label": None}
+
+
+def save_mode(mode: str, label: str | None) -> None:
+    MODE_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = MODE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"mode": mode, "label": label}) + "\n")
+    os.replace(tmp, MODE_PATH)
+
+
+def _write_0600(path: Path, text: str) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = path.with_suffix(".ccx-tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def load_blobs() -> dict:
+    try:
+        return json.loads(BLOBS_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"version": 1, "accounts": {}}
+
+
+def save_blobs(blobs: dict) -> None:
+    _write_0600(BLOBS_PATH, json.dumps(blobs, indent=2, sort_keys=True) + "\n")
+
+
+def migrate_vault_to_blobs() -> int:
+    """One-time seed: copy each account's full blob out of the keychain vault
+    into the 0600 file store. Keychain READS only (allow-all vault items are
+    silent); nothing is written to the keychain."""
+    meta = load_meta()
+    pairs = load_label_pairs()
+    blobs = load_blobs()
+    n = 0
+    for key, entry in meta.get("accounts", {}).items():
+        label = resolve_label(entry.get("email"), entry.get("org_uuid"), pairs)
+        blob = kc_read(VAULT_SERVICE, key)
+        if not blob:
+            continue
+        blobs.setdefault("accounts", {})[label] = {
+            "blob": blob,
+            "email": entry.get("email"),
+            "org_uuid": entry.get("org_uuid"),
+            "org_type": entry.get("org_type"),
+        }
+        n += 1
+    save_blobs(blobs)
+    return n
+
+
+def write_live_creds(blob: str) -> None:
+    """Atomic 0600 write of ~/.claude/.credentials.json — the one file cc reads.
+    FILE ONLY; never the keychain (that write is what stormed 2026-07-17)."""
+    _write_0600(CRED_FILE, blob)
+
+
+def capture_live_to_blobs(blobs: dict) -> str | None:
+    """After cc refreshes the active account it rewrites .credentials.json;
+    fold that fresh blob back into the store so the account stays pollable and
+    its next restore is current. Returns the active label if identified."""
+    try:
+        live = CRED_FILE.read_text()
+    except OSError:
+        return None
+    tok = blob_access_token(live)
+    if not tok:
+        return None
+    for label, e in (blobs.get("accounts") or {}).items():
+        if blob_access_token(e.get("blob", "")) == tok:
+            return label  # unchanged
+    # token changed (cc refreshed) — attribute via profile and update its entry
+    prof = fetch_profile(tok)
+    if not prof:
+        return None
+    ident = identity_from_profile(prof)
+    label = resolve_label(ident.get("email"), ident.get("org_uuid"), load_label_pairs())
+    acct = blobs.setdefault("accounts", {}).setdefault(label, {})
+    acct.update({"blob": live, "email": ident.get("email"), "org_uuid": ident.get("org_uuid")})
+    save_blobs(blobs)
+    return label
+
+
+def apply_account(label: str, blobs: dict) -> bool:
+    """Overwrite ~/.claude/.credentials.json with `label`'s full blob so cc
+    switches to it. Returns False if we hold no blob for that account."""
+    e = (blobs.get("accounts") or {}).get(label)
+    if not e or not e.get("blob"):
+        return False
+    write_live_creds(e["blob"])
+    return True
+
+
+def blob_expired(blob: str, now_ts: float) -> bool:
+    """True when the stored credential can no longer be used to switch — its
+    refresh token is past expiry (or absent). This is the 'needs a fresh
+    /login' state the statusline flags ⚠login. Distinct from 'capped' (a live
+    account that's temporarily at its rate limit)."""
+    exp = blob_refresh_expiry(blob)
+    return exp is None or now_ts >= exp
+
+
+def poll_blobs_usage(blobs: dict) -> int:
+    """Query each stored account's remaining limits with its OWN access token
+    and write them to the board (account-resets.json). Pure reads. Skips blobs
+    whose access token has expired (would 401) — those show the reset-aware
+    estimate until the account is next active and its blob refreshes."""
+    now = int(time.time())
+    fresh: dict[str, dict] = {}
+    for label, e in (blobs.get("accounts") or {}).items():
+        blob = e.get("blob", "")
+        exp = blob_access_expiry(blob)
+        if exp is not None and now >= exp:
+            continue
+        token = blob_access_token(blob)
+        if not token:
+            continue
+        usage = fetch_usage(token)
+        if usage is None:
+            continue
+        fresh[f"{e.get('email')}|{e.get('org_uuid')}"] = usage_to_reset_row(
+            e.get("email"), e.get("org_uuid"), usage, now
+        )
+    merge_reset_rows(fresh)
+    return len(fresh)
+
+
+def route_rows(blobs: dict, active_label: str | None, now_ts: float) -> list[dict]:
+    """One row per stored account: label, effective 5h% (reset-aware, from the
+    board the poll just refreshed), whether its cred is expired, whether it's
+    the live account. Sorted best-first (lowest 5h)."""
+    resets = load_resets()
+    rows = []
+    for label, e in (blobs.get("accounts") or {}).items():
+        row = resets_row(resets, e.get("email"), e.get("org_uuid"))
+        effs = effective_pcts(row, now_utc())
+        rows.append(
+            {
+                "label": label,
+                "email": e.get("email"),
+                "five_hour": effs["five_hour"],
+                "expired": blob_expired(e.get("blob", ""), now_ts),
+                "active": label == active_label,
+            }
+        )
+    rows.sort(key=lambda r: (float("inf") if r["five_hour"] is None else r["five_hour"]))
+    return rows
+
+
+def route_pick(rows: list[dict], excludes: set[str]) -> str | None:
+    """Best switchable account: lowest 5h, not active, not excluded, cred live."""
+    for r in rows:
+        if r["active"] or r["expired"] or r["label"] in excludes:
+            continue
+        return r["label"]
+    return None
 
 
 def load_token_vault() -> dict:
@@ -796,46 +977,117 @@ def cmd_pick_env(_args) -> None:
     print(f"export CCX_ROUTED_LABEL='{label}'")
 
 
-def cmd_mirror(args) -> None:
-    """Capture + poll only. Each tick: vault the live slot if it changed
-    (/login or token rotation), and refresh the all-account usage board on the
-    poll sub-cadence. Never writes the live keychain slot — switching accounts
-    is /login's job (see cmd_switch)."""
-    poll_every = args.poll_all_sec
-    log_line(
-        f"ccx mirror started (interval {args.interval}s; poll-all every {poll_every}s; "
-        "capture-only)"
+ROUTE_AT_DEFAULT = 80.0  # switch when the active account's 5h usage crosses this
+
+
+def notify(text: str, title: str = "ccx") -> None:
+    safe = text.replace('"', "'")
+    subprocess.run(
+        ["osascript", "-e", f'display notification "{safe}" with title "{title}"'],
+        capture_output=True,
+        text=True,
     )
-    last_poll = 0.0
+
+
+def route_once(threshold: float) -> str | None:
+    """One pass of the whole system: fold in any cc refresh, poll every stored
+    account's limits, then — in AUTO — if the live account is past `threshold`
+    and a better one exists, overwrite .credentials.json with it. In SET, keep
+    the pinned account live. Returns a log line if it switched, else None.
+    Only ever writes files; never the keychain."""
+    with locked():
+        blobs = load_blobs()
+        active = capture_live_to_blobs(blobs)
+        poll_blobs_usage(blobs)
+        rows = route_rows(blobs, active, time.time())
+        by_label = {r["label"]: r for r in rows}
+        mode = load_mode()
+
+        if mode["mode"] == "set":
+            target = mode.get("label")
+            if target and target != active and not (by_label.get(target) or {}).get("expired"):
+                if apply_account(target, blobs):
+                    return f"SET {active} → {target}"
+            return None
+
+        # AUTO: only act once the live account is genuinely low
+        cur = by_label.get(active) if active else None
+        if cur is None or cur["five_hour"] is None or cur["five_hour"] < threshold:
+            return None
+        pick = route_pick(rows, excluded_labels())
+        if pick is None:
+            return None
+        cur_pct = cur["five_hour"]
+        pick_pct = by_label[pick]["five_hour"]
+        if apply_account(pick, blobs):
+            return f"ROUTED {active} → {pick} (5h {cur_pct:.0f}% → {pick_pct:.0f}%)"
+    return None
+
+
+def cmd_route(args) -> None:
+    """The router daemon. Every --interval seconds: capture cc's own refreshes,
+    poll all stored accounts' limits, and (AUTO) switch the live .credentials
+    .json to the freshest account when the current one runs low, or (SET) hold
+    the pinned account. All file writes — cannot storm."""
+    log_line(
+        f"ccx route started (interval {args.interval}s; switch at ≥{args.at:.0f}% 5h; "
+        f"mode={load_mode()['mode']})"
+    )
     while True:
         try:
-            with locked(blocking=False):
-                meta = load_meta()
-                result = snapshot_live(meta)
-            if result is not None:
-                key, entry = result
-                pairs = load_label_pairs()
-                label = resolve_label(entry.get("email"), entry.get("org_uuid"), pairs)
-                log_line(f"vaulted {label} ({entry.get('email')}) [{short_key(key)}]")
-        except BlockingIOError:
-            pass  # another ccx holds the lock; catch the change on the next tick
+            line = route_once(args.at)
+            if line:
+                log_line(line)
+                notify(line.split(" (")[0], "ccx")
         except CcxError as exc:
             log_line(f"warn: {exc}")
         except Exception as exc:  # daemon must survive anything
             log_line(f"error: {type(exc).__name__}: {exc}")
-
-        if poll_every > 0 and (time.monotonic() - last_poll) >= poll_every:
-            try:
-                n = poll_all_usage(load_meta())
-                if n:
-                    log_line(f"polled usage for {n} account(s)")
-            except Exception as exc:
-                log_line(f"poll-all error: {type(exc).__name__}: {exc}")
-            last_poll = time.monotonic()
-
         if args.once:
             return
         time.sleep(args.interval)
+
+
+def cmd_set(args) -> None:
+    """Pin the live account to <label> and hold it there (manual mode)."""
+    blobs = load_blobs()
+    if args.label not in (blobs.get("accounts") or {}):
+        die(f"'{args.label}' has no stored blob — run `ccx migrate` or mint/login it first")
+    save_mode("set", args.label)
+    ok = apply_account(args.label, blobs)
+    print(f"SET → {args.label}" + ("" if ok else " (mode set; blob missing, not applied)"))
+    print("new + restarted sessions use it; a running session picks it up on its next creds re-read")
+
+
+def cmd_auto(_args) -> None:
+    """Hand routing back to the daemon (switch to freshest when the live account runs low)."""
+    save_mode("auto", None)
+    with locked():
+        blobs = load_blobs()
+        active = capture_live_to_blobs(blobs)
+        rows = route_rows(blobs, active, time.time())
+    pick = route_pick(rows, excluded_labels())
+    print("AUTO — daemon routes to the freshest account when the live one runs low")
+    print(f"  live: {active or '?'} · would pick now: {pick or '(none free)'}")
+
+
+def cmd_status(_args) -> None:
+    mode = load_mode()
+    blobs = load_blobs()
+    active = capture_live_to_blobs(blobs)
+    rows = route_rows(blobs, active, time.time())
+    tag = f"SET → {mode['label']}" if mode["mode"] == "set" else "AUTO"
+    print(f"mode: {tag}   live: {active or '?'}")
+    for r in rows:
+        mark = "*" if r["active"] else " "
+        pct = "—" if r["five_hour"] is None else f"{r['five_hour']:.0f}%"
+        flag = "  ⚠login" if r["expired"] else ""
+        print(f" {mark} {r['label']:<12} 5h {pct:>5}{flag}")
+
+
+def cmd_migrate(_args) -> None:
+    n = migrate_vault_to_blobs()
+    print(f"seeded {n} account blob(s) into {BLOBS_PATH}")
 
 
 def _account_rows(meta: dict) -> list[dict]:
@@ -1002,19 +1254,24 @@ def main(argv: list[str] | None = None) -> None:
 
     sub.add_parser("enroll", help="vault the active account now").set_defaults(fn=cmd_enroll)
 
-    p_mirror = sub.add_parser("mirror", help="watch the live slot and vault every change")
-    p_mirror.add_argument("--interval", type=float, default=20.0)
-    p_mirror.add_argument("--once", action="store_true", help="single pass (for cron/tests)")
-    p_mirror.add_argument(
-        "--poll-all-sec",
-        type=float,
-        default=15.0,
-        help="refresh usage for all non-active accounts this often (0 disables)",
+    p_route = sub.add_parser("route", help="router daemon: poll all, auto-switch the live account")
+    p_route.add_argument("--interval", type=float, default=30.0)
+    p_route.add_argument("--at", type=float, default=ROUTE_AT_DEFAULT, help="switch at this 5h%%")
+    p_route.add_argument("--once", action="store_true")
+    p_route.set_defaults(fn=cmd_route)
+
+    p_set = sub.add_parser("set", help="pin the live account to <label> (manual mode)")
+    p_set.add_argument("label")
+    p_set.set_defaults(fn=cmd_set)
+
+    sub.add_parser("auto", help="hand routing back to the daemon").set_defaults(fn=cmd_auto)
+    sub.add_parser("status", help="mode + per-account 5h + ⚠login flags").set_defaults(fn=cmd_status)
+    sub.add_parser("migrate", help="seed ~/.ccx/blobs.json from the keychain vault").set_defaults(
+        fn=cmd_migrate
     )
-    p_mirror.set_defaults(fn=cmd_mirror)
 
     sub.add_parser(
-        "poll", help="refresh the usage board for all vaulted accounts now"
+        "poll", help="refresh the usage board for all stored accounts now"
     ).set_defaults(fn=cmd_poll)
 
     p_mint = sub.add_parser("mint", help="mint + vault a 1-year token via claude setup-token")
