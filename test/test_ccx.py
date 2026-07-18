@@ -206,7 +206,11 @@ class TestRouterCore:
     def test_blob_expired_by_refresh_expiry(self):
         assert ccx.blob_expired(self._blob("a", 1_000_000_000_000), self.NOW) is True   # 2001, past
         assert ccx.blob_expired(self._blob("a", 3_000_000_000_000), self.NOW) is False  # 2065, future
-        assert ccx.blob_expired('{"claudeAiOauth":{}}', self.NOW) is True               # no refresh expiry
+        assert ccx.blob_expired('{"claudeAiOauth":{}}', self.NOW) is True    # no refresh token at all
+        assert ccx.blob_expired("", self.NOW) is True                        # unparseable
+        # regression: cc's rotation rewrites omit refreshTokenExpiresAt — alive, not dead
+        rotation = json.dumps({"claudeAiOauth": {"accessToken": "a", "refreshToken": "r"}})
+        assert ccx.blob_expired(rotation, self.NOW) is False
 
     def _rows(self):
         return [

@@ -809,12 +809,20 @@ def apply_account(label: str, blobs: dict) -> bool:
 
 
 def blob_expired(blob: str, now_ts: float) -> bool:
-    """True when the stored credential can no longer be used to switch — its
-    refresh token is past expiry (or absent). This is the 'needs a fresh
-    /login' state the statusline flags ⚠login. Distinct from 'capped' (a live
-    account that's temporarily at its rate limit)."""
+    """True when the stored credential can no longer be used to switch — no
+    refresh token at all, or a known refresh expiry in the past. cc's rotation
+    rewrites carry refreshToken but OMIT refreshTokenExpiresAt (only fresh
+    /login blobs have it), so a missing expiry is alive, not dead. This is the
+    'needs a fresh /login' state the statusline flags ⚠login."""
+    try:
+        data = json.loads(blob)
+    except json.JSONDecodeError:
+        return True
+    oauth = data.get("claudeAiOauth") if isinstance(data.get("claudeAiOauth"), dict) else data
+    if not isinstance(oauth, dict) or not oauth.get("refreshToken"):
+        return True
     exp = blob_refresh_expiry(blob)
-    return exp is None or now_ts >= exp
+    return exp is not None and now_ts >= exp
 
 
 def poll_blobs_usage(blobs: dict) -> int:
