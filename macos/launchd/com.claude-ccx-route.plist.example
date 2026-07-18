@@ -1,33 +1,34 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- ccx mirror: keeps the per-account credential vault in sync with the live
-     "Claude Code-credentials" keychain slot, so /login and token refreshes
-     never lose an account (see bin/ccx.py).
+<!-- ccx route: the account-routing daemon. Every interval it polls each stored
+     account's remaining limits and, in AUTO, overwrites ~/.claude/.credentials.json
+     with the freshest account when the live one runs low (in SET, holds the pin).
+     File-only — it never writes the keychain (see bin/ccx.py).
 
      Install:
-       1. Edit the paths below to match your checkout location.
-       2. Copy to ~/Library/LaunchAgents/com.claude-ccx-mirror.plist
-       3. launchctl load ~/Library/LaunchAgents/com.claude-ccx-mirror.plist
+       1. Edit the two paths below to match your checkout and username.
+       2. Copy to ~/Library/LaunchAgents/com.claude-ccx-route.plist
+       3. launchctl load ~/Library/LaunchAgents/com.claude-ccx-route.plist
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.claude-ccx-mirror</string>
+    <string>com.claude-ccx-route</string>
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
         <string>-c</string>
         <!-- Edit path to point at your checkout. -->
-        <string>exec /opt/homebrew/bin/python3 "/PATH/TO/claude-statusline/bin/ccx.py" mirror --interval 20</string>
+        <string>exec /opt/homebrew/bin/python3 "/PATH/TO/claude-statusline/bin/ccx.py" route --interval 30</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/tmp/claude-ccx-mirror.stdout.log</string>
+    <string>/tmp/claude-ccx-route.stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/claude-ccx-mirror.stderr.log</string>
+    <string>/tmp/claude-ccx-route.stderr.log</string>
     <key>EnvironmentVariables</key>
     <dict>
         <!-- Edit HOME to your username. -->

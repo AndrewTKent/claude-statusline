@@ -1046,6 +1046,10 @@ get_oauth_token() {
         return 0
     fi
 
+    # Keychain first, file fallback — mirrors cc's own credential store
+    # ('keychain-with-plaintext-fallback'): the slot wins whenever it exists;
+    # a ccx route deletes the slot, so both readers fall through to the file
+    # together and the board always shows the account cc is actually using.
     if command -v security >/dev/null 2>&1; then
         local blob
         # Timeout guard: cap keychain call at 2 seconds
@@ -1683,15 +1687,18 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
         # Legacy entries (bare email key, no .value.email) fall back to
         # splitting the key on "|".
         now_ar=$(date +%s)
-        # ccx vault: which accounts have a dead refresh token (switching to them
-        # needs a fresh /login). Keyed email|org to match the ledger rows below.
-        ccx_vault="$HOME/.claude/ccx-vault.json"
+        # ccx blobs: which accounts have a dead refresh token (switching to them
+        # needs a fresh /login). blobs.json is the router's live source of truth;
+        # refresh expiry lives inside each blob (epoch-ms). Keyed email|org to
+        # match the ledger rows below.
+        ccx_blobs="$HOME/.ccx/blobs.json"
         CCX_EXPIRED_LOOKUP=""
-        if [ -f "$ccx_vault" ]; then
+        if [ -f "$ccx_blobs" ]; then
             CCX_EXPIRED_LOOKUP=$(jq -r --argjson now "$now_ar" '
                 (.accounts // {}) | to_entries[] | .value |
-                select(.refresh_expires_at != null and .refresh_expires_at <= $now) |
-                "\(.email)|\(.org_uuid)"' "$ccx_vault" 2>/dev/null)
+                (try ((.blob | fromjson).claudeAiOauth.refreshTokenExpiresAt) catch null) as $exp |
+                select($exp != null and ($exp / 1000) <= $now) |
+                "\(.email)|\(.org_uuid)"' "$ccx_blobs" 2>/dev/null)
         fi
         entries=$(jq -r --argjson now "$now_ar" '
             to_entries[] |
