@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
-"""ccx — lossless Claude Code account vault and headroom board.
+"""ccx — Claude Code multi-account router and headroom board.
 
-Claude Code keeps ONE credential slot (Keychain item "Claude Code-credentials"),
-so /login clobbers whichever account was active. ccx snapshots the slot into a
-per-account vault (one Keychain item per account) so no login is ever lost, and
-ranks accounts by remaining rate-limit headroom (reset-aware, from
-~/.claude/account-resets.json).
+cc's credential store (decompiled 2.1.214) is 'keychain-with-plaintext-fallback',
+re-read on a ~30s TTL: the Keychain item "Claude Code-credentials" wins whenever
+it exists; ~/.claude/.credentials.json is read only when it doesn't. On refresh,
+cc recreates the keychain slot itself and deletes the file. ccx therefore stores
+every account's full OAuth blob in ~/.ccx/blobs.json and switches by writing the
+FILE then DELETING the keychain slot — cc's next ~30s re-read lands on the file,
+mid-session. Accounts are ranked by remaining rate-limit headroom (reset-aware).
 
-ccx only ever READS the live slot. It never writes it: macOS pins the slot's
-partition list to whoever writes it, so a programmatic swap makes every reader
-storm password prompts (2026-07-17 incident). Switching accounts is /login's
-job; `ccx switch` just says which account to pick. Only identity metadata
-lands in ~/.claude/ccx-vault.json.
+ccx NEVER adds or modifies the Keychain live slot. macOS pins the slot's
+partition list to whoever writes it, so a programmatic Keychain write makes
+every reader storm password prompts (2026-07-17 incident). Deleting the slot
+re-pins nothing — cc recreates it itself — and is cc's own logout primitive.
 
-Commands:
-  enroll          snapshot the active account into the vault (one-shot)
-  mirror          loop: re-snapshot the slot whenever it changes (run as daemon)
-  ls              vaulted accounts + reset-aware headroom estimates
-  best            print the vaulted account with the most headroom
-  switch TARGET   print which account to pick in /login (advisory; never writes)
-  selftest        keychain round-trip on a scratch item (never touches live/vault)
+Router commands:
+  route           daemon: poll all accounts, switch the creds file to the
+                  freshest when the live one runs low (AUTO) or hold a pin (SET)
+  set LABEL       pin the live account to LABEL and hold it
+  auto            hand routing back to the daemon
+  status          mode + per-account 5h headroom + ⚠login flags
+  poll / migrate  repaint the board / seed blobs.json from the legacy vault
+Legacy Keychain-vault board (never writes the live slot): enroll, ls, best, switch, selftest.
 """
 
 from __future__ import annotations
@@ -81,10 +83,32 @@ def kc_read(service: str, account: str | None = None) -> str | None:
     if account is not None:
         cmd += ["-a", account]
     cmd.append("-w")
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    except subprocess.TimeoutExpired:
+        return None  # wedged securityd must not hang the caller (it may hold the flock)
     if r.returncode != 0:
         return None
     return r.stdout.rstrip("\n")
+
+
+def kc_slot_status(service: str) -> str:
+    """'present' | 'absent' | 'unknown' — metadata-only probe (no secret read, so
+    it works even when the keychain is locked and a -w read would be refused)."""
+    try:
+        r = subprocess.run(
+            ["security", "find-generic-password", "-s", service],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except subprocess.TimeoutExpired:
+        return "unknown"
+    if r.returncode == 0:
+        return "present"
+    if r.returncode == 44:  # errSecItemNotFound
+        return "absent"
+    return "unknown"
 
 
 def kc_vault_put(account: str, secret: str, service: str = VAULT_SERVICE) -> None:
@@ -115,12 +139,14 @@ def kc_vault_put(account: str, secret: str, service: str = VAULT_SERVICE) -> Non
 
 
 
-def kc_delete(service: str, account: str) -> None:
-    subprocess.run(
-        ["security", "delete-generic-password", "-s", service, "-a", account],
-        capture_output=True,
-        text=True,
-    )
+def kc_delete(service: str, account: str | None = None) -> None:
+    cmd = ["security", "delete-generic-password", "-s", service]
+    if account is not None:
+        cmd += ["-a", account]
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    except subprocess.TimeoutExpired:
+        pass  # caller re-probes the slot; a hang must not wedge the flock holder
 
 
 
@@ -424,15 +450,32 @@ def resets_row(resets: dict, email: str | None, org_uuid: str | None) -> dict:
 # ── core ops ──────────────────────────────────────────────────────────────
 
 
+_lock_depth = 0  # ccx is single-threaded; nested locked() must not re-flock
+
+
 @contextmanager
 def locked(blocking: bool = True):
+    # Reentrant within this process. macOS flock ties the lock to the open file
+    # description, so a second open()+flock from the SAME process (route_once
+    # holds it → poll's merge_reset_rows re-takes it) blocks forever. Only the
+    # outermost frame flocks; nested calls are no-ops.
+    global _lock_depth
+    if _lock_depth > 0:
+        _lock_depth += 1
+        try:
+            yield
+        finally:
+            _lock_depth -= 1
+        return
     LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     handle = open(LOCK_PATH, "w")
     flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
     try:
         fcntl.flock(handle, flags)
+        _lock_depth = 1
         yield
     finally:
+        _lock_depth = 0
         fcntl.flock(handle, fcntl.LOCK_UN)
         handle.close()
 
@@ -507,8 +550,7 @@ def resolve_target(meta: dict, needle: str, pairs) -> tuple[str, dict]:
         die(
             f"'{needle}' is not in the vault. Vaulted: "
             + (", ".join(sorted(vault_labels(meta, pairs))) or "(none)")
-            + ". Log into it once with the mirror running (or run `ccx enroll` while "
-            "it is active) and it will be captured."
+            + ". Run `ccx enroll` while it is active and it will be captured."
         )
     if len(matches) > 1:
         labels = ", ".join(
@@ -559,8 +601,8 @@ def cmd_enroll(_args) -> None:
 
 def merge_reset_rows(rows: dict[str, dict]) -> None:
     """Write freshly-polled rows into account-resets.json, preserving every row
-    we didn't poll. Re-reads under the ccx lock so a concurrent statusline write
-    (its own atomic mv of the active row) is not lost. Atomic rename."""
+    we didn't poll. Re-reads under the ccx lock (serializes ccx writers only —
+    the statusline writes this file without the lock). Atomic rename."""
     if not rows:
         return
     with locked():
@@ -572,40 +614,6 @@ def merge_reset_rows(rows: dict[str, dict]) -> None:
         os.replace(tmp, RESETS_PATH)
 
 
-def poll_all_usage(meta: dict, *, skip_active: bool = True) -> int:
-    """Refresh account-resets.json for every vaulted account with a live access
-    token — the statusline board only auto-polls the active account, so the
-    other rows would otherwise sit frozen. Pure reads (access token only): no
-    refresh, no rotation. Returns the number of rows refreshed.
-
-    The active account is skipped by default: statusline owns its row at 60s
-    with interpolation, and letting each writer own disjoint rows avoids a
-    two-writer fight over the same one."""
-    now = int(time.time())
-    live_sha = meta.get("last_live_sha")
-    fresh: dict[str, dict] = {}
-    for key, entry in meta["accounts"].items():
-        if skip_active and entry.get("blob_sha256") == live_sha:
-            continue
-        blob = kc_read(VAULT_SERVICE, key)
-        if not blob:
-            continue
-        access_exp = blob_access_expiry(blob)
-        if access_exp is not None and now >= access_exp:
-            continue  # expired access token would 401; leave the row reset-aware
-        token = blob_access_token(blob)
-        if not token:
-            continue
-        usage = fetch_usage(token)
-        if usage is None:
-            continue
-        fresh[f"{entry.get('email')}|{entry.get('org_uuid')}"] = usage_to_reset_row(
-            entry.get("email"), entry.get("org_uuid"), usage, now
-        )
-    merge_reset_rows(fresh)
-    return len(fresh)
-
-
 def cmd_poll(_args) -> None:
     """Query every stored account's remaining limits and repaint the board."""
     n = poll_blobs_usage(load_blobs())
@@ -615,7 +623,8 @@ def cmd_poll(_args) -> None:
 # ── token vault + router (zero keychain) ──────────────────────────────────
 # Long-lived per-account tokens minted by `claude setup-token`, stored in a
 # 0600 file OUTSIDE ~/.claude (the nightly archival chain mirrors ~/.claude
-# to remote-host in plaintext — tokens must never land there). Routing injects
+# session data to remote-host in plaintext — long-lived tokens must never land in an
+# archived path). Routing injects
 # CLAUDE_CODE_OAUTH_TOKEN into the child env, which outranks keychain auth;
 # the live keychain slot stays 100% Claude-Code-owned.
 
@@ -664,11 +673,44 @@ def _write_0600(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
+def _preserve_corrupt(path: Path) -> None:
+    """Copy an unparseable store aside so a bad read can't silently destroy it."""
+    try:
+        content = path.read_bytes()
+        newest = max(path.parent.glob(f"{path.name}.corrupt.*"), default=None)
+        if newest is not None and newest.read_bytes() == content:
+            return  # already preserved; don't pile up one copy per daemon pass
+        backup = path.with_name(f"{path.name}.corrupt.{int(time.time())}")
+        n = 0
+        while backup.exists():  # same-second different corruption: never clobber a backup
+            n += 1
+            backup = path.with_name(f"{path.name}.corrupt.{int(time.time())}.{n}")
+        shutil.copy2(path, backup)
+        log_line(f"warn: unreadable {path.name} preserved as {backup.name}")
+    except OSError:
+        pass
+
+
 def load_blobs() -> dict:
     try:
-        return json.loads(BLOBS_PATH.read_text())
-    except (OSError, json.JSONDecodeError):
+        raw = BLOBS_PATH.read_text()
+    except FileNotFoundError:
         return {"version": 1, "accounts": {}}
+    except OSError as exc:
+        # Present but unreadable (perms, I/O): treating it as empty would let the
+        # next capture overwrite the store with one account. Refuse instead.
+        raise CcxError(f"{BLOBS_PATH} unreadable ({exc}) — refusing to treat as empty") from exc
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        # Readable but corrupt: preserve it before any capture overwrites the store,
+        # so a bad parse never silently destroys the other accounts' stored logins.
+        _preserve_corrupt(BLOBS_PATH)
+        return {"version": 1, "accounts": {}}
+    if not isinstance(parsed, dict):
+        _preserve_corrupt(BLOBS_PATH)
+        return {"version": 1, "accounts": {}}
+    return parsed
 
 
 def save_blobs(blobs: dict) -> None:
@@ -700,18 +742,33 @@ def migrate_vault_to_blobs() -> int:
 
 
 def write_live_creds(blob: str) -> None:
-    """Atomic 0600 write of ~/.claude/.credentials.json — the one file cc reads.
-    FILE ONLY; never the keychain (that write is what stormed 2026-07-17)."""
+    """Atomic 0600 write of ~/.claude/.credentials.json. FILE ONLY; the live
+    keychain slot is never added/modified (that write is what stormed
+    2026-07-17 — deletion is the only sanctioned keychain-slot operation)."""
     _write_0600(CRED_FILE, blob)
 
 
-def capture_live_to_blobs(blobs: dict) -> str | None:
-    """After cc refreshes the active account it rewrites .credentials.json;
-    fold that fresh blob back into the store so the account stays pollable and
-    its next restore is current. Returns the active label if identified."""
+def live_cred() -> tuple[str | None, str | None]:
+    """The credential cc is actually using, mirroring cc's own read order
+    (its store is literally 'keychain-with-plaintext-fallback', re-read on a
+    ~30s TTL): the keychain slot when it exists, else .credentials.json.
+    Returns (blob, 'keychain'|'file') or (None, None)."""
+    kc = kc_read(LIVE_SERVICE)
+    if kc:
+        return kc, "keychain"
     try:
-        live = CRED_FILE.read_text()
+        return CRED_FILE.read_text(), "file"
     except OSError:
+        return None, None
+
+
+def capture_live_to_blobs(blobs: dict) -> str | None:
+    """Fold cc's current credential back into the store so the account stays
+    pollable and its next restore is current. cc refreshes into the KEYCHAIN
+    (recreating the slot and deleting the file), so the live source oscillates
+    keychain<->file. Returns the active label if identified."""
+    live, _src = live_cred()
+    if live is None:
         return None
     tok = blob_access_token(live)
     if not tok:
@@ -732,12 +789,22 @@ def capture_live_to_blobs(blobs: dict) -> str | None:
 
 
 def apply_account(label: str, blobs: dict) -> bool:
-    """Overwrite ~/.claude/.credentials.json with `label`'s full blob so cc
-    switches to it. Returns False if we hold no blob for that account."""
+    """Make `label` the live account. cc reads keychain-first with the file as
+    fallback, so the switch is: write the file, then DELETE the keychain slot —
+    cc's next ~30s re-read misses the keychain and picks up the file, mid-
+    session. Deletion never re-pins ACLs (there is nothing left to pin) and cc
+    recreates the slot itself on its next refresh; the slot is never
+    added/modified from here. Returns False if we hold no blob for `label`."""
     e = (blobs.get("accounts") or {}).get(label)
     if not e or not e.get("blob"):
         return False
     write_live_creds(e["blob"])
+    status = kc_slot_status(LIVE_SERVICE)
+    if status == "present":
+        kc_delete(LIVE_SERVICE)
+        status = kc_slot_status(LIVE_SERVICE)
+    if status != "absent":  # survived delete, or unreadable (locked keychain / wedged securityd)
+        log_line(f"warn: keychain live slot {status} after switch; cc may keep reading it")
     return True
 
 
@@ -978,6 +1045,13 @@ def cmd_pick_env(_args) -> None:
 
 
 ROUTE_AT_DEFAULT = 80.0  # switch when the active account's 5h usage crosses this
+ROUTE_HYSTERESIS_PCT = 10.0  # below cap: only switch for a headroom gain this large
+ROUTE_CAP_PCT = 95.0  # at/above this the live account is ~capped: escape to a usable account
+ROUTE_MIN_DWELL_S = 300.0  # >= this long between AUTO switches (each cold-starts a prompt cache)
+
+# Monotonic so an NTP step-back can't wedge routing; None = never switched this
+# process. Daemon is one long-lived process, so no persistence needed.
+_last_switch_ts: float | None = None
 
 
 def notify(text: str, title: str = "ccx") -> None:
@@ -995,19 +1069,33 @@ def route_once(threshold: float) -> str | None:
     and a better one exists, overwrite .credentials.json with it. In SET, keep
     the pinned account live. Returns a log line if it switched, else None.
     Only ever writes files; never the keychain."""
+    global _last_switch_ts
     with locked():
         blobs = load_blobs()
+        capture_live_to_blobs(blobs)  # fold any cc refresh from before this pass
+        poll_blobs_usage(blobs)  # seconds of network per account
+        # cc may have refreshed (and rotated) the live token during the poll;
+        # re-capture so we never overwrite an unsaved rotation below.
         active = capture_live_to_blobs(blobs)
-        poll_blobs_usage(blobs)
-        rows = route_rows(blobs, active, time.time())
+        now = time.time()
+        rows = route_rows(blobs, active, now)
         by_label = {r["label"]: r for r in rows}
         mode = load_mode()
 
         if mode["mode"] == "set":
             target = mode.get("label")
-            if target and target != active and not (by_label.get(target) or {}).get("expired"):
-                if apply_account(target, blobs):
-                    return f"SET {active} → {target}"
+            if not target or target == active:
+                return None
+            if (by_label.get(target) or {}).get("expired"):
+                return None
+            # active is None both for "no live cred anywhere" (seed it) and
+            # "live cred present but profile fetch failed" (unattributed). Don't
+            # overwrite an unattributed live token — it may be a cc-rotated one
+            # we'd clobber.
+            if active is None and live_cred()[0] is not None:
+                return None
+            if apply_account(target, blobs):
+                return f"SET {active or '?'} → {target}"
             return None
 
         # AUTO: only act once the live account is genuinely low
@@ -1019,7 +1107,23 @@ def route_once(threshold: float) -> str | None:
             return None
         cur_pct = cur["five_hour"]
         pick_pct = by_label[pick]["five_hour"]
+        if pick_pct is None:  # no board row for the pick: never switch (also no log crash)
+            return None
+        if cur_pct >= ROUTE_CAP_PCT:
+            # Live account is ~capped. Only worth escaping to one with real headroom
+            # (below the cap); if every account is capped there's nothing better, so
+            # hold — never thrash between two dead accounts (that was the flap).
+            if pick_pct >= ROUTE_CAP_PCT:
+                return None
+        elif pick_pct >= cur_pct - ROUTE_HYSTERESIS_PCT:
+            # Not capped: hold unless a MEANINGFULLY fresher account exists.
+            return None
+        # Each switch cold-starts the new account's prompt cache, so cap the rate at
+        # one per dwell regardless of how the board drifts under usage feedback.
+        if _last_switch_ts is not None and time.monotonic() - _last_switch_ts < ROUTE_MIN_DWELL_S:
+            return None
         if apply_account(pick, blobs):
+            _last_switch_ts = time.monotonic()
             return f"ROUTED {active} → {pick} (5h {cur_pct:.0f}% → {pick_pct:.0f}%)"
     return None
 
@@ -1050,11 +1154,24 @@ def cmd_route(args) -> None:
 
 def cmd_set(args) -> None:
     """Pin the live account to <label> and hold it there (manual mode)."""
-    blobs = load_blobs()
-    if args.label not in (blobs.get("accounts") or {}):
-        die(f"'{args.label}' has no stored blob — run `ccx migrate` or mint/login it first")
-    save_mode("set", args.label)
-    ok = apply_account(args.label, blobs)
+    with locked():
+        blobs = load_blobs()
+        e = (blobs.get("accounts") or {}).get(args.label)
+        if not e:
+            die(f"'{args.label}' has no stored blob — run `ccx migrate` or mint/login it first")
+        if blob_expired(e.get("blob", ""), time.time()):
+            die(f"'{args.label}' refresh token is expired — /login it first (won't write a dead cred)")
+        active = capture_live_to_blobs(blobs)  # fold any unsaved rotation of the outgoing account
+        # Mirror route_once's SET guard: live creds present but unattributable
+        # (offline / profile fetch failed) may be a cc-rotated token not yet in the
+        # store — overwriting would lose that account's login.
+        if active is None and live_cred()[0] is not None:
+            die(
+                "live creds present but unattributable (offline, or profile fetch failed) — "
+                "retry online before forcing a switch"
+            )
+        save_mode("set", args.label)
+        ok = apply_account(args.label, blobs)
     print(f"SET → {args.label}" + ("" if ok else " (mode set; blob missing, not applied)"))
     print("new + restarted sessions use it; a running session picks it up on its next creds re-read")
 
@@ -1073,9 +1190,10 @@ def cmd_auto(_args) -> None:
 
 def cmd_status(_args) -> None:
     mode = load_mode()
-    blobs = load_blobs()
-    active = capture_live_to_blobs(blobs)
-    rows = route_rows(blobs, active, time.time())
+    with locked():
+        blobs = load_blobs()
+        active = capture_live_to_blobs(blobs)
+        rows = route_rows(blobs, active, time.time())
     tag = f"SET → {mode['label']}" if mode["mode"] == "set" else "AUTO"
     print(f"mode: {tag}   live: {active or '?'}")
     for r in rows:
@@ -1086,7 +1204,8 @@ def cmd_status(_args) -> None:
 
 
 def cmd_migrate(_args) -> None:
-    n = migrate_vault_to_blobs()
+    with locked():
+        n = migrate_vault_to_blobs()
     print(f"seeded {n} account blob(s) into {BLOBS_PATH}")
 
 
@@ -1135,7 +1254,7 @@ def cmd_ls(_args) -> None:
     meta = load_meta()
     rows = _account_rows(meta)
     if not rows:
-        print("vault is empty — run `ccx enroll` (or start the mirror) on each account once")
+        print("vault is empty — run `ccx enroll` on each account once")
         return
     excludes = excluded_labels()
     print(f"{'':2}{'label':<12} {'email':<32} {'5h':>6} {'7d':>6} {'fable':>6}")

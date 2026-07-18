@@ -2,6 +2,9 @@
 
 import json
 import sys
+import threading
+import time
+import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -327,3 +330,341 @@ class TestResolveTarget:
     def test_missing_dies(self):
         with pytest.raises(SystemExit):
             ccx.resolve_target(self.META, "nope", PAIRS)
+
+
+def _live_blob(atok, future_ms=3_000_000_000_000):
+    # access + refresh both far-future: poll won't skip it, cred isn't expired
+    return json.dumps({"claudeAiOauth": {"accessToken": atok, "refreshToken": "r",
+                                         "expiresAt": future_ms, "refreshTokenExpiresAt": future_ms}})
+
+
+class TestLockedReentrant:
+    """The BLOCK deadlock: route_once holds locked(), poll's merge_reset_rows
+    re-takes it on a second fd — non-reentrant flock self-blocks in-process."""
+
+    def test_nested_locked_does_not_deadlock(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ccx, "LOCK_PATH", tmp_path / "ccx.lock")
+        monkeypatch.setattr(ccx, "_lock_depth", 0)
+        done = threading.Event()
+
+        def run():
+            with ccx.locked():
+                with ccx.locked():  # nested acquire must return, not block
+                    pass
+            done.set()
+
+        threading.Thread(target=run, daemon=True).start()
+        assert done.wait(timeout=5), "nested locked() deadlocked"
+
+
+class TestRouteOnceNoDeadlock:
+    def _paths(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ccx, "LOCK_PATH", tmp_path / "ccx.lock")
+        monkeypatch.setattr(ccx, "BLOBS_PATH", tmp_path / "blobs.json")
+        monkeypatch.setattr(ccx, "RESETS_PATH", tmp_path / "resets.json")
+        monkeypatch.setattr(ccx, "MODE_PATH", tmp_path / "mode.json")
+        monkeypatch.setattr(ccx, "CRED_FILE", tmp_path / ".credentials.json")
+        monkeypatch.setattr(ccx, "_lock_depth", 0)
+        monkeypatch.setattr(ccx, "_last_switch_ts", None)
+        # hermetic: never read/delete the REAL keychain from tests
+        monkeypatch.setattr(ccx, "kc_read", lambda service, account=None: None)
+        monkeypatch.setattr(ccx, "kc_slot_status", lambda service: "absent")
+        monkeypatch.setattr(ccx, "kc_delete", lambda service, account=None: None)
+
+    def test_route_once_completes_when_poll_yields_rows(self, tmp_path, monkeypatch):
+        # Real poll -> merge_reset_rows re-enters the lock. Pre-fix: hangs here.
+        self._paths(tmp_path, monkeypatch)
+        blobs = {"accounts": {"gmail": {"email": "g@x", "org_uuid": "o1",
+                                        "blob": _live_blob("tok-g")}}}
+        (tmp_path / "blobs.json").write_text(json.dumps(blobs))
+        monkeypatch.setattr(ccx, "fetch_usage", lambda tok: {
+            "five_hour": {"utilization": 10, "resets_at": "2026-07-17T22:00:00Z"},
+            "seven_day": {"utilization": 5, "resets_at": "2026-07-23T10:00:00Z"}, "limits": []})
+        monkeypatch.setattr(ccx, "fetch_profile", lambda tok: None)
+        done, errbox = threading.Event(), []
+
+        def run():
+            try:
+                ccx.route_once(80.0)
+            except Exception as exc:  # noqa: BLE001
+                errbox.append(exc)
+            finally:
+                done.set()
+
+        threading.Thread(target=run, daemon=True).start()
+        assert done.wait(timeout=5), "route_once deadlocked (nested locked() self-blocks)"
+        assert not errbox, f"route_once raised: {errbox}"
+        assert (tmp_path / "resets.json").exists()  # proves it reached merge under the lock
+
+
+class TestRouteDecision:
+    """AUTO/SET switch logic in route_once, with poll/attribution stubbed so only
+    the decision path runs. apply_account (the real file write) is NOT stubbed."""
+
+    def _wire(self, tmp_path, monkeypatch, rows, active, mode, blobs):
+        monkeypatch.setattr(ccx, "LOCK_PATH", tmp_path / "ccx.lock")
+        monkeypatch.setattr(ccx, "CRED_FILE", tmp_path / ".credentials.json")
+        monkeypatch.setattr(ccx, "_lock_depth", 0)
+        monkeypatch.setattr(ccx, "_last_switch_ts", None)  # never switched: dwell open
+        monkeypatch.setattr(ccx, "load_blobs", lambda: blobs)
+        monkeypatch.setattr(ccx, "poll_blobs_usage", lambda b: 0)
+        monkeypatch.setattr(ccx, "capture_live_to_blobs", lambda b: active)
+        monkeypatch.setattr(ccx, "route_rows", lambda b, a, t: rows)
+        monkeypatch.setattr(ccx, "load_mode", lambda: mode)
+        monkeypatch.setattr(ccx, "excluded_labels", lambda: set())
+        # hermetic: never read/delete the REAL keychain from tests
+        self.kc_deletes = []
+        monkeypatch.setattr(ccx, "kc_read", lambda service, account=None: None)
+        monkeypatch.setattr(ccx, "kc_slot_status", lambda service: "absent")
+        monkeypatch.setattr(ccx, "kc_delete",
+                            lambda service, account=None: self.kc_deletes.append(service))
+
+    def test_auto_holds_when_pick_not_meaningfully_fresher(self, tmp_path, monkeypatch):
+        # A active @85 (>=80), B @82 — 3 pts fresher. Pre-fix switches A->B then
+        # B->A every pass (ping-pong). Fixed: holds (needs >= hysteresis fresher).
+        rows = [ccx_row("A", 85.0, active=True), ccx_row("B", 82.0)]
+        self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "auto"},
+                   {"accounts": {"B": {"blob": "BLOB-B"}}})
+        assert ccx.route_once(80.0) is None
+        assert not ccx.CRED_FILE.exists()  # no switch written
+
+    def test_auto_switches_when_pick_much_fresher(self, tmp_path, monkeypatch):
+        rows = [ccx_row("A", 85.0, active=True), ccx_row("B", 70.0)]
+        self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "auto"},
+                   {"accounts": {"B": {"blob": "BLOB-B"}}})
+        line = ccx.route_once(80.0)
+        assert line and "ROUTED A → B" in line
+        assert ccx.CRED_FILE.read_text() == "BLOB-B"
+
+    def test_auto_no_switch_below_threshold(self, tmp_path, monkeypatch):
+        rows = [ccx_row("A", 50.0, active=True), ccx_row("B", 5.0)]
+        self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "auto"},
+                   {"accounts": {"B": {"blob": "BLOB-B"}}})
+        assert ccx.route_once(80.0) is None
+        assert not ccx.CRED_FILE.exists()
+
+    def test_auto_pick_without_board_row_does_not_crash(self, tmp_path, monkeypatch):
+        # B has no five_hour (poll skipped it) -> pick_pct None must not TypeError
+        rows = [ccx_row("A", 90.0, active=True), ccx_row("B", None)]
+        self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "auto"},
+                   {"accounts": {"B": {"blob": "BLOB-B"}}})
+        assert ccx.route_once(80.0) is None
+        assert not ccx.CRED_FILE.exists()
+
+    def test_set_holds_when_live_present_but_unattributed(self, tmp_path, monkeypatch):
+        # CRED_FILE present, capture returns None (profile down) -> a cc-rotated
+        # token may be live; must NOT overwrite it with the stored blob.
+        rows = [ccx_row("B", 5.0)]
+        self._wire(tmp_path, monkeypatch, rows, None, {"mode": "set", "label": "B"},
+                   {"accounts": {"B": {"blob": "BLOB-B"}}})
+        ccx.CRED_FILE.write_text("LIVE-ROTATED")
+        assert ccx.route_once(80.0) is None
+        assert ccx.CRED_FILE.read_text() == "LIVE-ROTATED"  # untouched
+
+    def test_set_seeds_when_no_cred_file(self, tmp_path, monkeypatch):
+        rows = [ccx_row("B", 5.0)]
+        self._wire(tmp_path, monkeypatch, rows, None, {"mode": "set", "label": "B"},
+                   {"accounts": {"B": {"blob": "BLOB-B"}}})
+        assert "SET" in (ccx.route_once(80.0) or "")
+        assert ccx.CRED_FILE.read_text() == "BLOB-B"
+
+    def test_auto_capped_escapes_to_a_usable_account(self, tmp_path, monkeypatch):
+        # active @100 (>= cap 95), best alt @91 (below cap = real headroom). Below
+        # cap the 9-pt gap would hold on hysteresis; capped, we escape to it.
+        rows = [ccx_row("A", 100.0, active=True), ccx_row("B", 91.0)]
+        self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "auto"},
+                   {"accounts": {"B": {"blob": "BLOB-B"}}})
+        line = ccx.route_once(80.0)
+        assert line and "ROUTED A → B" in line
+        assert ccx.CRED_FILE.read_text() == "BLOB-B"
+
+    def test_auto_capped_holds_when_every_alt_is_also_capped(self, tmp_path, monkeypatch):
+        # active capped @96, only alt @98 also >= cap -> hold. Two near-capped
+        # accounts never swap: this is what stops the feedback ping-pong.
+        rows = [ccx_row("A", 96.0, active=True), ccx_row("B", 98.0)]
+        self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "auto"},
+                   {"accounts": {"B": {"blob": "BLOB-B"}}})
+        assert ccx.route_once(80.0) is None
+        assert not ccx.CRED_FILE.exists()
+
+    def test_auto_dwell_rate_limits_switching(self, tmp_path, monkeypatch):
+        # Even a far-fresher pick is held if we switched within the dwell — each
+        # switch cold-starts a prompt cache, so the daemon switches at most once
+        # per ROUTE_MIN_DWELL_S.
+        rows = [ccx_row("A", 100.0, active=True), ccx_row("B", 20.0)]
+        self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "auto"},
+                   {"accounts": {"B": {"blob": "BLOB-B"}}})
+        monkeypatch.setattr(ccx, "_last_switch_ts", time.monotonic())  # just switched
+        assert ccx.route_once(80.0) is None
+        assert not ccx.CRED_FILE.exists()
+        monkeypatch.setattr(ccx, "_last_switch_ts", time.monotonic() - ccx.ROUTE_MIN_DWELL_S - 1)
+        line = ccx.route_once(80.0)
+        assert line and "ROUTED A → B" in line
+        assert ccx._last_switch_ts is not None and ccx._last_switch_ts > 1  # stamp advanced
+
+
+class TestCmdSet:
+    def _paths(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ccx, "LOCK_PATH", tmp_path / "ccx.lock")
+        monkeypatch.setattr(ccx, "CRED_FILE", tmp_path / ".credentials.json")
+        monkeypatch.setattr(ccx, "MODE_PATH", tmp_path / "mode.json")
+        monkeypatch.setattr(ccx, "BLOBS_PATH", tmp_path / "blobs.json")
+        monkeypatch.setattr(ccx, "_lock_depth", 0)
+        # never reach the network / real store / real keychain from tests
+        monkeypatch.setattr(ccx, "fetch_profile", lambda tok: None)
+        monkeypatch.setattr(ccx, "kc_read", lambda service, account=None: None)
+        monkeypatch.setattr(ccx, "kc_slot_status", lambda service: "absent")
+        monkeypatch.setattr(ccx, "kc_delete", lambda service, account=None: None)
+
+    def test_refuses_expired_blob(self, tmp_path, monkeypatch):
+        self._paths(tmp_path, monkeypatch)
+        expired = _live_blob("a", future_ms=1_000_000_000_000)  # 2001, past
+        monkeypatch.setattr(ccx, "load_blobs", lambda: {"accounts": {"B": {"blob": expired}}})
+        with pytest.raises(SystemExit):
+            ccx.cmd_set(types.SimpleNamespace(label="B"))
+        assert not ccx.CRED_FILE.exists()  # dead cred NOT written
+
+    def test_applies_live_blob(self, tmp_path, monkeypatch):
+        self._paths(tmp_path, monkeypatch)
+        live = _live_blob("a")
+        monkeypatch.setattr(ccx, "load_blobs", lambda: {"accounts": {"B": {"blob": live}}})
+        ccx.cmd_set(types.SimpleNamespace(label="B"))
+        assert ccx.CRED_FILE.read_text() == live
+
+    def test_captures_live_before_applying(self, tmp_path, monkeypatch):
+        # regression: cmd_set must fold an outgoing rotation into blobs (capture)
+        # BEFORE overwriting the live file (apply), so a switch never drops the
+        # departing account's freshly-rotated token.
+        self._paths(tmp_path, monkeypatch)
+        live = _live_blob("a")
+        monkeypatch.setattr(ccx, "load_blobs", lambda: {"accounts": {"B": {"blob": live}}})
+        monkeypatch.setattr(ccx, "save_mode", lambda m, label: None)
+        calls = []
+        monkeypatch.setattr(ccx, "capture_live_to_blobs", lambda b: calls.append("capture"))
+        real_apply = ccx.apply_account
+        monkeypatch.setattr(ccx, "apply_account",
+                            lambda label, b: (calls.append("apply"), real_apply(label, b))[1])
+        ccx.cmd_set(types.SimpleNamespace(label="B"))
+        assert calls == ["capture", "apply"]
+        assert ccx.CRED_FILE.read_text() == live
+
+    def test_refuses_when_live_present_but_unattributable(self, tmp_path, monkeypatch):
+        # cc rotated the live token (not yet in the store) and profile fetch fails
+        # (stubbed None in _paths) -> capture can't attribute it. Overwriting would
+        # lose that account's login, so refuse and leave the live cred untouched.
+        self._paths(tmp_path, monkeypatch)
+        monkeypatch.setattr(ccx, "load_blobs",
+                            lambda: {"accounts": {"B": {"blob": _live_blob("b")}}})
+        ccx.CRED_FILE.write_text(_live_blob("ROTATED-UNKNOWN"))
+        with pytest.raises(SystemExit):
+            ccx.cmd_set(types.SimpleNamespace(label="B"))
+        assert "ROTATED-UNKNOWN" in ccx.CRED_FILE.read_text()  # not clobbered
+
+
+class TestLoadBlobs:
+    def test_corrupt_store_is_preserved_not_destroyed(self, tmp_path, monkeypatch):
+        blobs_path = tmp_path / "blobs.json"
+        blobs_path.write_text("NOT JSON {{{")
+        monkeypatch.setattr(ccx, "BLOBS_PATH", blobs_path)
+        monkeypatch.setattr(ccx, "MIRROR_LOG", tmp_path / "log")  # keep log_line off real paths
+        assert ccx.load_blobs() == {"version": 1, "accounts": {}}
+        backups = list(tmp_path.glob("blobs.json.corrupt.*"))
+        assert len(backups) == 1 and backups[0].read_text() == "NOT JSON {{{"
+        # still-corrupt on the next read: no second identical backup piles up
+        assert ccx.load_blobs() == {"version": 1, "accounts": {}}
+        assert len(list(tmp_path.glob("blobs.json.corrupt.*"))) == 1
+
+    def test_missing_store_returns_empty_without_backup(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ccx, "BLOBS_PATH", tmp_path / "nope.json")
+        assert ccx.load_blobs() == {"version": 1, "accounts": {}}
+        assert not list(tmp_path.glob("*.corrupt.*"))
+
+    def test_unreadable_store_refuses_instead_of_empty(self, tmp_path, monkeypatch):
+        # present-but-unreadable (perms) must NOT read as empty — the next capture
+        # would overwrite the store with a single account.
+        blobs_path = tmp_path / "blobs.json"
+        blobs_path.write_text('{"version": 1, "accounts": {"a": {}, "b": {}}}')
+        blobs_path.chmod(0o000)
+        monkeypatch.setattr(ccx, "BLOBS_PATH", blobs_path)
+        try:
+            with pytest.raises(ccx.CcxError):
+                ccx.load_blobs()
+        finally:
+            blobs_path.chmod(0o600)
+
+    def test_non_dict_store_is_preserved_and_empty(self, tmp_path, monkeypatch):
+        blobs_path = tmp_path / "blobs.json"
+        blobs_path.write_text("[1, 2, 3]")
+        monkeypatch.setattr(ccx, "BLOBS_PATH", blobs_path)
+        monkeypatch.setattr(ccx, "MIRROR_LOG", tmp_path / "log")
+        assert ccx.load_blobs() == {"version": 1, "accounts": {}}
+        assert len(list(tmp_path.glob("blobs.json.corrupt.*"))) == 1
+
+
+class TestLiveCredAndSwitch:
+    """The macOS switch primitive: cc reads keychain-first ('keychain-with-
+    plaintext-fallback', ~30s TTL), so a switch = write file + DELETE slot."""
+
+    def test_live_cred_prefers_keychain_over_file(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ccx, "CRED_FILE", tmp_path / ".credentials.json")
+        ccx.CRED_FILE.write_text("FILE-BLOB")
+        monkeypatch.setattr(ccx, "kc_read", lambda service, account=None: "KC-BLOB")
+        assert ccx.live_cred() == ("KC-BLOB", "keychain")
+
+    def test_live_cred_falls_back_to_file_then_none(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ccx, "CRED_FILE", tmp_path / ".credentials.json")
+        monkeypatch.setattr(ccx, "kc_read", lambda service, account=None: None)
+        assert ccx.live_cred() == (None, None)
+        ccx.CRED_FILE.write_text("FILE-BLOB")
+        assert ccx.live_cred() == ("FILE-BLOB", "file")
+
+    def test_capture_reads_the_keychain_source(self, tmp_path, monkeypatch):
+        # cc refreshed into the keychain (file deleted): capture must still
+        # attribute the live account without any profile fetch when unchanged.
+        monkeypatch.setattr(ccx, "CRED_FILE", tmp_path / ".credentials.json")
+        kc_blob = _live_blob("tok-kc")
+        monkeypatch.setattr(ccx, "kc_read", lambda service, account=None: kc_blob)
+        monkeypatch.setattr(ccx, "fetch_profile",
+                            lambda tok: (_ for _ in ()).throw(AssertionError("no network")))
+        blobs = {"accounts": {"gmail": {"blob": kc_blob}}}
+        assert ccx.capture_live_to_blobs(blobs) == "gmail"
+
+    def test_apply_account_deletes_keychain_slot(self, tmp_path, monkeypatch):
+        # While the slot exists the file is invisible to cc — apply must write
+        # the file AND delete the slot so the ~30s re-read lands on the file.
+        monkeypatch.setattr(ccx, "CRED_FILE", tmp_path / ".credentials.json")
+        monkeypatch.setattr(ccx, "MIRROR_LOG", tmp_path / "log")
+        kc_state = {"present": True}
+        deletes = []
+        monkeypatch.setattr(ccx, "kc_slot_status",
+                            lambda service: "present" if kc_state["present"] else "absent")
+
+        def fake_delete(service, account=None):
+            deletes.append(service)
+            kc_state["present"] = False
+        monkeypatch.setattr(ccx, "kc_delete", fake_delete)
+        assert ccx.apply_account("B", {"accounts": {"B": {"blob": "BLOB-B"}}}) is True
+        assert ccx.CRED_FILE.read_text() == "BLOB-B"
+        assert deletes == [ccx.LIVE_SERVICE]
+        assert not (tmp_path / "log").exists()  # clean switch: no warn logged
+
+    def test_apply_account_skips_delete_when_no_slot(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ccx, "CRED_FILE", tmp_path / ".credentials.json")
+        deletes = []
+        monkeypatch.setattr(ccx, "kc_slot_status", lambda service: "absent")
+        monkeypatch.setattr(ccx, "kc_delete", lambda service, account=None: deletes.append(service))
+        assert ccx.apply_account("B", {"accounts": {"B": {"blob": "BLOB-B"}}}) is True
+        assert deletes == []  # nothing to delete; no gratuitous keychain ops
+
+    def test_apply_account_warns_when_slot_state_unknown(self, tmp_path, monkeypatch):
+        # Locked keychain / wedged securityd: the probe can't tell — apply must
+        # NOT claim a clean switch (cc may keep reading the intact slot) and
+        # must not fire a blind delete.
+        monkeypatch.setattr(ccx, "CRED_FILE", tmp_path / ".credentials.json")
+        monkeypatch.setattr(ccx, "MIRROR_LOG", tmp_path / "log")
+        deletes = []
+        monkeypatch.setattr(ccx, "kc_slot_status", lambda service: "unknown")
+        monkeypatch.setattr(ccx, "kc_delete", lambda service, account=None: deletes.append(service))
+        assert ccx.apply_account("B", {"accounts": {"B": {"blob": "BLOB-B"}}}) is True
+        assert deletes == []
+        assert "unknown" in (tmp_path / "log").read_text()
