@@ -52,11 +52,10 @@ class ClaudeStatusline < Formula
       Restart Claude Code to activate the status line.
 
       Configure: edit ~/.claude/statusline.conf
-        HOURLY_RATE=150    # enables cost tracking
         DAILY_BUDGET=20    # enables budget bar
         FORMAT=sigil       # single-line compact mode
 
-      Formats: default, sigil, sparkline, iterm2, rprompt
+      Formats: default, compact, narrow, sigil, sparkline, rprompt, iterm2
     EOS
   end
 

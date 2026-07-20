@@ -7,6 +7,8 @@
   <a href="#install">Install</a> &middot;
   <a href="#formats">Formats</a> &middot;
   <a href="#configure">Configure</a> &middot;
+  <a href="#ccx-multi-account-routing">ccx</a> &middot;
+  <a href="#token-scanning-and-redaction">Token Scanning</a> &middot;
   <a href="#macos-native">macOS Native</a> &middot;
   <a href="#how-it-works">How It Works</a>
 </p>
@@ -14,13 +16,17 @@
 ---
 
 ```
-  Opus 4.6 │ work │ my-project (feature-123*↑1)[PR✓] │ $2.14 ($8.90/d) @$5.30/h │ ⏱ 24:12 ctx:72%
-  context ●●●●●●●○○○  72%
-  current ●●●●○○○○○○  42.3% 3:45pm →full ~52m ✓18m
-  weekly  ●●●●●●●○○○  71.4% apr 4, 10:00am →full ~2.1d ✗8h
-  extra   ●●●○○○○○○○  32.0% $63.53/$200.00
-  budget  ●●●●○○○○○○  45% $4.50/$10
-  tokens  ●●●●●●○○○○  60% (11.8+48.7M)/100M +120k +45k sub (+890k/d)
+model   Opus 4.6
+time    ⏱ 24:12
+account work
+repo    my-project primary (feature-123*↑1)[PR✓]
+context ●●●●●●●●●●○○○○○  72%
+session ●●●●●●○○○○○○○○○  46.2%  resets 3:45pm
+weekly  ●●●●●●●●○○○○○○○  58%  resets apr 4, 10:00am
+fable   ●●●○○○○○○○○○○○○  24%
+budget  ●●●●○○○○○○  45%    $4.50/$10
+tokens  ●●●●●●●●●●  60%w/40%p (11.80w+7.90p=19.70M)
+usage   today 847.32k · session 118.50k · lifetime 19.70M
 ```
 
 Everything you need to not get rate-limited, blow your budget, or lose context mid-task. One bash script, zero dependencies beyond `jq`.
@@ -102,59 +108,39 @@ dispatch to the renderer; anything else launches Codex). `codex-top` monitors ex
 
 ## What You See
 
-### Line 1 — The headline
+`default` renders one labeled row per fact — the block at the top of this README. Every row below `repo` is conditional on data actually being available:
 
-```
-Opus 4.6 │ work │ my-project (feature-123*↑1)[PR✓] │ $2.14 ($8.90/d) @$5.30/h │ ⏱ 24:12 ctx:72%
-```
+| Row | Shown when | What it shows |
+|-----|-----------|----------------|
+| `model` | always | Model + effort suffix (`.low`/`.medium`/`.high`/`.xhigh`/`.max`) + `⚡fast` when Settings' fast mode is on |
+| `time` | session duration available | Wall-clock (`⏱ 24:12`); adds `idle Nm` after 30s with no user turn |
+| `account` | account resolved | Tag from `ACCOUNT_LABELS`, colored per `LABEL_COLORS` |
+| `repo` | always | Dir name, `worktree`/`primary` tag, branch (dirty `*`, `↑`/`↓` ahead/behind), PR badge |
+| `context` | always | Context-window fill — 15-dot sweet-spot bar (blue <30%, green 30–70%, yellow 70–85%, red 85%+) |
+| `session` | 5h rate-limit data available | 5h window used, 15-dot bar + `resets <time>` |
+| `weekly` | 7-day rate-limit data available | 7-day window used, 15-dot bar + `resets <date>` |
+| `fable` | account has a per-model weekly cap | That cap's usage, 15-dot bar (label = the scoped model; opt-out `SHOW_FABLE_ROW=0`) |
+| `budget` | `DAILY_BUDGET` set | Spend vs. cap, 10-dot bar |
+| `tokens` | scan data available | All-time work/personal token ratio, 10-dot bar (opt-out `SHOW_TOKENS_ROW=0`) |
+| goal row | `CHALLENGE_GOAL_M` set (see script header comment) | Progress toward a token goal, labeled `CHALLENGE_LABEL` (opt-out `SHOW_CHALLENGE_ROW=0`) |
+| `bounty` | bounty config set and uncleared | ETA to a work-token floor (opt-out `SHOW_BOUNTY_ROW=0`) |
+| `usage` | scan data available | Today / this session / lifetime totals, human-formatted |
+| `stack` | `SHOW_BACKENDS_ROW=1` | Live snapshot across Claude/Codex/hound agents (`bin/live-state.py`) |
+| per-account rows | `SHOW_ACCOUNT_RESETS=1` | One row per tracked account: 5h%, reset, week%, fable%, reset, work-unit cap |
 
-| Segment | What it means |
-|---------|---------------|
-| `Opus 4.6` | Model + effort level (`.high`, `.low`, etc.) |
-| `work` | Account label — auto-detected from OAuth email, configurable |
-| `feature-123*↑1` | Git branch, `*` = dirty, `↑1` = 1 commit ahead |
-| `[PR✓]` | PR status: `[PR✓]` approved, `[PR✗]` checks failing, `[draft]`, `[PR△]` changes requested, `[PR⋯]` pending |
-| `$2.14` | Session cost |
-| `($8.90/d)` | Daily aggregate across all sessions |
-| `@$5.30/h` | Burn rate |
-| `⏱ 24:12` | Session wall-clock |
-| `ctx:72%` | Context badge — only appears at 70%+ as a warning |
-
-### Lines 2–7 — The gauges
-
-| Line | What it tracks | Why it matters |
-|------|---------------|----------------|
-| `context` | Context window fill | At 95% your session is about to die |
-| `current` | 5-hour rate limit + reset time | The one that actually blocks you |
-| `→full ~52m` | Burn-down projection | Minutes until you hit the wall at current pace |
-| `✓18m` / `✗1.7h` | Survive indicator | Buffer until reset (✓) or downtime before reset (✗) |
-| `weekly` | 7-day rate limit + reset date | The slow squeeze |
-| `→full ~2.1d` | Weekly burn-down projection | Days/hours until weekly limit at current pace |
-| `extra` | Extra credits spent / limit | Your overflow budget |
-| `~$18 until reset` | Projected extra spend | Estimated extra credit burn until current window resets (only at 100%) |
-| `budget` | Daily spend vs your cap | Only shows if `DAILY_BUDGET` is set |
-| `tokens` | Cumulative tokens with input/output split + subagent tracking | See below |
+PR badge states: `[draft]`, `[PR✗]` checks failing, `[PR△]` changes requested, `[PR✓]` approved, `[PR⋯]` checks pending, `[PR]` open with no strong signal either way.
 
 ### Token tracking
 
-The token bar shows your all-time token usage from `stats-cache.json`, split by color:
+`tokens` and `usage` are both fed by `bin/scan-tokens.py`'s background scan of every session JSONL, cached to `~/.claude/token-scan-summary.json` (small, preferred) or `~/.claude/token-scan-cache.json` (full, fallback) — rescanned in the background whenever that cache is older than 180s.
 
-```
-tokens  ●●●●●●○○○○  60% (11.8+48.7M)/100M +120k +45k sub (+890k/d)
-        ╰cyan╯╰magenta╯     ╰cyan╯╰magenta╯
-```
-
-- **Cyan dots / number** — input tokens (your prompts)
-- **Magenta dots / number** — output tokens (Claude's responses)
-- `+120k` — tokens consumed this session
-- `+45k sub` — tokens consumed by subagents (Agent tool) in this session
-- `(+890k/d)` — daily aggregate across all sessions
-
-Subagent tokens are tracked by scanning `~/.claude/projects/<project>/<session>/subagents/*.jsonl` with a 30-second cache.
+- **`tokens`** — all-time work/personal ratio (cyan = work, magenta = personal), classified per-request by the `WORK_PATHS`/`WORK_KEYWORDS` vs `PERSONAL_PATHS`/`PERSONAL_KEYWORDS` rules in `statusline.conf`
+- **`usage`** — today / this session / lifetime, human-formatted (k/M/B)
+- Subagent (Agent tool) tokens are scanned separately (30s cache) and only break out in the optional token-goal row
 
 ### Account tagging
 
-All cost and token ledgers are tagged with your account label (e.g., `work` or `personal`), derived from your OAuth email. This lets you aggregate spend by account after the fact.
+All cost and token ledgers are tagged with your account label (e.g., `work` or `personal`), derived from your OAuth email via `ACCOUNT_LABELS`. This lets you aggregate spend by account after the fact. Two related but distinct dimensions live inside the token scanner itself: `EMAIL_PAYER_MAP` (which plan paid) and the work/personal path/keyword classifier (what the work was) — see Configure.
 
 ### Terminal tab titles
 
@@ -169,25 +155,33 @@ macOS Notification Center alerts fire automatically (once per threshold, deduped
 
 ### Automatic account detection
 
-When you `/login` to switch accounts, the status bar detects the credential change and immediately refreshes — rate limits, account label, and extra credits update across all open sessions.
+When you `/login` to switch accounts, the status bar detects the change (OAuth token hash, with a credential-file mtime fallback) and immediately refreshes — rate limits, account label, and profile data update across all open sessions.
 
 ---
 
 ## Formats
 
-Five render modes. Set `FORMAT=` in `~/.claude/statusline.conf` or `STATUSLINE_FORMAT=` env var.
+Seven render modes. Set `FORMAT=` in `~/.claude/statusline.conf` or `STATUSLINE_FORMAT=` env var.
 
 ### `default` — Multi-line dashboard (shown above)
 
-The full cockpit. Adapts to terminal width (>=100 cols wide, <100 compact).
+The full cockpit, one labeled row per fact. Auto-falls-through to `narrow` when the detected terminal width is below `NARROW_THRESHOLD` (default 60 cols).
+
+### `compact` — Context + session only
+
+Just the `context` and `session` rows — the two numbers that actually gate you.
+
+### `narrow` — Trimmed fallback for tight panels
+
+Same facts as `default` (model+effort, dir+branch, context, 5h, 7d+cost), trimmed hard: short labels, 5–8 char bars scaled to `COLS`, no reset timestamps or breakdowns. Auto-selected under `default` when the panel is narrow; can also be set explicitly.
 
 ### `sigil` — Single dense line
 
 ```
-◈ Opus 4.6 · $2.14 ($8.90/d) · ●●●●●○○○○○ 55% · ⎇ feature-123✦↑1[PR✓] · 42%⏱24:12 · 71%w
+◈ Opus 4.6 · $2.14 ($8.90/d) · ●●●○○ 60% · ⎇ feature-123✦↑1[PR✓] · 42%⏱24:12 · 71%w
 ```
 
-Everything on one line. Width-adaptive — drops segments as the terminal narrows. Good for tmux status bars or small terminals.
+Width-adaptive: full detail (cost, daily aggregate, context, git, 5h rate, weekly) at ≥120 cols; drops the daily aggregate and weekly at ≥80; drops git detail to a bare branch name and rate to a bare percentage below 80. Good for tmux status bars or small terminals.
 
 ### `sparkline` — Default + trend history
 
@@ -196,7 +190,7 @@ Everything on one line. Width-adaptive — drops segments as the terminal narrow
   trend   cost▁▂▃▅▃▂▁▄▆█  rate▁▃▅▇█▇▅▃▂▁
 ```
 
-Appends inline `▁▂▃▄▅▆▇█` mini-charts showing cost and rate limit trends across your last 15 sessions. See if you're burning hotter today than yesterday.
+Appends inline `▁▂▃▄▅▆▇█` mini-charts (cost and 5h-rate trend, last 15 sessions) read from `~/.claude/session-history.jsonl`. See if you're burning hotter today than yesterday.
 
 ### `rprompt` — Zsh right-prompt
 
@@ -214,11 +208,11 @@ autoload -Uz add-zsh-hook
 add-zsh-hook precmd _claude_rprompt
 ```
 
-Claude metrics in your shell prompt gutter. Zero vertical space. Auto-hides after 5 minutes of inactivity.
+Claude metrics in your shell prompt gutter. Zero vertical space. Auto-hides after 5 minutes of inactivity. Also emits `sigil` to stdout for Claude Code's own status area.
 
 ### `iterm2` — Native terminal status bar
 
-Pushes structured data to iTerm2 via `OSC 1337;SetUserVar` or sets Kitty window title via `OSC 2`. Auto-detects your terminal.
+Pushes structured data to iTerm2 via `OSC 1337;SetUserVar` or sets the Kitty window title via `OSC 2`. Auto-detects your terminal; also emits `sigil` to stdout as a fallback.
 
 **iTerm2 setup:** Preferences → Profiles → Session → Status Bar → add "Interpolated String" components:
 
@@ -228,21 +222,65 @@ Pushes structured data to iTerm2 via `OSC 1337;SetUserVar` or sets Kitty window 
 
 ## Configure
 
-Create `~/.claude/statusline.conf`:
+Create `~/.claude/statusline.conf` (bash, sourced directly). Full annotated version with every knob: [`config/statusline.conf.example`](config/statusline.conf.example). All settings are optional — the script works with no config file at all.
 
-```bash
-# Cost tracking
-HOURLY_RATE=150            # Shows billable amount based on session time
-DAILY_BUDGET=20            # Enables budget progress bar + notifications at 90%/100%
+**Cost & format**
+- `DAILY_BUDGET=20` — daily cost ceiling; enables the `budget` row + 90%/100% notifications
+- `FORMAT=default` — `default | compact | narrow | sigil | sparkline | rprompt | iterm2`
 
-# Render format
-FORMAT=default             # default | sigil | sparkline | rprompt | iterm2
+**Branch display**
+- `BRANCH_PREFIX_STRIP="andrew/"` — strip a literal prefix off the displayed branch name
+- `MAX_BRANCH=24` — max visible branch chars before an ellipsis
 
-# Account labels — map OAuth emails to short names
-ACCOUNT_LABELS="work:*@company.com personal:me@gmail.com"
-```
+**Account labels**
+- `ACCOUNT_LABELS="work:*@company.com personal:me@gmail.com"` — email pattern → short tag, first match wins
+- `LABEL_COLORS="work:cyan personal:magenta"` — tag → color for the `account` row (unmapped tags default to orange)
+- `EMAIL_PAYER_MAP="work:andrew@company.com personal:me@gmail.com"` — which plan paid, for the token scanner's `payer` dimension (independent of the work/personal classifier below)
+- `SHOW_ACCOUNT_RESETS=1` — adds a per-account board (5h%, reset, week%, fable%, reset, work-unit cap) below the main rows
 
-All settings are optional. The script works with no config file at all.
+**Token classifier** (feeds the `tokens` row's work/personal split — see `bin/scan-tokens.py`)
+- `WORK_PATHS` / `PERSONAL_PATHS` — comma-separated cwd/file-path substrings
+- `WORK_KEYWORDS` / `PERSONAL_KEYWORDS` — comma-separated prompt keywords (weighted 3× a path hit)
+
+**Bounty / challenge tracker** (opt-in token-goal ETA)
+- `CHALLENGE_START`, `BOUNTY_TARGET_TOKENS`, `BOUNTY_LOOKBACK_DAYS`, `BOUNTY_SESSION_GAP_MIN`
+
+**Row visibility** (each defaults on when its data exists; `0` hides it)
+- `SHOW_TOKENS_ROW`, `SHOW_CHALLENGE_ROW`, `SHOW_BOUNTY_ROW`
+
+**Live state stack row** (opt-in)
+- `SHOW_BACKENDS_ROW=1` — adds a `stack` row from `bin/live-state.py`: a snapshot across Claude (`account-resets.json`), Codex (`state_5.sqlite`), and hound autobuild agents (`sessions.jsonl`)
+
+---
+
+## ccx: Multi-Account Routing
+
+`bin/ccx.py` is a router + headroom board for accounts logged in via `/login`. Onboarding is automatic: log into an account, then run any `ccx` command that touches the board (`route`, `set`, `auto`, `status`, `poll`) — it folds the live credential into `~/.ccx/blobs.json` on its own. No separate enrollment step.
+
+| Command | What it does |
+|---------|---------------|
+| `ccx route` | Router daemon: polls all accounts, auto-switches the live one when it runs low (`--interval`, `--at`, `--once`) |
+| `ccx set <label>` | Pin the live account to `<label>` (manual mode) |
+| `ccx auto` | Hand routing back to the daemon |
+| `ccx status` | Mode + per-account 5h headroom + ⚠login flags |
+| `ccx poll` | Refresh the usage board for all stored accounts now |
+| `ccx refresh [label]` | Re-auth stale blobs via their own refresh token, no browser (default: every stale-but-refreshable account) |
+| `ccx mint <label>` | Mint + vault a 1-year token via `claude setup-token` |
+| `ccx tokens` | List minted tokens and expiry |
+| `ccx sync` | Converge the token vault with hound |
+| `ccx pick-env` | Emit env exports for the best routable account (wrapper hook) |
+
+Routing never adds to or modifies the Keychain's live `Claude Code-credentials` slot — every switch is a plain file write to `~/.claude/.credentials.json`, followed by a delete of the keychain slot so Claude Code's own ~30s re-read lands on the file. Minted long-lived tokens live outside `~/.claude` (`~/.ccx/vault.json`), since the nightly transcript-archival chain mirrors `~/.claude` in plaintext.
+
+---
+
+## Token Scanning and Redaction
+
+Two independent tools, both built on the same session JSONLs.
+
+**Token scanning** (`bin/scan_tokens_core.py` + the `bin/scan-tokens*.py`/`.sh` CLIs) attributes every request to work/personal and to a payer, incrementally, and feeds the `tokens`/`usage`/goal/`bounty` rows above plus the work-unit cap columns on the account board. `bin/derive-cap.py` fits those per-account caps from utilization history — it's a manual, unscheduled tool you re-run occasionally, not something cron or launchd calls. Full design, cache schema, and failure modes: [`bin/ARCHITECTURE.md`](bin/ARCHITECTURE.md).
+
+**Redaction** (`bin/scan-tokens-export.py`, `-autoflag.py`, `-coworker-scrub.py`, `-merge.py`) strips sensitive content from a session JSONL into a separate export copy before you hand it to a third party — source files are never modified. Pipeline, re-run steps, and file layout: [`bin/REDACTION.md`](bin/REDACTION.md).
 
 ---
 
@@ -286,17 +324,17 @@ Run on a 30s launchd timer for auto-refresh. See [`macos/claude-widget/README.md
 
 Claude Code pipes a JSON status blob into the script via stdin on every tool call. The script:
 
-1. **Parses** model, cost, context, tokens, session metadata (single `jq` call)
-2. **Resolves** account label from OAuth profile cache (tagged on all ledger entries)
-3. **Updates** daily cost/token ledgers in `~/.claude/`
-4. **Scans** subagent JSONL files for the current session (cached 30s)
-5. **Fetches** rate limits from Anthropic's OAuth API — background, non-blocking
+1. **Parses** model, cost, context, session metadata (single `jq` call)
+2. **Resolves** account label from the OAuth profile cache (tags all ledger entries) and updates the daily cost/token ledgers in `~/.claude/`
+3. **Scans** subagent JSONL files for the current session (cached 30s) and reads `token-scan-summary.json` (fallback: `token-scan-cache.json`) for the work/personal token split — kicks off a background `scan-tokens.py` rescan when that cache is stale (>180s)
+4. **Builds** the git/PR segment (branch, dirty, ahead/behind, `gh pr view` cached 90s) and the effort/fast-mode/focus badges
+5. **Fetches** rate limits and profile from Anthropic's OAuth API in the background, never blocking render (usage cached 60s, profile cached 5min)
 6. **Interpolates** usage between polls — tracks velocity across consecutive API responses for smooth fractional percentages
-7. **Projects** burn-down, survive indicators, and extra credit spend from interpolated rates
-8. **Detects** account switches (credential file mtime change → cache invalidation)
+7. **Builds** the budget row (if `DAILY_BUDGET` is set) and the optional multi-account reset board (if `SHOW_ACCOUNT_RESETS=1`)
+8. **Detects** account switches (OAuth token hash change, with a credential-mtime fallback → cache invalidation)
 9. **Sets** terminal tab title to repo + branch
 10. **Checks** notification thresholds (fires once per crossing, deduped)
-11. **Renders** in your chosen format
+11. **Renders** in your chosen format, falling back to `narrow` under `NARROW_THRESHOLD` columns
 
 ### Architecture
 
@@ -309,13 +347,13 @@ Claude Code                    statusline.sh
     │                              ├─► update daily-cost.json    (tagged w/ account)
     │                              ├─► update daily-tokens.json  (tagged w/ account)
     │                              ├─► scan subagent JSONL files (cached 30s)
-    │                              ├─► read stats-cache.json     (token challenge total)
+    │                              ├─► read token-scan-summary.json (fallback: token-scan-cache.json)
     │                              ├─► background: fetch /api/oauth/usage (cached 60s)
     │                              ├─► background: fetch /api/oauth/profile (cached 5min)
     │                              ├─► check notification thresholds
     │                              ├─► set terminal tab title (\033]0;repo (branch)\007)
     │                              │
-    │  stdout ANSI ◄──────────────├─► render (default|sigil|sparkline|rprompt|iterm2)
+    │  stdout ANSI ◄──────────────├─► render (default|compact|narrow|sigil|sparkline|rprompt|iterm2)
     │                              │
     ├─ /tmp/claude/*.json ────────►│ macOS apps read these
 ```
@@ -324,14 +362,14 @@ Claude Code                    statusline.sh
 
 | Concern | How it's handled |
 |---------|-----------------|
-| Network latency | Background subshell, never blocks render (5min poll interval) |
+| Network latency | Background subshell, never blocks render (usage poll 60s, profile poll 5min) |
 | Concurrent sessions | Lock file with stale-PID detection (auto-cleanup at 30s) |
 | Git dirty check | `git diff-index --quiet HEAD` (faster than `git status`) |
 | PR status | `gh pr view` cached 90s, background-refreshed |
 | Ledger writes | Atomic (mktemp + mv) |
-| Account switch | Credential mtime tracking, instant cache invalidation |
+| Account switch | OAuth token hash + credential mtime tracking, instant cache invalidation |
 | Subagent scan | File-based cache with 30s TTL, scoped to current session |
-| Token challenge | Single `jq` read from `stats-cache.json` (no JSONL scanning) |
+| Token bar | `jq` read from `token-scan-summary.json` (fallback: `token-scan-cache.json`); the actual JSONL rescan runs in the background via `scan-tokens.py`, never inline |
 
 ### Files
 
@@ -341,17 +379,26 @@ Claude Code                    statusline.sh
 | `~/.claude/statusline.conf` | Config | Permanent |
 | `~/.claude/daily-cost.json` | Daily cost ledger (account-tagged) | Resets daily |
 | `~/.claude/daily-tokens.json` | Daily token tracker (account-tagged) | Resets daily |
-| `~/.claude/stats-cache.json` | Token challenge source (Claude Code managed) | Persistent |
-| `~/.claude/session-history.jsonl` | Sparkline history (w/ account + subagent fields) | Rolling 100 entries |
-| `~/.claude/rprompt.txt` | Zsh RPROMPT (rprompt format) | Updated each render |
-| `/tmp/claude/statusline-usage-cache.json` | Rate limit API cache | 5min TTL |
-| `/tmp/claude/statusline-usage-prev.json` | Previous poll for interpolation | Updated each poll |
+| `~/.claude/token-scan-summary.json` | Small token-scan summary (preferred read) | Persistent |
+| `~/.claude/token-scan-cache.json` | Full token-scan cache (fallback read) | Persistent |
+| `~/.claude/account-resets.json` | Multi-account reset ledger (`SHOW_ACCOUNT_RESETS`) | Persistent |
+| `~/.claude/account-caps.json` | Per-account work-unit caps, written by `bin/derive-cap.py` | Persistent |
+| `~/.claude/utilization-history.jsonl` | Raw utilization samples backing the account board | Rolling |
+| `~/.claude/session-history.jsonl` | Sparkline history (account + subagent fields) | Rolling 100 entries |
+| `~/.claude/rprompt.txt` | Zsh RPROMPT (`rprompt` format) | Updated each render |
+| `~/.claude/statusline-tz` | Optional timezone override for reset-time display | Permanent |
+| `~/.claude/.credentials.json` | Claude Code's own OAuth credential — read-only, mtime-tracked | Claude-Code-managed |
+| `/tmp/claude/statusline-usage-cache.json` | Rate-limit API cache | 60s TTL |
 | `/tmp/claude/statusline-profile-cache.json` | Profile API cache | 5min TTL |
-| `/tmp/claude/statusline-subagent-*.txt` | Subagent token cache per session | 30s TTL |
-| `/tmp/claude/statusline-raw.json` | Raw status for macOS apps | Updated each render |
+| `/tmp/claude/statusline-usage-prev.json` | Previous poll, for interpolation | Updated each poll |
+| `/tmp/claude/statusline-subagent-<sid>.txt` | Subagent token cache per session | 30s TTL |
+| `/tmp/claude/ctx-history-<sid>.txt` | Context-fill samples, for the fill-ETA calc | Rolling |
+| `/tmp/claude/statusline-pr-<branch>.json` | PR status cache | 90s TTL |
+| `/tmp/claude/statusline-raw.json` | Raw status blob, for macOS apps | Updated each render |
 | `/tmp/claude/statusline-notif-state.json` | Notification dedup state | Per-threshold |
 | `/tmp/claude/statusline-refresh.lock` | Background refresh lock | Transient |
-| `/tmp/claude/statusline-creds-mtime` | Credential change detection | Persistent |
+| `/tmp/claude/statusline-creds-mtime` | Credential mtime, account-switch fallback detector | Persistent |
+| `/tmp/claude/statusline-token-hash` | OAuth token hash, primary account-switch detector | Persistent |
 
 ---
 
@@ -369,7 +416,7 @@ rm ~/.claude/statusline.sh
 # Remove "statusLine" key from ~/.claude/settings.json
 
 # Codex monitor
-rm ~/.local/bin/codex-{cockpit,statusline,top,watch} \
+rm ~/.local/bin/codex-{statusline,top,watch} \
    ~/.local/bin/codex-config.sh ~/.local/bin/codex_statusline.py
 # Optionally: rm ~/.codex/statusline.conf
 ```
