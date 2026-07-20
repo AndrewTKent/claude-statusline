@@ -2267,7 +2267,7 @@ render_default() {
         [ -n "$backends_line" ] && printf "\n${white}$(printf "%-7s" "stack")${reset} ${dim}%s${reset}" "$backends_line"
     fi
     if [ -n "$FINAL_ACCOUNT_ROWS" ]; then
-        _acct_header="  $(_pad_to_cols "acct" 9) $(_ralign "5h" 4)  $(_ralign "reset" 6)   $(_ralign "wk" 4)   $(_ralign "fable" 5)  $(_ralign "reset" 6)"
+        _acct_header="  $(_pad_to_cols "acct" 9) $(_ralign "5h" 4)  $(_ralign "reset" 6)   $(_ralign "week" 4)   $(_ralign "fable" 5)  $(_ralign "reset" 6)"
         printf "\n${dim}%s${reset}%b" "$_acct_header" "$FINAL_ACCOUNT_ROWS"
     fi
 }
