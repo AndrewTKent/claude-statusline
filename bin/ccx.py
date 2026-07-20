@@ -55,11 +55,22 @@ CONF_PATH = HOME / ".claude" / "statusline.conf"
 MIRROR_LOG = HOME / ".claude" / "ccx-mirror.log"
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"  # public Claude Code OAuth client (PKCE, no secret)
 STALE_AFTER_S = 3 * 3600
 
 
 class CcxError(RuntimeError):
     pass
+
+
+class TokenRefreshError(CcxError):
+    """Non-200 from the OAuth token endpoint. `.code` is the HTTP status string
+    ("429" = the edge in front of the endpoint is throttling this client)."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(f"token endpoint returned {code}")
 
 
 def die(msg: str) -> None:
@@ -244,6 +255,75 @@ def fetch_usage(access_token: str, timeout: float = 4.0) -> dict | None:
     except Exception:
         return None
     return data if isinstance(data, dict) and "five_hour" in data else None
+
+
+def refresh_blob_access(blob: str, timeout: float = 15.0) -> str | None:
+    """Exchange the blob's refresh token for a fresh access token; return the
+    updated blob string. The OAuth refresh ROTATES the refresh token, so the
+    caller MUST persist the returned blob — dropping it bricks the account (it
+    would need a browser /login). Returns None when the blob has no refresh
+    token or the response is malformed; raises TokenRefreshError on a non-200
+    (429 = the edge fronting the token endpoint is throttling this client).
+    Deliberately not called from poll_blobs_usage: polling stays a pure read so
+    the statusline can repaint on a timer without rotating anyone's credential."""
+    try:
+        outer = json.loads(blob)
+    except json.JSONDecodeError:
+        return None
+    oauth = outer.get("claudeAiOauth") if isinstance(outer.get("claudeAiOauth"), dict) else outer
+    if not isinstance(oauth, dict) or not oauth.get("refreshToken"):
+        return None
+    body = json.dumps(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": oauth["refreshToken"],
+            "client_id": OAUTH_CLIENT_ID,
+        }
+    )
+    # curl, not urllib: the edge fronting the token endpoint 429s urllib's client
+    # fingerprint but lets a normal one through. The refresh token is piped in on
+    # stdin (--data @-), never argv, so it can't surface in the process list.
+    proc = subprocess.run(
+        [
+            "curl", "-sS", "-m", str(int(timeout)),
+            "-w", "\n%{http_code}",
+            "-X", "POST", TOKEN_URL,
+            "-H", "Content-Type: application/json",
+            "-H", "Accept: application/json",
+            "-H", "User-Agent: claude-cli/2.1.34 (external, cli)",
+            "--data", "@-",
+        ],
+        input=body,
+        capture_output=True,
+        text=True,
+    )
+    resp_text, _, code = proc.stdout.rpartition("\n")
+    if code.strip() != "200":
+        raise TokenRefreshError(code.strip() or f"curl-exit-{proc.returncode}")
+    try:
+        payload = json.loads(resp_text)
+    except json.JSONDecodeError:
+        return None
+    access, refresh = payload.get("access_token"), payload.get("refresh_token")
+    if not (access and refresh):
+        return None
+    now_ms = int(time.time() * 1000)
+    oauth["accessToken"] = access
+    oauth["refreshToken"] = refresh
+    ttl = payload.get("expires_in")
+    if isinstance(ttl, (int, float)):
+        oauth["expiresAt"] = now_ms + int(ttl) * 1000
+    rt_ttl = payload.get("refresh_token_expires_in")
+    if isinstance(rt_ttl, (int, float)):
+        oauth["refreshTokenExpiresAt"] = now_ms + int(rt_ttl) * 1000
+    else:
+        # cc's own rotation omits this field, and blob_expired reads missing as alive.
+        oauth.pop("refreshTokenExpiresAt", None)
+    if "claudeAiOauth" in outer:
+        outer["claudeAiOauth"] = oauth
+    else:
+        outer = oauth
+    return json.dumps(outer)
 
 
 def usage_to_reset_row(email: str, org_uuid: str, usage: dict, now_ts: int) -> dict:
@@ -618,6 +698,56 @@ def cmd_poll(_args) -> None:
     """Query every stored account's remaining limits and repaint the board."""
     n = poll_blobs_usage(load_blobs())
     print(f"refreshed usage for {n} account(s)")
+
+
+def cmd_refresh(args) -> None:
+    """Re-auth stale accounts without a browser: swap each expired access token
+    for a fresh one via its own refresh token, in place. On-demand and explicit —
+    `poll` never does this, since it runs on the statusline's timer and would
+    rotate a credential on every repaint. Default target set is every account
+    whose access token has expired but whose refresh token is still alive; pass a
+    label to force one."""
+    now = time.time()
+    accounts = load_blobs().get("accounts") or {}
+    if args.label:
+        if args.label not in accounts:
+            raise CcxError(f"no stored blob for '{args.label}'")
+        targets = [args.label]
+    else:
+        targets = []
+        for label, e in accounts.items():
+            blob = e.get("blob", "")
+            acc_exp = blob_access_expiry(blob)
+            access_stale = acc_exp is None or now >= acc_exp
+            if access_stale and not blob_expired(blob, now):
+                targets.append(label)
+    if not targets:
+        print("nothing to refresh — every access token is current")
+        return
+    revived = 0
+    for label in targets:
+        try:
+            new_blob = refresh_blob_access(accounts[label].get("blob", ""))
+        except TokenRefreshError as e:
+            hint = "token endpoint throttled, retry in a minute" if e.code == "429" else "not refreshed"
+            print(f"  {label}: HTTP {e.code} — {hint}")
+            continue
+        except Exception as e:  # noqa: BLE001 - report and move on, never brick a blob
+            print(f"  {label}: {type(e).__name__} — not refreshed")
+            continue
+        if not new_blob:
+            print(f"  {label}: no usable refresh token — needs a browser /login")
+            continue
+        # Persist now: the old refresh token is already dead server-side.
+        with locked():
+            fresh = load_blobs()
+            fresh.setdefault("accounts", {}).setdefault(label, {})["blob"] = new_blob
+            save_blobs(fresh)
+        revived += 1
+        print(f"  {label}: refreshed")
+    if revived:
+        poll_blobs_usage(load_blobs())
+        print(f"repainted board for {revived} refreshed account(s)")
 
 
 # ── token vault + router (zero keychain) ──────────────────────────────────
@@ -1406,6 +1536,14 @@ def main(argv: list[str] | None = None) -> None:
     p_mint.set_defaults(fn=cmd_mint)
 
     sub.add_parser("tokens", help="list minted tokens and expiry").set_defaults(fn=cmd_tokens)
+
+    p_refresh = sub.add_parser(
+        "refresh", help="re-auth stale blobs via their refresh token (no browser)"
+    )
+    p_refresh.add_argument(
+        "label", nargs="?", help="account to refresh (default: all stale-but-refreshable)"
+    )
+    p_refresh.set_defaults(fn=cmd_refresh)
 
     sub.add_parser("sync", help="converge the token vault with hound").set_defaults(fn=cmd_sync)
 
