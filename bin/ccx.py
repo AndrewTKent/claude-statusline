@@ -1224,6 +1224,13 @@ def route_once(threshold: float) -> str | None:
             target = mode.get("label")
             if not target or target == active:
                 return None
+            # A keychain blob carrying refreshTokenExpiresAt is a fresh /login (cc's
+            # rotations omit it): the user picked an account — move the pin, don't clobber.
+            if active is not None:
+                live, src = live_cred()
+                if src == "keychain" and live and blob_refresh_expiry(live) is not None:
+                    save_mode("set", active)
+                    return f"ADOPT /login {target} → {active} (pin follows the login)"
             if (by_label.get(target) or {}).get("expired"):
                 return None
             # active is None both for "no live cred anywhere" (seed it) and
