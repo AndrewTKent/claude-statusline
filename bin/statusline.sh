@@ -8,7 +8,7 @@ input=$(cat)
 #   HOURLY_RATE=150           # Billing rate in $/hour (enables cost tracking)
 #   DAILY_BUDGET=20           # Daily cost ceiling in $ (enables budget bar)
 #   CHALLENGE_GOAL_M=100      # Token goal in millions (enables challenge progress line)
-#   CHALLENGE_START_DATE=...  # ISO date (YYYY-MM-DD) for challenge window start
+#   CHALLENGE_START=...       # ISO date (YYYY-MM-DD) for challenge window start
 #   CHALLENGE_LABEL=100m      # Label shown on the challenge line
 #   NARROW_THRESHOLD=60       # default render auto-falls-through to narrow
 #                             # when detected terminal cols are below this
@@ -26,7 +26,6 @@ CONFIG_FILE="$HOME/.claude/statusline.conf"
 HOURLY_RATE=0
 DAILY_BUDGET=0
 CHALLENGE_GOAL_M=0                      # Challenge goal in millions (0 = disabled)
-CHALLENGE_START_DATE=""                 # ISO date, e.g. 2026-03-23
 CHALLENGE_LABEL="goal"
 [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
 
@@ -248,63 +247,6 @@ build_context_bar() {
         out+="$cell"
     done
     printf "%b" "$out"
-}
-
-# ── Context-fill ETA (minutes until ~95% full) ─────────────
-# History file: /tmp/claude/ctx-history-<SID>.txt, one line per sample:
-#   <epoch_seconds> <context_pct_float>
-# Linear fit over recent samples gives a minutes-to-full estimate. Samples
-# older than the current session's start are ignored when SID changes.
-#
-# Writes: CTX_ETA_DISPLAY (e.g. "~18m to full") or empty if not enough data.
-CTX_ETA_DISPLAY=""
-compute_context_eta() {
-    local sid="$1" pct="$2"
-    [ -z "$sid" ] && return
-    [ -z "$pct" ] && return
-
-    mkdir -p /tmp/claude
-    local hist="/tmp/claude/ctx-history-${sid}.txt"
-    local now
-    now=$(date +%s)
-
-    # Append current sample, keep only last 40 lines (bounded, cheap).
-    printf "%s %s\n" "$now" "$pct" >> "$hist"
-    if [ "$(wc -l < "$hist" 2>/dev/null)" -gt 40 ]; then
-        tail -n 40 "$hist" > "${hist}.tmp" && mv "${hist}.tmp" "$hist"
-    fi
-
-    # Need ≥3 samples spanning ≥60s to compute a meaningful slope.
-    local n_lines
-    n_lines=$(wc -l < "$hist" 2>/dev/null | tr -d ' ')
-    [ "${n_lines:-0}" -lt 3 ] && return
-
-    # Linear regression via awk: slope in %/sec, then minutes to hit 95%.
-    local result
-    result=$(awk -v now="$now" -v cur="$pct" '
-        { n++; x[n]=$1; y[n]=$2; sx+=$1; sy+=$2 }
-        END {
-            if (n < 3) exit
-            span = x[n] - x[1]
-            if (span < 60) exit
-            mx = sx/n; my = sy/n
-            num=0; den=0
-            for (i=1; i<=n; i++) { dx=x[i]-mx; num += dx*(y[i]-my); den += dx*dx }
-            if (den == 0) exit
-            slope = num/den  # percent per second
-            if (slope <= 0.0005) { print "flat"; exit }  # ~<0.03%/min, effectively idle
-            remaining = 95 - cur
-            if (remaining <= 0) { print "0"; exit }
-            mins = remaining / (slope * 60)
-            if (mins < 0) exit
-            printf "%.0f", mins
-        }' "$hist")
-
-    if [ "$result" = "flat" ]; then
-        CTX_ETA_DISPLAY="idle"
-    elif [ -n "$result" ]; then
-        CTX_ETA_DISPLAY="~${result}m to full"
-    fi
 }
 
 # build_ratio_bar WORK_PCT PERSONAL_PCT WIDTH EMPTY_CHAR
@@ -728,15 +670,9 @@ if [ -n "$SESSION_ID" ]; then
     SCAN_SUMMARY="$HOME/.claude/token-scan-summary.json"
     # Resolution order:
     #   1. $SCAN_SCRIPT env (from statusline.conf)
-    #   2. bin/scan-tokens.py next to this script (repo-local, preferred)
-    #   3. ~/agent-workflows/claude/scripts/scan-tokens.py (legacy location)
+    #   2. bin/scan-tokens.py next to this script (repo-local)
     if [ -z "${SCAN_SCRIPT:-}" ]; then
-        _repo_scan="${BASH_SOURCE[0]%/*}/scan-tokens.py"
-        if [ -f "$_repo_scan" ]; then
-            SCAN_SCRIPT="$_repo_scan"
-        else
-            SCAN_SCRIPT="$HOME/agent-workflows/claude/scripts/scan-tokens.py"
-        fi
+        SCAN_SCRIPT="${BASH_SOURCE[0]%/*}/scan-tokens.py"
     fi
     CHALLENGE_DISPLAY=""
 
@@ -875,23 +811,10 @@ if [ -n "$SESSION_ID" ]; then
     _lifetime_total=$(( ${G_TOTAL:-0} + ${G_RECOVERED:-0} ))
     _lifetime_fmt=$(_usage_fmt "$_lifetime_total")
     USAGE_DISPLAY="${dim}today${reset} ${cyan}${_today_fmt}${reset} ${dim}·${reset} ${dim}session${reset} ${magenta}${_session_fmt}${reset} ${dim}·${reset} ${dim}lifetime${reset} ${green}${_lifetime_fmt}${reset}"
-
-    # ── Redaction indicator (only when ranges > 0) ──
-    # Reminds to run scan-tokens-export.py before submission.
-    REDACT_DISPLAY=""
-    if [ "$R_RANGES" -gt 0 ] 2>/dev/null; then
-        REDACT_DISPLAY="${orange}${R_RANGES}${reset} ${dim}range(s) across ${reset}${orange}${R_SESSIONS}${reset} ${dim}session(s) — review before submission${reset}"
-    fi
 fi
 
-# ── Cost & burn rate ────────────────────────────────────
+# ── Cost ────────────────────────────────────────────────
 COST_FMT=$(printf "%.2f" "$COST")
-
-BURN_RATE=""
-if [ "$DURATION_MS" -gt 0 ] 2>/dev/null; then
-    RATE=$(awk "BEGIN {h=$DURATION_MS/3600000; if(h>0.001) printf \"%.2f\", $COST/h}")
-    [ -n "$RATE" ] && BURN_RATE=" ${magenta}@\$${RATE}/h${reset}"
-fi
 
 # ── Session timer ───────────────────────────────────────
 SESSION_TIME=""
@@ -907,26 +830,10 @@ if [ "$DURATION_MS" -gt 0 ] 2>/dev/null; then
     fi
 fi
 
-# ── Billable amount ────────────────────────────────────
-BILLABLE=""
-if [ "$HOURLY_RATE" -gt 0 ] 2>/dev/null && [ "$DURATION_MS" -gt 0 ] 2>/dev/null; then
-    BILL=$(awk "BEGIN {printf \"%.2f\", ($DURATION_MS/3600000) * $HOURLY_RATE}")
-    BILLABLE=" ${orange}\$${BILL}b${reset}"
-fi
-
 # ── Context % with visual bar ──────────────────────────
 CONTEXT_INT=$(printf "%.0f" "$CONTEXT_PCT")
 CTX_BAR=$(build_context_bar "$CONTEXT_INT" 15)
 CTX_COLOR=$(color_for_context "$CONTEXT_INT")
-
-# Sample current context pct into history → compute minutes-to-full ETA.
-compute_context_eta "$SESSION_ID" "$CONTEXT_PCT"
-
-# ── Context badge for line 1 (surfaces at 70%+) ───────
-CTX_BADGE=""
-if [ "$CONTEXT_INT" -ge 70 ] 2>/dev/null; then
-    CTX_BADGE=" ${CTX_COLOR}ctx:${CONTEXT_INT}%${reset}"
-fi
 
 # ── Effort level ───────────────────────────────────────
 # Claude Code 2.1+ emits effort as `.effort.level`; older builds used
@@ -955,17 +862,6 @@ fi
 # ── Focus mode ──────────────────────────────────────────
 FOCUS=""
 [ -f "$FOCUS_FILE" ] && FOCUS=" ${red}[FOCUS]${reset}"
-
-# ── Cache hit ratio ─────────────────────────────────────
-CACHE_TOTAL=$((CACHE_READ + CACHE_CREATE))
-if [ "$CACHE_TOTAL" -gt 0 ] 2>/dev/null; then
-    CACHE_PCT=$((CACHE_READ * 100 / CACHE_TOTAL))
-    # low-bad: high cache hit rate = good
-    CACHE_COLOR=$(color_for_pct "$CACHE_PCT" "low-bad")
-    CACHE_STR="${CACHE_COLOR}cache:${CACHE_PCT}%${reset}"
-else
-    CACHE_STR="${dim}cache:--${reset}"
-fi
 
 # ── Git info ────────────────────────────────────────────
 GIT_INFO=""
@@ -1072,10 +968,6 @@ if [ -n "$BRANCH" ] && [ "$BRANCH" != "main" ] && [ "$BRANCH" != "master" ] && c
         fi
     fi
 fi
-
-# ── Session ID ──────────────────────────────────────────
-SID=""
-[ -n "$SESSION_ID" ] && SID=" ${dim}${SESSION_ID:0:8}${reset}"
 
 # ── Directory name ──────────────────────────────────────
 # Strip to last path component. Handle both / (Unix) and \ (Windows/MSYS).
@@ -1525,9 +1417,6 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
                         full_display=$(fmt_duration_m "$mins_to_full")
                         # Pad "→full ~Xm" to 11 cols so "✗buf" lines up.
                         rate_lines+=" ${bd_color}$(pad_right "→full ~${full_display}" 14)${reset}"
-                        # Expose for the current-account row tail.
-                        CUR_FULL_DISPLAY="$full_display"
-                        CUR_FULL_COLOR="$bd_color"
 
                         # Survive indicator: buffer or downtime until window resets
                         mins_to_reset=$(( secs_to_reset / 60 ))
@@ -1535,13 +1424,9 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
                             if [ "$mins_to_full" -gt "$mins_to_reset" ] 2>/dev/null; then
                                 buf_display=$(fmt_duration_m $(( mins_to_full - mins_to_reset )))
                                 rate_lines+=" ${green}✓${buf_display}${reset}"
-                                CUR_SURVIVE_DISPLAY="✓${buf_display}"
-                                CUR_SURVIVE_COLOR="$green"
                             else
                                 dt_display=$(fmt_duration_m $(( mins_to_reset - mins_to_full )))
                                 rate_lines+=" ${red}✗${dt_display}${reset}"
-                                CUR_SURVIVE_DISPLAY="✗${dt_display}"
-                                CUR_SURVIVE_COLOR="$red"
                             fi
                         fi
                     fi
@@ -1619,13 +1504,8 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
 
 fi
 
-# Weekly and survive are rendered as their own labeled rows now;
-# no longer appended to the current-account row.
-CURRENT_RATE_TAIL=""
 WEEKLY_BAR_LINE=""
 FABLE_BAR_LINE=""
-SURVIVE_BAR_LINE=""
-EXTRA_BAR_LINE=""
 if [ -n "${WEEK_PCT_DISPLAY:-}" ] && [ "${WEEK_PCT_DISPLAY:-0}" -gt 0 ] 2>/dev/null; then
     _wk_bar=$(build_bar "$WEEK_PCT_DISPLAY" 15)
     # fmt_pct on the fractional display preserves interpolated sub-percent
@@ -1647,10 +1527,6 @@ if [ -n "${fable_pct_raw:-}" ]; then
     # No reset timestamp: fable shares the 5h window shown on the row above.
     FABLE_BAR_LINE="${white}$(printf "%-7s" "$_fb_label")${reset} ${_fb_bar} ${_fb_color}$(fmt_pct "$_fb_pct_int")${reset}"
 fi
-
-# Burn row removed — kept SURVIVE_BAR_LINE empty for the renderer's `elif`
-# at the emit site. Upstream projection vars (CUR_FULL_DISPLAY etc.) still
-# build but no longer drive a row.
 
 # ── Daily budget line ──────────────────────────────────
 BUDGET_DISPLAY=""
@@ -1696,7 +1572,6 @@ _ralign() {
     printf '%*s%s' "$pad" '' "$s"
 }
 
-ACCOUNT_RESETS_DISPLAY=""
 ACCOUNT_ROWS=""  # per-account stacked rows (new layout); each row starts with \n
 if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
     ledger_file="$HOME/.claude/account-resets.json"
@@ -1798,7 +1673,6 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
             # epoch sort to the end. Epoch is field 4; row now has 8 fields.
             parsed=$(printf '%s' "$parsed" | awk -F'|' 'NF>=8 { key=($4==""?"9999999999":$4); print key"\t"$0 }' | sort -n | cut -f2-)
 
-            rendered=""
             while IFS='|' read -r em uuid tag ep pct pct_state seven_day_iso weekly_pct_ledger fbl_iso fable_pct_ledger; do
                 [ -z "$em" ] && continue
                 # Match the active account on (email, org_uuid). Legacy ledger
@@ -1935,7 +1809,6 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                    printf '%s\n' "$CCX_EXPIRED_LOOKUP" | grep -qxF "${em}|${uuid}"; then
                     exp_suffix=" ${red}⚠login${reset}"
                 fi
-                rendered+="${marker}${seg} ${white}${tdisp}${reset} ${pct_color}${pct_show}${reset}${cap_suffix}${exp_suffix}   "
 
                 # ── Per-account row (new stacked layout) ──
                 # Pull this account's latest extra-credit spend from the lookup
@@ -2110,12 +1983,8 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 if [ "$has_wall" = "1" ]; then
                     row_line+="  ${red}⚠ hard wall${reset}"
                 fi
-                # Append projection tail to the current-account row only.
-                # (CURRENT_RATE_TAIL no longer appended here — weekly and
-                # survive are standalone bar rows above the account block.)
                 ACCOUNT_ROWS+="|${em}:${row_line}"
             done <<< "$parsed"
-            [ -n "$rendered" ] && ACCOUNT_RESETS_DISPLAY="$rendered"
 
             # Second pass: annotate the "✓ best next" row and assemble final output.
             FINAL_ACCOUNT_ROWS=""
@@ -2298,7 +2167,6 @@ render_default() {
     fi
     [ -n "$WEEKLY_BAR_LINE"  ] && printf "\n%b" "$WEEKLY_BAR_LINE"
     [ -n "$FABLE_BAR_LINE" ] && [ "${SHOW_FABLE_ROW:-1}" = "1" ] && printf "\n%b" "$FABLE_BAR_LINE"
-    [ -n "$EXTRA_BAR_LINE" ] && printf "\n%b" "$EXTRA_BAR_LINE"
     [ -n "$BUDGET_DISPLAY" ] && printf "\n%b" "$BUDGET_DISPLAY"
     # Each opt-out defaults to 1 (show); set to 0 in statusline.conf to hide.
     [ -n "$TOKEN_DISPLAY" ] && [ "${SHOW_TOKENS_ROW:-1}" = "1" ] && printf "\n${white}$(printf "%-7s" "tokens")${reset} %b" "$TOKEN_DISPLAY"
