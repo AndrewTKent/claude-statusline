@@ -672,3 +672,53 @@ class TestLiveCredAndSwitch:
         assert ccx.apply_account("B", {"accounts": {"B": {"blob": "BLOB-B"}}}) is True
         assert deletes == []
         assert "unknown" in (tmp_path / "log").read_text()
+
+
+class TestRouteOnceAdoptsLogin:
+    """SET mode must adopt a fresh /login instead of clobbering it (2026-07-20:
+    pin=alumni overwrote every acme /login within one daemon tick)."""
+
+    LOGIN_BLOB = json.dumps(  # fresh /login: carries refreshTokenExpiresAt
+        {"claudeAiOauth": {"accessToken": "at-new", "refreshToken": "rt",
+                           "refreshTokenExpiresAt": 4102444800000}}
+    )
+    ROTATION_BLOB = json.dumps(  # cc rotation: no refreshTokenExpiresAt
+        {"claudeAiOauth": {"accessToken": "at-rot", "refreshToken": "rt"}}
+    )
+
+    def _run(self, monkeypatch, live_pair, mode_label="alumni", active="acme-max"):
+        from contextlib import nullcontext
+
+        calls = {"save_mode": [], "apply": []}
+        monkeypatch.setattr(ccx, "locked", lambda blocking=True: nullcontext())
+        monkeypatch.setattr(ccx, "load_blobs", lambda: {"accounts": {}})
+        monkeypatch.setattr(ccx, "capture_live_to_blobs", lambda blobs: active)
+        monkeypatch.setattr(ccx, "poll_blobs_usage", lambda blobs: 0)
+        monkeypatch.setattr(ccx, "route_rows", lambda blobs, a, now: [])
+        monkeypatch.setattr(ccx, "load_mode", lambda: {"mode": "set", "label": mode_label})
+        monkeypatch.setattr(ccx, "live_cred", lambda: live_pair)
+        monkeypatch.setattr(
+            ccx, "save_mode", lambda mode, label: calls["save_mode"].append((mode, label))
+        )
+        monkeypatch.setattr(
+            ccx, "apply_account", lambda label, blobs: calls["apply"].append(label) or True
+        )
+        return ccx.route_once(80.0), calls
+
+    def test_keychain_login_blob_moves_the_pin(self, monkeypatch):
+        line, calls = self._run(monkeypatch, (self.LOGIN_BLOB, "keychain"))
+        assert line is not None and line.startswith("ADOPT /login")
+        assert calls["save_mode"] == [("set", "acme-max")]
+        assert calls["apply"] == []  # the login is never overwritten
+
+    def test_keychain_rotation_blob_still_pins(self, monkeypatch):
+        line, calls = self._run(monkeypatch, (self.ROTATION_BLOB, "keychain"))
+        assert line == "SET acme-max → alumni"
+        assert calls["save_mode"] == []
+        assert calls["apply"] == ["alumni"]
+
+    def test_file_sourced_login_blob_still_pins(self, monkeypatch):
+        line, calls = self._run(monkeypatch, (self.LOGIN_BLOB, "file"))
+        assert line == "SET acme-max → alumni"
+        assert calls["save_mode"] == []
+        assert calls["apply"] == ["alumni"]
