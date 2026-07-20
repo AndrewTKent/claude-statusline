@@ -792,7 +792,7 @@ class CodexStatuslineTest(unittest.TestCase):
                 """
             )
             rows = (
-                ("cockpit-root", "cli", str(root_rollout), 100),
+                ("launcher-root", "cli", str(root_rollout), 100),
                 ("nested-exec", "exec", str(nested_rollout), 200),
             )
             for thread_id, source, path, updated_at in rows:
@@ -809,7 +809,7 @@ class CodexStatuslineTest(unittest.TestCase):
                 selected = codex_statusline.select_owner_thread_id(conn, str(pid_file))
             conn.close()
 
-        self.assertEqual(selected, "cockpit-root")
+        self.assertEqual(selected, "launcher-root")
 
     def test_owner_thread_selection_ignores_concurrent_root_outside_process_tree(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1463,7 +1463,7 @@ class CodexStatuslineTest(unittest.TestCase):
         )
 
     def test_launcher_defaults_to_yolo_without_overriding_explicit_permissions(self) -> None:
-        cockpit = MODULE_PATH.with_name("codex-statusline")
+        launcher = MODULE_PATH.with_name("codex-statusline")
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             capture = tmp / "args"
@@ -1480,14 +1480,14 @@ class CodexStatuslineTest(unittest.TestCase):
             env.update(
                 {
                     "CAPTURE": str(capture),
-                    "CODEX_COCKPIT_CODEX_BIN": str(fake_codex),
+                    "CODEX_STATUSLINE_CODEX_BIN": str(fake_codex),
                     "PATH": f"{tmp}:{env['PATH']}",
                     "TMUX": "test",
                 }
             )
 
             result = subprocess.run(
-                [str(cockpit), "--dangerously-bypass-approvals-and-sandbox", "--model", "gpt-test"],
+                [str(launcher), "--dangerously-bypass-approvals-and-sandbox", "--model", "gpt-test"],
                 capture_output=True,
                 check=True,
                 env=env,
@@ -1506,19 +1506,19 @@ class CodexStatuslineTest(unittest.TestCase):
                 ],
             )
 
-            subprocess.run([str(cockpit)], check=True, env=env)
+            subprocess.run([str(launcher)], check=True, env=env)
             self.assertEqual(
                 capture.read_text().splitlines(),
                 ["-c", "tui.status_line=[]", "--dangerously-bypass-approvals-and-sandbox"],
             )
 
-            subprocess.run([str(cockpit), "--sandbox", "read-only"], check=True, env=env)
+            subprocess.run([str(launcher), "--sandbox", "read-only"], check=True, env=env)
             self.assertEqual(
                 capture.read_text().splitlines(),
                 ["-c", "tui.status_line=[]", "--sandbox", "read-only"],
             )
 
-            subprocess.run([str(cockpit), "--yolo"], check=True, env=env)
+            subprocess.run([str(launcher), "--yolo"], check=True, env=env)
             self.assertEqual(
                 capture.read_text().splitlines(),
                 ["-c", "tui.status_line=[]", "--yolo"],
@@ -1526,12 +1526,12 @@ class CodexStatuslineTest(unittest.TestCase):
 
             for permissions in (("-sread-only",), ("-s=read-only",), ("-anever",), ("-a=never",)):
                 with self.subTest(permissions=permissions):
-                    subprocess.run([str(cockpit), *permissions], check=True, env=env)
+                    subprocess.run([str(launcher), *permissions], check=True, env=env)
                     captured = capture.read_text().splitlines()
                     self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", captured)
                     self.assertEqual(captured[-1], permissions[0])
 
-            subprocess.run([str(cockpit), "--", "-summarize"], check=True, env=env)
+            subprocess.run([str(launcher), "--", "-summarize"], check=True, env=env)
             self.assertEqual(
                 capture.read_text().splitlines(),
                 [
@@ -1543,8 +1543,8 @@ class CodexStatuslineTest(unittest.TestCase):
                 ],
             )
 
-    def test_cockpit_loads_config_file(self) -> None:
-        cockpit = MODULE_PATH.with_name("codex-statusline")
+    def test_launcher_loads_config_file(self) -> None:
+        launcher = MODULE_PATH.with_name("codex-statusline")
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             codex_home = tmp / ".codex"
@@ -1553,9 +1553,9 @@ class CodexStatuslineTest(unittest.TestCase):
             fake_tmux = tmp / "tmux"
             codex_home.mkdir()
             (codex_home / "statusline.conf").write_text(
-                "CODEX_COCKPIT_HEIGHT=14 \n"
-                "CODEX_COCKPIT_INTERVAL=3\n"
-                "CODEX_COCKPIT_MANAGE_APPROVALS=0\n"
+                "CODEX_STATUSLINE_HEIGHT=14 \n"
+                "CODEX_STATUSLINE_INTERVAL=3\n"
+                "CODEX_STATUSLINE_MANAGE_APPROVALS=0\n"
             )
             fake_codex.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$@" >> "$CAPTURE"\n')
             fake_tmux.write_text(
@@ -1567,22 +1567,22 @@ class CodexStatuslineTest(unittest.TestCase):
             fake_tmux.chmod(0o755)
             env = os.environ.copy()
             for name in (
-                "CODEX_COCKPIT_HEIGHT",
-                "CODEX_COCKPIT_INTERVAL",
-                "CODEX_COCKPIT_MANAGE_APPROVALS",
+                "CODEX_STATUSLINE_HEIGHT",
+                "CODEX_STATUSLINE_INTERVAL",
+                "CODEX_STATUSLINE_MANAGE_APPROVALS",
             ):
                 env.pop(name, None)
             env.update(
                 {
                     "CAPTURE": str(capture),
-                    "CODEX_COCKPIT_CODEX_BIN": str(fake_codex),
+                    "CODEX_STATUSLINE_CODEX_BIN": str(fake_codex),
                     "CODEX_HOME": str(codex_home),
                     "PATH": f"{tmp}:{env['PATH']}",
                     "TMUX": "test",
                 }
             )
 
-            subprocess.run([str(cockpit)], check=True, env=env)
+            subprocess.run([str(launcher)], check=True, env=env)
 
             captured = capture.read_text().splitlines()
             split_window = next(line for line in captured if line.startswith("split-window "))
@@ -1593,7 +1593,7 @@ class CodexStatuslineTest(unittest.TestCase):
             self.assertIn("set-option -w history-limit 100000", captured)
 
             subprocess.run(
-                [str(cockpit), "resume", "-s", "read-only", "019f0000-0000-7000-8000-000000000000"],
+                [str(launcher), "resume", "-s", "read-only", "019f0000-0000-7000-8000-000000000000"],
                 check=True,
                 env=env,
             )
@@ -1603,8 +1603,8 @@ class CodexStatuslineTest(unittest.TestCase):
             self.assertNotIn("--bind-after-ms", latest_split)
             self.assertNotIn("--thread-id", latest_split)
 
-    def test_cockpit_rejects_zero_interval_and_short_footer(self) -> None:
-        cockpit = MODULE_PATH.with_name("codex-statusline")
+    def test_launcher_rejects_zero_interval_and_short_footer(self) -> None:
+        launcher = MODULE_PATH.with_name("codex-statusline")
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             fake_codex = tmp / "codex"
@@ -1616,23 +1616,23 @@ class CodexStatuslineTest(unittest.TestCase):
             base_env = os.environ.copy()
             base_env.update(
                 {
-                    "CODEX_COCKPIT_CODEX_BIN": str(fake_codex),
+                    "CODEX_STATUSLINE_CODEX_BIN": str(fake_codex),
                     "PATH": f"{tmp}:{base_env['PATH']}",
                     "TMUX": "test",
                 }
             )
             cases = (
-                ({"CODEX_COCKPIT_INTERVAL": "0"}, "positive number"),
-                ({"CODEX_COCKPIT_HEIGHT": "10"}, "at least 11"),
-                ({"CODEX_COCKPIT_HEIGHT": "08"}, "at least 11"),
-                ({"CODEX_COCKPIT_HISTORY_LIMIT": "0"}, "positive integer"),
+                ({"CODEX_STATUSLINE_INTERVAL": "0"}, "positive number"),
+                ({"CODEX_STATUSLINE_HEIGHT": "10"}, "at least 11"),
+                ({"CODEX_STATUSLINE_HEIGHT": "08"}, "at least 11"),
+                ({"CODEX_STATUSLINE_HISTORY_LIMIT": "0"}, "positive integer"),
             )
 
             for overrides, expected in cases:
                 with self.subTest(overrides=overrides):
                     env = {**base_env, **overrides}
                     result = subprocess.run(
-                        [str(cockpit)],
+                        [str(launcher)],
                         capture_output=True,
                         env=env,
                         text=True,
@@ -1640,8 +1640,8 @@ class CodexStatuslineTest(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn(expected, result.stderr)
 
-    def test_cockpit_sizes_detached_session_before_split(self) -> None:
-        cockpit = MODULE_PATH.with_name("codex-statusline")
+    def test_launcher_sizes_detached_session_before_split(self) -> None:
+        launcher = MODULE_PATH.with_name("codex-statusline")
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             capture = tmp / "tmux-args"
@@ -1669,7 +1669,7 @@ class CodexStatuslineTest(unittest.TestCase):
             env.update(
                 {
                     "CAPTURE": str(capture),
-                    "CODEX_COCKPIT_CODEX_BIN": str(fake_codex),
+                    "CODEX_STATUSLINE_CODEX_BIN": str(fake_codex),
                     "COLUMNS": "117",
                     "LINES": "83",
                     "PATH": f"{tmp}:{env['PATH']}",
@@ -1678,7 +1678,7 @@ class CodexStatuslineTest(unittest.TestCase):
             )
             env.pop("TMUX", None)
 
-            subprocess.run([str(cockpit), f"-C={project}"], check=True, env=env)
+            subprocess.run([str(launcher), f"-C={project}"], check=True, env=env)
 
             new_session = next(
                 line for line in capture.read_text().splitlines() if "new-session -d" in line
@@ -1702,7 +1702,7 @@ class CodexStatuslineTest(unittest.TestCase):
             self.assertIn("mouse on", "\n".join(capture.read_text().splitlines()))
             self.assertIn("history-limit 100000", "\n".join(capture.read_text().splitlines()))
 
-    def cockpit_detached_session_env(self, tmp: Path, capture: Path) -> dict[str, str]:
+    def launcher_detached_session_env(self, tmp: Path, capture: Path) -> dict[str, str]:
         fake_codex = tmp / "codex"
         fake_tmux = tmp / "tmux"
         fake_codex.write_text("#!/usr/bin/env bash\nexit 0\n")
@@ -1725,7 +1725,7 @@ class CodexStatuslineTest(unittest.TestCase):
         env.update(
             {
                 "CAPTURE": str(capture),
-                "CODEX_COCKPIT_CODEX_BIN": str(fake_codex),
+                "CODEX_STATUSLINE_CODEX_BIN": str(fake_codex),
                 "COLUMNS": "100",
                 "LINES": "40",
                 "PATH": f"{tmp}:{env['PATH']}",
@@ -1735,16 +1735,16 @@ class CodexStatuslineTest(unittest.TestCase):
         env.pop("TMUX", None)
         return env
 
-    def test_cockpit_detach_leaves_running_session_alive(self) -> None:
-        cockpit = MODULE_PATH.with_name("codex-statusline")
+    def test_launcher_detach_leaves_running_session_alive(self) -> None:
+        launcher = MODULE_PATH.with_name("codex-statusline")
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             capture = tmp / "tmux-args"
-            env = self.cockpit_detached_session_env(tmp, capture)
+            env = self.launcher_detached_session_env(tmp, capture)
             env["FAKE_HAS_SESSION"] = "0"
 
             result = subprocess.run(
-                [str(cockpit)],
+                [str(launcher)],
                 capture_output=True,
                 check=True,
                 env=env,
@@ -1755,16 +1755,16 @@ class CodexStatuslineTest(unittest.TestCase):
             self.assertNotIn("kill-session", capture.read_text())
             self.assertEqual(len(list(tmp.glob("codex-statusline.*"))), 1)
 
-    def test_cockpit_cleans_up_when_session_ends_without_status(self) -> None:
-        cockpit = MODULE_PATH.with_name("codex-statusline")
+    def test_launcher_cleans_up_when_session_ends_without_status(self) -> None:
+        launcher = MODULE_PATH.with_name("codex-statusline")
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             capture = tmp / "tmux-args"
-            env = self.cockpit_detached_session_env(tmp, capture)
+            env = self.launcher_detached_session_env(tmp, capture)
             env["FAKE_HAS_SESSION"] = "1"
 
             result = subprocess.run(
-                [str(cockpit)],
+                [str(launcher)],
                 capture_output=True,
                 check=True,
                 env=env,
