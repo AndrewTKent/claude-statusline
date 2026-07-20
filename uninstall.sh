@@ -4,6 +4,7 @@ set -euo pipefail
 
 INSTALL_DIR="$HOME/.claude"
 SETTINGS_FILE="$INSTALL_DIR/settings.json"
+PURGE_FLAG="${1:-}"
 
 green='\033[32m'; yellow='\033[33m'; reset='\033[0m'
 [ -n "${NO_COLOR:-}" ] && { green=''; yellow=''; reset=''; }
@@ -47,4 +48,43 @@ if [ -f "$INSTALL_DIR/statusline.conf" ]; then
     fi
 fi
 
-printf "\n${green}Uninstalled.${reset} Restart Claude Code to take effect.\n"
+# Handle --purge flag
+if [ "$PURGE_FLAG" = "--purge" ]; then
+    printf "${yellow}[*]${reset} Purging state files and launchd agents...\n"
+    rm -f "$INSTALL_DIR/daily-cost.json"
+    rm -f "$INSTALL_DIR/daily-tokens.json"
+    rm -f "$INSTALL_DIR/token-scan-cache.json"
+    rm -f "$INSTALL_DIR/token-scan-summary.json"
+    rm -f "$INSTALL_DIR/account-resets.json"
+    rm -f "$INSTALL_DIR/utilization-history.jsonl"
+    rm -f "$INSTALL_DIR/account-caps.json"
+    rm -f "$INSTALL_DIR/statusline-tz"
+    rm -f "$INSTALL_DIR/focus"
+    rm -rf "$INSTALL_DIR/ctx-history"
+    info "Removed state files"
+
+    for agent in "com.claude-scan-tokens-watch" "com.claude-ccx-route"; do
+        if launchctl list "$agent" >/dev/null 2>&1; then
+            launchctl unload "$HOME/Library/LaunchAgents/${agent}.plist" 2>/dev/null || true
+            rm -f "$HOME/Library/LaunchAgents/${agent}.plist"
+            info "Unloaded and removed $agent"
+        fi
+    done
+
+    printf "\n${green}Purged.${reset} All state files and launchd agents removed.\n"
+else
+    printf "\n${yellow}State files remain:${reset}\n"
+    printf "  ~/.claude/daily-cost.json\n"
+    printf "  ~/.claude/daily-tokens.json\n"
+    printf "  ~/.claude/token-scan-{cache,summary}.json\n"
+    printf "  ~/.claude/account-resets.json\n"
+    printf "  ~/.claude/utilization-history.jsonl\n"
+    printf "  ~/.claude/account-caps.json\n"
+    printf "  ~/.claude/statusline-tz\n"
+    printf "  ~/.claude/focus\n"
+    printf "  ~/.claude/ctx-history/\n"
+    printf "  ~/Library/LaunchAgents/com.claude-scan-tokens-watch.plist\n"
+    printf "  ~/Library/LaunchAgents/com.claude-ccx-route.plist\n"
+    printf "\n${green}Uninstalled.${reset} Run ${green}%s --purge${reset} to remove state files.\n" "$0"
+    printf "Restart Claude Code to take effect.\n"
+fi

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Manual tool — outputs account-caps.json for statusline cap columns (not scheduled).
 """Derive a plan-agnostic "work unit" measure from utilization history.
 
 Model
