@@ -1825,6 +1825,68 @@ class WatchReliabilityTest(unittest.TestCase):
             codex_statusline.next_sleep_seconds(120.0, idle_ms, now_ms), 120.0
         )
 
+    def test_snapshot_activity_ms_scales_seconds(self) -> None:
+        # Regression: watch_loop fed threads.updated_at (epoch SECONDS) into
+        # next_sleep_seconds, which compares against now_ms — so every session
+        # read as idle and the loop slept the 30s floor regardless of interval.
+        now_ms = 1_000_000_000_000
+        now_s = now_ms // 1000
+        recent_s = now_s - 5
+        single = codex_statusline.snapshot_activity_ms({"updated_at": recent_s}, False)
+        self.assertEqual(single, recent_s * 1000)
+        multi = codex_statusline.snapshot_activity_ms(
+            {"sessions": [{"updated_at": recent_s - 30}, {"updated_at": recent_s}]}, True
+        )
+        self.assertEqual(multi, recent_s * 1000)
+        # Scaled value keeps the fast interval; the pre-fix seconds value tripped
+        # the idle branch and forced the 30s floor.
+        self.assertEqual(codex_statusline.next_sleep_seconds(2.0, single, now_ms), 2.0)
+        self.assertEqual(
+            codex_statusline.next_sleep_seconds(2.0, recent_s, now_ms),
+            codex_statusline.IDLE_POLL_SECONDS,
+        )
+
+    def test_floor_multi_session_sleep(self) -> None:
+        # Footer (single session) keeps the live interval; --top/--all is floored
+        # to the idle cadence so the live refresh can't thrash the re-reading cache.
+        self.assertEqual(codex_statusline.floor_multi_session_sleep(2.0, False), 2.0)
+        self.assertEqual(
+            codex_statusline.floor_multi_session_sleep(2.0, True),
+            codex_statusline.IDLE_POLL_SECONDS,
+        )
+        self.assertEqual(codex_statusline.floor_multi_session_sleep(120.0, True), 120.0)
+
+    def test_limit_display_is_reset_aware(self) -> None:
+        now = datetime.fromtimestamp(1_770_000_000).astimezone()
+        now_ts = int(now.timestamp())
+        past, future = now_ts - 3600, now_ts + 7200
+        pct, text = codex_statusline.limit_display(
+            {"used_percent": 100.0, "resets_at": past}, now
+        )
+        self.assertEqual(pct, 0.0)
+        self.assertEqual(text, "reset")
+        pct, text = codex_statusline.limit_display(
+            {"used_percent": 63.0, "resets_at": future}, now
+        )
+        self.assertEqual(pct, 63.0)
+        self.assertTrue(text.startswith("resets"))
+        pct, text = codex_statusline.limit_display({"used_percent": 42.0}, now)
+        self.assertEqual(pct, 42.0)
+        self.assertEqual(text, "reset n/a")
+
+    def test_resolve_state_db_picks_highest_version(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            self.assertEqual(
+                codex_statusline.resolve_state_db(home), home / "state_5.sqlite"
+            )
+            (home / "state_5.sqlite").touch()
+            (home / "state_6.sqlite").touch()
+            (home / "state_x.sqlite").touch()
+            self.assertEqual(
+                codex_statusline.resolve_state_db(home), home / "state_6.sqlite"
+            )
+
     def test_owner_alive_semantics(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             pid_file = Path(tmpdir) / "owner.pid"
