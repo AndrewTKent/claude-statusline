@@ -28,7 +28,26 @@ except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 fallback
 
 
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
-STATE_DB = CODEX_HOME / "state_5.sqlite"
+
+
+def resolve_state_db(home: Path) -> Path:
+    """Highest-versioned state_N.sqlite in CODEX_HOME. Codex bumps the numeric
+    suffix on schema changes; pinning state_5 means a future state_6 either
+    renders frozen data or 404s. Falls back to state_5 so a missing DB still
+    names the file the error message expects."""
+    best_version = -1
+    best_path = home / "state_5.sqlite"
+    for path in home.glob("state_*.sqlite"):
+        try:
+            version = int(path.stem.split("_", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        if version > best_version:
+            best_version, best_path = version, path
+    return best_path
+
+
+STATE_DB = resolve_state_db(CODEX_HOME)
 CONFIG_FILE = CODEX_HOME / "statusline.conf"
 DEFAULT_BAR_WIDTH = 15
 MAX_ROLLOUT_CACHE = 64
@@ -236,6 +255,27 @@ def next_sleep_seconds(interval: float, latest_activity_ms: int, now_ms: int) ->
     if latest_activity_ms and now_ms - latest_activity_ms > IDLE_AFTER_SECONDS * 1000:
         return max(IDLE_POLL_SECONDS, interval)
     return max(0.5, interval)
+
+
+def snapshot_activity_ms(data: dict[str, Any], multi: bool) -> int:
+    """Newest thread activity as epoch MILLISECONDS. threads.updated_at (and the
+    per-session updated_at in a --top/--all snapshot) is epoch SECONDS; the ×1000
+    is the fix for the watch loop treating every session as idle and sleeping the
+    30s floor regardless of the requested interval."""
+    if multi:
+        return max(
+            (int(s.get("updated_at") or 0) * 1000 for s in data.get("sessions") or []),
+            default=0,
+        )
+    return int(data.get("updated_at") or 0) * 1000
+
+
+def floor_multi_session_sleep(sleep_s: float, multi: bool) -> float:
+    """--top/--all re-read every rollout each tick, so the now-live refresh
+    interval would thrash the re-reading cache; hold multi-session views at the
+    idle cadence. The footer (single session) stays live. Lift this once the
+    cache stops re-reading cold files."""
+    return max(sleep_s, IDLE_POLL_SECONDS) if multi else sleep_s
 
 
 def owner_alive(owner_pid_file: str) -> bool:
@@ -1223,6 +1263,23 @@ def format_reset(timestamp: Any, now: datetime | None = None) -> str:
     return f"resets {reset_at.strftime('%b').lower()} {reset_at.day} {reset_at.year}"
 
 
+def limit_display(limit: dict[str, Any], now: datetime | None = None) -> tuple[float, str]:
+    """Reset-aware (used_percent, reset_text) for a rate-limit bucket. Once the
+    window's resets_at has passed the limit has rolled over, so report 0% and
+    "reset" rather than freezing the last-seen percentage against a stale past
+    timestamp (the source values only refresh when a session runs a turn)."""
+    used = float(limit.get("used_percent") or 0.0)
+    resets_at = limit.get("resets_at")
+    try:
+        reset_at = datetime.fromtimestamp(int(resets_at)).astimezone()
+    except (TypeError, ValueError, OSError):
+        return used, "reset n/a"
+    local_now = (now or datetime.now(timezone.utc)).astimezone()
+    if reset_at <= local_now:
+        return 0.0, "reset"
+    return used, format_reset(resets_at, now)
+
+
 def sandbox_label(policy: str) -> str:
     if not policy:
         return "-"
@@ -1243,9 +1300,8 @@ def render_goal_row(label: str, value: int, goal: int, width: int, p: Palette, i
 
 
 def render_rate_limit_row(label: str, limit: dict[str, Any], width: int, p: Palette, indent: int = 8) -> str:
-    used_percent = float(limit.get("used_percent") or 0.0)
+    used_percent, reset = limit_display(limit)
     bar = build_pct_bar(used_percent, width, p)
-    reset = format_reset(limit.get("resets_at"))
     return f"{' ' * indent}{label:<7} {bar} {format_pct(used_percent).ljust(7)} {reset}"
 
 
@@ -1499,7 +1555,7 @@ def render_sigil(data: dict[str, Any], p: Palette) -> str:
     limits = labeled_rate_limits(rate_limits)
     limit_label, limit = limits[0] if limits else ("5-hour", {})
     short_limit_label = {"5-hour": "5h", "weekly": "wk"}.get(limit_label, limit_label)
-    pct = float(limit.get("used_percent") or 0.0)
+    pct, _ = limit_display(limit)
     bar = build_pct_bar(pct, 10, p)
     effort = f".{data['reasoning_effort']}" if data["reasoning_effort"] else ""
     context = "-"
@@ -1547,7 +1603,8 @@ def render_footer(data: dict[str, Any], width: int, p: Palette) -> str:
         if width >= 64:
             lines.append(render_rate_limit_row(label, limit, DEFAULT_BAR_WIDTH, p, 2))
         else:
-            lines.append(row(label, f"{format_pct(float(limit.get('used_percent') or 0.0))} {format_reset(limit.get('resets_at'))}"))
+            limit_pct, limit_reset = limit_display(limit)
+            lines.append(row(label, f"{format_pct(limit_pct)} {limit_reset}"))
 
     lines.extend(
         [
@@ -1737,10 +1794,10 @@ def render_top(data: dict[str, Any], args: argparse.Namespace, p: Palette) -> st
     lines = [summary]
     for label, limit in limits:
         short_label = {"5-hour": "5h", "weekly": "wk"}.get(label, label)
-        used_percent = float(limit.get("used_percent") or 0.0)
+        used_percent, limit_reset = limit_display(limit)
         lines.append(
             f"{short_label} [{build_pct_bar(used_percent, rate_width, p)}] "
-            f"{format_pct(used_percent):>6} {format_reset(limit.get('resets_at'))}"
+            f"{format_pct(used_percent):>6} {limit_reset}"
         )
     lines.extend(["─" * min(width, 140), columns])
 
@@ -1847,13 +1904,7 @@ def watch_loop(args: argparse.Namespace, p: Palette) -> int:
             if args.dynamic_width:
                 args.width = terminal_size().columns
             data = all_sessions_snapshot(args) if args.all or args.top else snapshot(args)
-            if args.all or args.top:
-                latest_activity_ms = max(
-                    (int(s.get("updated_at") or 0) for s in data.get("sessions") or []),
-                    default=0,
-                )
-            else:
-                latest_activity_ms = int(data.get("updated_at") or 0)
+            latest_activity_ms = snapshot_activity_ms(data, bool(args.all or args.top))
             if (
                 (args.bind_after or args.bind_after_ms or args.bind_updated_after_ms)
                 and not args.owner_pid_file
@@ -1884,11 +1935,8 @@ def watch_loop(args: argparse.Namespace, p: Palette) -> int:
             STATE_DB, last_attempt=wal_attempt, now=time.monotonic()
         )
         try:
-            time.sleep(
-                next_sleep_seconds(
-                    args.watch, latest_activity_ms, int(time.time() * 1000)
-                )
-            )
+            sleep_s = next_sleep_seconds(args.watch, latest_activity_ms, int(time.time() * 1000))
+            time.sleep(floor_multi_session_sleep(sleep_s, bool(args.all or args.top)))
         except KeyboardInterrupt:
             print()
             return 0
