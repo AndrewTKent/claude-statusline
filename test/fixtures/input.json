@@ -1,0 +1,21 @@
+{
+  "model": { "display_name": "Claude Opus 4.8" },
+  "cost": {
+    "total_cost_usd": 12.5,
+    "total_duration_ms": 3600000,
+    "total_lines_added": 420,
+    "total_lines_removed": 137
+  },
+  "context_window": {
+    "used_percentage": 42,
+    "context_window_size": 200000,
+    "total_input_tokens": 1500000,
+    "total_output_tokens": 45000,
+    "current_usage": {
+      "cache_read_input_tokens": 1200000,
+      "cache_creation_input_tokens": 300000
+    }
+  },
+  "workspace": { "current_dir": "__CWD__" },
+  "session_id": "snaptest0-1111-2222-3333-444455556666"
+}
