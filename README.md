@@ -1,6 +1,6 @@
 <p align="center">
   <strong>claude-statusline</strong><br>
-  <em>The cockpit for Claude Code.</em>
+  <em>The statusline for Claude Code.</em>
 </p>
 
 <p align="center">
@@ -78,8 +78,7 @@ The footer refreshes every 3s (`CODEX_STATUSLINE_INTERVAL`) and backs off to a
 30s poll once its session has been idle for 10 minutes, exits when the owning
 process is gone, and opportunistically truncates `state_5.sqlite`'s WAL when it
 grows past 128 MB — long-lived footers previously starved SQLite checkpoints
-until every Codex query slowed to a crawl. The old `CODEX_COCKPIT_*` variable
-names still work as fallbacks.
+until every Codex query slowed to a crawl.
 
 The launcher defaults to Codex YOLO mode by passing
 `--dangerously-bypass-approvals-and-sandbox`. An explicit `-a/--ask-for-approval`,
@@ -179,7 +178,7 @@ Five render modes. Set `FORMAT=` in `~/.claude/statusline.conf` or `STATUSLINE_F
 
 ### `default` — Multi-line dashboard (shown above)
 
-The full cockpit. Adapts to terminal width (>=100 cols wide, <100 compact).
+The full dashboard. Adapts to terminal width (>=100 cols wide, <100 compact).
 
 ### `sigil` — Single dense line
 
@@ -369,7 +368,7 @@ rm ~/.claude/statusline.sh
 # Remove "statusLine" key from ~/.claude/settings.json
 
 # Codex monitor
-rm ~/.local/bin/codex-{cockpit,statusline,top,watch} \
+rm ~/.local/bin/codex-{statusline,top,watch} \
    ~/.local/bin/codex-config.sh ~/.local/bin/codex_statusline.py
 # Optionally: rm ~/.codex/statusline.conf
 ```

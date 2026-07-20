@@ -19,9 +19,9 @@ command -v tmux >/dev/null 2>&1 || {
     printf "tmux is required\n" >&2
     exit 1
 }
-if [ -n "${CODEX_COCKPIT_CODEX_BIN:-}" ]; then
-    [ -x "$CODEX_COCKPIT_CODEX_BIN" ] || {
-        printf "Codex CLI is not executable: %s\n" "$CODEX_COCKPIT_CODEX_BIN" >&2
+if [ -n "${CODEX_STATUSLINE_CODEX_BIN:-}" ]; then
+    [ -x "$CODEX_STATUSLINE_CODEX_BIN" ] || {
+        printf "Codex CLI is not executable: %s\n" "$CODEX_STATUSLINE_CODEX_BIN" >&2
         exit 1
     }
 elif ! command -v codex >/dev/null 2>&1; then
