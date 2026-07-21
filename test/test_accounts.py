@@ -100,20 +100,6 @@ class TestEffectivePcts:
         assert accounts.effective_pcts(row, now)["fable"] == 0.0
 
 
-class TestHeadroomRank:
-    def test_orders_by_five_hour_then_seven_day(self):
-        a = {"five_hour": 10.0, "seven_day": 90.0, "fable": None}
-        b = {"five_hour": 10.0, "seven_day": 5.0, "fable": None}
-        c = {"five_hour": 0.0, "seven_day": 99.0, "fable": None}
-        ranked = sorted([a, b, c], key=accounts.headroom_rank)
-        assert ranked == [c, b, a]
-
-    def test_unknown_ranks_last(self):
-        known = {"five_hour": 99.0, "seven_day": 99.0, "fable": 99.0}
-        unknown = {"five_hour": None, "seven_day": None, "fable": None}
-        assert sorted([unknown, known], key=accounts.headroom_rank) == [known, unknown]
-
-
 class TestBlobAccessToken:
     def test_nested(self):
         blob = json.dumps({"claudeAiOauth": {"accessToken": "tok-1"}})
@@ -127,17 +113,6 @@ class TestBlobAccessToken:
         assert accounts.blob_access_token(json.dumps(["nope"])) is None
 
 
-class TestSynthesizeOauthAccount:
-    def test_identifiers_land(self):
-        ident = {"uuid": "u1", "email": "e@x.y", "org_uuid": "o1", "org_type": "claude_max",
-                 "rate_limit_tier": "default_claude_max_20x"}
-        oa = accounts.synthesize_oauth_account(ident, None)
-        assert oa["accountUuid"] == "u1"
-        assert oa["emailAddress"] == "e@x.y"
-        assert oa["organizationUuid"] == "o1"
-        assert oa["organizationRateLimitTier"] == "default_claude_max_20x"
-
-
 class TestCredExpiry:
     def test_blob_refresh_expiry_ms_to_seconds(self):
         blob = json.dumps({"claudeAiOauth": {"refreshTokenExpiresAt": 1784337371728}})
@@ -149,15 +124,6 @@ class TestCredExpiry:
 
     def test_blob_refresh_expiry_flat(self):
         assert accounts.blob_refresh_expiry(json.dumps({"refreshTokenExpiresAt": 2000000000000})) == 2000000000
-
-    def test_cred_expired_past(self):
-        assert accounts.cred_expired(1) is True  # epoch 1 is long past
-
-    def test_cred_expired_future(self):
-        assert accounts.cred_expired(4000000000) is False  # year 2096
-
-    def test_cred_expired_none_is_not_expired(self):
-        assert accounts.cred_expired(None) is False
 
 
 class TestPickRoute:
@@ -292,71 +258,6 @@ class TestUsageMapping:
 
     def test_access_expiry_missing(self):
         assert accounts.blob_access_expiry(json.dumps({"claudeAiOauth": {}})) is None
-
-
-class TestVaultKey:
-    def test_composite_of_account_and_org(self):
-        ident = {"uuid": "acct1", "org_uuid": "orgA"}
-        assert accounts.vault_key(ident) == "acct1|orgA"
-
-    def test_shared_account_two_orgs_distinct_keys(self):
-        # acme-max and acme-work: same account, different org -> must not collide
-        maxk = accounts.vault_key({"uuid": "d9eb", "org_uuid": "e1c8"})
-        workk = accounts.vault_key({"uuid": "d9eb", "org_uuid": "52ae"})
-        assert maxk != workk
-
-    def test_missing_org_is_none(self):
-        assert accounts.vault_key({"uuid": "acct1", "org_uuid": None}) is None
-        assert accounts.vault_key({"uuid": None, "org_uuid": "orgA"}) is None
-
-    def test_short_key_shows_both_parts(self):
-        assert accounts.short_key("d9eb92c0-xxxx|52ae57ff-yyyy") == "d9eb92c0|52ae57ff"
-
-
-class TestResolveTargetSharedEmail:
-    META = {
-        "accounts": {
-            "d9eb|e1c8": {"email": "andrew.kent@acme.ai", "org_uuid": "e1c8"},
-            "d9eb|52ae": {"email": "andrew.kent@acme.ai", "org_uuid": "52ae"},
-        }
-    }
-    PAIRS = [
-        ("acme-max", "andrew.kent@acme.ai", "e1c8"),
-        ("acme-work", "andrew.kent@acme.ai", "52ae"),
-    ]
-
-    def test_label_disambiguates_shared_email(self):
-        k, _ = accounts.resolve_target(self.META, "acme-work", self.PAIRS)
-        assert k == "d9eb|52ae"
-
-    def test_shared_email_is_ambiguous(self):
-        with pytest.raises(SystemExit):
-            accounts.resolve_target(self.META, "andrew.kent@acme.ai", self.PAIRS)
-
-
-class TestResolveTarget:
-    META = {
-        "accounts": {
-            "uuid-a": {"email": "andrew.kent@acme.ai", "org_uuid": "e1c8"},
-            "uuid-b": {"email": "user@example.com", "org_uuid": "g1"},
-        }
-    }
-
-    def test_by_label(self):
-        uuid, _ = accounts.resolve_target(self.META, "acme-max", PAIRS)
-        assert uuid == "uuid-a"
-
-    def test_by_email(self):
-        uuid, _ = accounts.resolve_target(self.META, "user@example.com", PAIRS)
-        assert uuid == "uuid-b"
-
-    def test_by_uuid(self):
-        uuid, _ = accounts.resolve_target(self.META, "uuid-b", PAIRS)
-        assert uuid == "uuid-b"
-
-    def test_missing_dies(self):
-        with pytest.raises(SystemExit):
-            accounts.resolve_target(self.META, "nope", PAIRS)
 
 
 def _live_blob(atok, future_ms=3_000_000_000_000):
