@@ -1536,6 +1536,9 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
         # refresh expiry lives inside each blob (epoch-ms). Keyed email|org to
         # match the ledger rows below.
         accounts_blobs="$HOME/.accounts/blobs.json"
+        _route_mode=$(jq -r '.mode // ""' "$HOME/.accounts/mode.json" 2>/dev/null)
+        _US=$'\x1f'
+        _name_w=9
         ACCOUNTS_EXPIRED_LOOKUP=""
         if [ -f "$accounts_blobs" ]; then
             ACCOUNTS_EXPIRED_LOOKUP=$(jq -r --argjson now "$now_ar" '
@@ -1814,7 +1817,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     [ -n "$fbl_ep" ] && [ "$fbl_ep" -le "$now_ar" ] 2>/dev/null && fable_state="unknown"
                 fi
                 if [ "$fable_state" = "unknown" ] || [ -z "$fable_disp" ]; then
-                    fable_color="$dim"; fb_raw="—"
+                    fable_color="$dim"; fb_raw="—"; fable_int=""
                 else
                     fable_int=$(printf "%.0f" "$fable_disp" 2>/dev/null || echo 0)
                     fable_color=$(color_for_pct "$fable_int"); fb_raw="${fable_int}%"
@@ -1863,11 +1866,16 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 # Weekly-capped accounts are bricks regardless of 5h headroom.
                 [ "${weekly_int:-0}" -ge 100 ] 2>/dev/null && score=0
                 [ -n "$exp_suffix" ] && score=0
+                # Under fable policy the marker must not point at an account the
+                # fable router would never pick (mirrors fable_eligible's cap).
+                if [ "$_route_mode" = "fable" ]; then
+                    { [ -z "${fable_int:-}" ] || [ "$fable_int" -ge 95 ] 2>/dev/null; } && score=0
+                fi
 
                 # Track best non-current account for the "✓ use now" marker.
                 if [ "$is_current" = "0" ] && [ "$score" -gt "${_best_score:-0}" ]; then
                     _best_score=$score
-                    _best_em=$em
+                    _best_key="${em}${_US}${uuid}"
                 fi
 
                 # 5h reset as relative time — the header labels the column;
@@ -1911,13 +1919,15 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 # Weekly-capped accounts are unusable regardless of 5h state — dim the name.
                 name_color="$white"
                 [ "$weekly_int" -ge 100 ] 2>/dev/null && name_color="$dim"
-                row_line="${marker}${name_color}$(_pad_to_cols "$display_name" 9)${reset} ${pct_color}$(_ralign "$pct_raw" 4)${reset}  ${dim}$(_ralign "$five_reset_rel" 6)${reset}   ${weekly_seg}   ${fable_seg}  ${dim}$(_ralign "$wk_reset_rel" 6)${reset}${exp_suffix}${stale_suffix}"
+                [ "${#display_name}" -gt "$_name_w" ] && _name_w=${#display_name}
+                row_rest=" ${pct_color}$(_ralign "$pct_raw" 4)${reset}  ${dim}$(_ralign "$five_reset_rel" 6)${reset}   ${weekly_seg}   ${fable_seg}  ${dim}$(_ralign "$wk_reset_rel" 6)${reset}${exp_suffix}${stale_suffix}"
                 # Annotate with hard-wall warning when applicable. (Windfall
                 # is implicit from the hrs_col — no extra note needed.)
                 if [ "$has_wall" = "1" ]; then
-                    row_line+="  ${red}⚠ hard wall${reset}"
+                    row_rest+="  ${red}⚠ hard wall${reset}"
                 fi
-                ACCOUNT_ROWS+="|${em}:${row_line}"
+                # Name padded in the second pass, once _name_w is final.
+                ACCOUNT_ROWS+="|${em}${_US}${uuid}${_US}${marker}${_US}${name_color}${_US}${display_name}${_US}${row_rest}"
             done <<< "$parsed"
 
             # Second pass: annotate the "✓ best next" row and assemble final output.
@@ -1925,9 +1935,9 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
             IFS='|' read -ra _rows <<< "$ACCOUNT_ROWS"
             for r in "${_rows[@]}"; do
                 [ -z "$r" ] && continue
-                row_em="${r%%:*}"
-                row_body="${r#*:}"
-                if [ -n "${_best_em:-}" ] && [ "$row_em" = "$_best_em" ] && [ "${five_hour_pct:-0}" -ge 70 ] 2>/dev/null; then
+                IFS="$_US" read -r r_em r_uuid r_marker r_ncolor r_name r_rest <<< "$r"
+                row_body="${r_marker}${r_ncolor}$(_pad_to_cols "$r_name" "$_name_w")${reset}${r_rest}"
+                if [ -n "${_best_key:-}" ] && [ "${r_em}${_US}${r_uuid}" = "$_best_key" ] && [ "${five_hour_pct:-0}" -ge 70 ] 2>/dev/null; then
                     row_body+="   ${green}✓ best next${reset}"
                 fi
                 # Prefix with the marker (already 2 cols) — no extra leading
@@ -2134,7 +2144,7 @@ render_default() {
         [ -n "$backends_line" ] && printf "\n${white}$(printf "%-7s" "stack")${reset} ${dim}%s${reset}" "$backends_line"
     fi
     if [ -n "$FINAL_ACCOUNT_ROWS" ]; then
-        _acct_header="  $(_pad_to_cols "acct" 9) $(_ralign "5h" 4)  $(_ralign "reset" 6)   $(_ralign "week" 4)   $(_ralign "fable" 5)  $(_ralign "reset" 6)"
+        _acct_header="  $(_pad_to_cols "acct" "${_name_w:-9}") $(_ralign "5h" 4)  $(_ralign "reset" 6)   $(_ralign "week" 4)   $(_ralign "fable" 5)  $(_ralign "reset" 6)"
         printf "\n${dim}%s${reset}%b" "$_acct_header" "$FINAL_ACCOUNT_ROWS"
     fi
 }
