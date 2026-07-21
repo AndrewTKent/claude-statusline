@@ -1857,6 +1857,8 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 fi
                 score=$(( headroom + extra_headroom / 2 + windfall ))
                 [ "$has_wall" = "1" ] && score=0
+                # Weekly-capped accounts are bricks regardless of 5h headroom.
+                [ "${weekly_int:-0}" -ge 100 ] 2>/dev/null && score=0
 
                 # Track best non-current account for the "✓ use now" marker.
                 if [ "$is_current" = "0" ] && [ "$score" -gt "${_best_score:-0}" ]; then
