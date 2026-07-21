@@ -7,9 +7,8 @@ description: Set up the accounts router (multi-account routing for Claude Code) 
 
 Multi-account routing for Claude Code: a headroom board across accounts,
 automatic switching when the live account runs low, launch-time routing to the
-freshest account, and pin-follows-login. The command is `accounts`; `ccx` is
-the legacy alias and keeps working. Run `/setup-statusline` first — the two
-share `~/.claude/statusline.conf`.
+freshest account, and pin-follows-login. The command is `accounts`. Run
+`/setup-statusline` first — the two share `~/.claude/statusline.conf`.
 
 Two independent layers; install both for full coverage:
 
@@ -23,7 +22,7 @@ Two independent layers; install both for full coverage:
 - The router NEVER writes the live keychain slot `Claude Code-credentials`
   (file writes + sanctioned deletion only). Do not "fix" that; it prevents
   the keychain prompt-storm failure class.
-- Never display or log token values. `~/.ccx/` contents stay out of
+- Never display or log token values. `~/.accounts/` contents stay out of
   transcripts and commits.
 
 ## Steps
@@ -42,8 +41,7 @@ Two independent layers; install both for full coverage:
 2. **Install the CLI:**
 
    ```bash
-   ln -sf "$REPO/bin/ccx.py" ~/.local/bin/accounts
-   ln -sf "$REPO/bin/ccx.py" ~/.local/bin/ccx    # legacy alias
+   ln -sf "$REPO/bin/accounts.py" ~/.local/bin/accounts
    ```
 
 3. **Seed each account into the store.** In Claude Code, `/login` as the
@@ -54,7 +52,7 @@ Two independent layers; install both for full coverage:
    ```
 
    Any `accounts` command captures the live credential into
-   `~/.ccx/blobs.json` under its label. Repeat per account. (That is the
+   `~/.accounts/blobs.json` under its label. Repeat per account. (That is the
    whole onboarding — there is no enroll step.)
 
 4. **Mint launch tokens** (enables launch-time routing; ~1-year lifetime,
@@ -83,7 +81,7 @@ Two independent layers; install both for full coverage:
      while true; do
        _env="$("$HOME/.local/bin/accounts" pick-env 2>/dev/null)" || _env=""
        ( [ -n "$_env" ] && eval "$_env"
-         [ -n "${CCX_ROUTED_LABEL:-}" ] && print -u2 "accounts → $CCX_ROUTED_LABEL"
+         [ -n "${ACCOUNTS_ROUTED_LABEL:-}" ] && print -u2 "accounts → $ACCOUNTS_ROUTED_LABEL"
          if [ "$_mode" = "start" ]; then exec "$_bin" "$@"; else exec "$_bin" --continue; fi )
        printf 'accounts: [Enter] resume this conversation on the freshest account · anything else quits  '
        _k=""
@@ -98,36 +96,37 @@ Two independent layers; install both for full coverage:
    # <<< accounts auto-route <<<
    ```
 
-   Pin one launch: `CCX_ACCOUNT=<label> claude`. No minted tokens → the
+   Pin one launch: `ACCOUNTS_PIN=<label> claude`. No minted tokens → the
    wrapper falls through to native auth unchanged.
 
 6. **Install the route daemon:**
 
    ```bash
-   cp "$REPO/macos/launchd/com.claude-ccx-route.plist.example" \
-      ~/Library/LaunchAgents/com.claude-ccx-route.plist
-   # edit ProgramArguments so the path points at YOUR clone's bin/ccx.py
-   launchctl load ~/Library/LaunchAgents/com.claude-ccx-route.plist
+   cp "$REPO/macos/launchd/com.claude-accounts-route.plist.example" \
+      ~/Library/LaunchAgents/com.claude-accounts-route.plist
+   # edit ProgramArguments so the path points at YOUR clone's bin/accounts.py
+   launchctl load ~/Library/LaunchAgents/com.claude-accounts-route.plist
    ```
 
 7. **Pick a mode:**
 
    ```bash
    accounts auto           # route to the freshest account when the live one runs low
+   accounts fable          # prefer a Fable-capable account; fall back to normal routing
    accounts set <label>    # pin and hold
    ```
 
    - A fresh `/login` always moves the pin to that account — the daemon adopts
      your explicit choice instead of fighting it.
-   - AUTO weighs fable capacity automatically while the live account is
-     actually spending fable; `CCX_FABLE_AWARE=0` in the conf turns that off.
+   - `fable` keeps you on whichever account has the most Fable (premium weekly)
+     headroom and degrades to normal 5h routing when none can do Fable.
 
 ## Verify
 
 ```bash
 accounts ls                         # board: 5h / 7d / fable per account
 accounts status                     # mode line + live account
-tail -5 ~/.claude/ccx-mirror.log    # every switch is logged with a reason
+tail -5 ~/.claude/accounts-mirror.log    # every switch is logged with a reason
 ```
 
 The statusline board row appears once `SHOW_ACCOUNT_RESETS=1` and at least one
@@ -137,10 +136,6 @@ poll has run.
 
 1. `accounts status` — a surprising `SET → <label>` explains "why am I on X".
 2. `accounts auto` releases a pin; `accounts set <label>` moves it.
-3. Still fighting you: `launchctl unload ~/Library/LaunchAgents/com.claude-ccx-route.plist`,
+3. Still fighting you: `launchctl unload ~/Library/LaunchAgents/com.claude-accounts-route.plist`,
    then `/login` sticks unconditionally; `load` re-arms.
-4. `~/.claude/ccx-mirror.log` names every write (`SET`, `ROUTED`, `ADOPT`).
-
-State paths (`~/.ccx/`), `CCX_*` variables, and the plist keep their historical
-names on purpose — they hold live credentials, and renaming them would force a
-migration for zero functional gain.
+4. `~/.claude/accounts-mirror.log` names every write (`SET`, `ROUTED`, `ADOPT`).
