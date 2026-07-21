@@ -159,13 +159,13 @@ class TestCredExpiry:
         assert ccx.cred_expired(None) is False
 
 
-def _route_row(label, eff5, active=False, expired=False):
+def _route_row(label, eff5, active=False, expired=False, fable=0.0):
     return {
         "uuid": label,
         "label": label,
         "active": active,
         "expired": expired,
-        "effs": {"five_hour": eff5, "seven_day": 0.0, "fable": 0.0},
+        "effs": {"five_hour": eff5, "seven_day": 0.0, "fable": fable},
     }
 
 
@@ -264,9 +264,9 @@ class TestRouterCore:
         assert ccx.route_pick(rows, set()) is None
 
 
-def ccx_row(label, five_hour, expired=False, active=False):
+def ccx_row(label, five_hour, expired=False, active=False, fable=0.0):
     return {"label": label, "email": f"{label}@x", "five_hour": five_hour,
-            "expired": expired, "active": active}
+            "fable": fable, "expired": expired, "active": active}
 
 
 class TestUsageMapping:
@@ -538,6 +538,93 @@ class TestRouteDecision:
         assert line and "ROUTED A → B" in line
         assert ccx._last_switch_ts is not None and ccx._last_switch_ts > 1  # stamp advanced
 
+    # ---- fable mode: greedy chase of the freshest Fable-capable account ----
+
+    def test_fable_holds_when_live_is_best_fable(self, tmp_path, monkeypatch):
+        # Live A has the most fable headroom; the only other eligible (B@90) is
+        # not >= hysteresis fresher, so hold — no cold-start for nothing.
+        rows = [ccx_row("A", 20.0, active=True, fable=10.0), ccx_row("B", 20.0, fable=90.0)]
+        self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "fable"},
+                   {"accounts": {"B": {"blob": "BLOB-B"}}})
+        assert ccx.route_once(80.0) is None
+        assert not ccx.CRED_FILE.exists()
+
+    def test_fable_holds_on_near_tie(self, tmp_path, monkeypatch):
+        # Live @45, best alt @40 — only 5 pts fresher (< hysteresis 10) → hold.
+        rows = [ccx_row("A", 20.0, active=True, fable=45.0), ccx_row("B", 20.0, fable=40.0)]
+        self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "fable"},
+                   {"accounts": {"B": {"blob": "BLOB-B"}}})
+        assert ccx.route_once(80.0) is None
+        assert not ccx.CRED_FILE.exists()
+
+    def test_fable_switches_to_meaningfully_fresher(self, tmp_path, monkeypatch):
+        # Live @80 (eligible), B @10 — 70 pts fresher (>= hysteresis) → switch.
+        rows = [ccx_row("A", 30.0, active=True, fable=80.0), ccx_row("B", 10.0, fable=10.0)]
+        self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "fable"},
+                   {"accounts": {"B": {"blob": "BLOB-B"}}})
+        line = ccx.route_once(80.0)
+        assert line and "FABLE A → B" in line
+        assert ccx.CRED_FILE.read_text() == "BLOB-B"
+
+    def test_fable_switches_when_live_fable_capped(self, tmp_path, monkeypatch):
+        # Live fable exhausted (@97) → live ineligible → switch to eligible B@50.
+        rows = [ccx_row("A", 20.0, active=True, fable=97.0), ccx_row("B", 10.0, fable=50.0)]
+        self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "fable"},
+                   {"accounts": {"B": {"blob": "BLOB-B"}}})
+        line = ccx.route_once(80.0)
+        assert line and "FABLE A → B" in line
+        assert ccx.CRED_FILE.read_text() == "BLOB-B"
+
+    def test_fable_switches_when_live_5h_capped(self, tmp_path, monkeypatch):
+        # Live fable fine (@20) but 5h capped (@97) → live unusable → switch.
+        rows = [ccx_row("A", 97.0, active=True, fable=20.0), ccx_row("B", 10.0, fable=50.0)]
+        self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "fable"},
+                   {"accounts": {"B": {"blob": "BLOB-B"}}})
+        line = ccx.route_once(80.0)
+        assert line and "FABLE A → B" in line
+        assert ccx.CRED_FILE.read_text() == "BLOB-B"
+
+    def test_fable_dwell_rate_limits(self, tmp_path, monkeypatch):
+        # A switch is due (live fable capped, B fresh) but held within the dwell.
+        rows = [ccx_row("A", 20.0, active=True, fable=97.0), ccx_row("B", 10.0, fable=10.0)]
+        self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "fable"},
+                   {"accounts": {"B": {"blob": "BLOB-B"}}})
+        monkeypatch.setattr(ccx, "_last_switch_ts", time.monotonic())  # just switched
+        assert ccx.route_once(80.0) is None
+        assert not ccx.CRED_FILE.exists()
+        monkeypatch.setattr(ccx, "_last_switch_ts", time.monotonic() - ccx.ROUTE_MIN_DWELL_S - 1)
+        line = ccx.route_once(80.0)
+        assert line and "FABLE A → B" in line
+
+    def test_fable_fallback_holds_below_threshold(self, tmp_path, monkeypatch):
+        # No account has fable headroom, but live 5h @30 (< threshold) → the 5h
+        # router holds; the session still does normal work, so no pointless switch.
+        rows = [ccx_row("A", 30.0, active=True, fable=100.0), ccx_row("B", 5.0, fable=100.0)]
+        self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "fable"},
+                   {"accounts": {"B": {"blob": "BLOB-B"}}})
+        assert ccx.route_once(80.0) is None
+        assert not ccx.CRED_FILE.exists()
+
+    def test_fable_fallback_escapes_capped_5h(self, tmp_path, monkeypatch):
+        # No fable anywhere AND live 5h capped (@97) → fall back to the 5h router,
+        # which escapes to B (@40, real headroom). Log is ROUTED (the 5h path).
+        rows = [ccx_row("A", 97.0, active=True, fable=100.0), ccx_row("B", 40.0, fable=100.0)]
+        self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "fable"},
+                   {"accounts": {"B": {"blob": "BLOB-B"}}})
+        line = ccx.route_once(80.0)
+        assert line and "ROUTED A → B" in line
+        assert ccx.CRED_FILE.read_text() == "BLOB-B"
+
+    def test_fable_holds_when_live_unattributed(self, tmp_path, monkeypatch):
+        # active None (profile down) + CRED_FILE present → don't clobber a possibly
+        # cc-rotated live token (mirrors the AUTO/SET guard).
+        rows = [ccx_row("B", 5.0, fable=5.0)]
+        self._wire(tmp_path, monkeypatch, rows, None, {"mode": "fable"},
+                   {"accounts": {"B": {"blob": "BLOB-B"}}})
+        ccx.CRED_FILE.write_text("LIVE-ROTATED")
+        assert ccx.route_once(80.0) is None
+        assert ccx.CRED_FILE.read_text() == "LIVE-ROTATED"
+
 
 class TestCmdSet:
     def _paths(self, tmp_path, monkeypatch):
@@ -754,3 +841,121 @@ class TestRouteOnceAdoptsLogin:
         assert line == "SET coram-max → alumni"
         assert calls["save_mode"] == []
         assert calls["apply"] == ["alumni"]
+
+
+class TestLoadModeFable:
+    def test_fable_round_trips(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ccx, "MODE_PATH", tmp_path / "mode.json")
+        ccx.save_mode("fable", None)
+        assert ccx.load_mode() == {"mode": "fable", "label": None}
+
+    def test_unknown_mode_defaults_to_auto(self, tmp_path, monkeypatch):
+        p = tmp_path / "mode.json"
+        p.write_text(json.dumps({"mode": "bogus", "label": None}))
+        monkeypatch.setattr(ccx, "MODE_PATH", p)
+        assert ccx.load_mode() == {"mode": "auto", "label": None}
+
+
+class TestFableEligible:
+    def test_both_under_cap(self):
+        assert ccx.fable_eligible(30.0, 40.0) is True
+
+    def test_boundary_just_under_cap(self):
+        assert ccx.fable_eligible(94.0, 94.0) is True
+
+    def test_fable_none_ineligible(self):
+        assert ccx.fable_eligible(10.0, None) is False
+
+    def test_fable_at_cap_ineligible(self):
+        assert ccx.fable_eligible(10.0, 95.0) is False  # cap is exclusive
+
+    def test_fable_over_cap_ineligible(self):
+        assert ccx.fable_eligible(10.0, 100.0) is False
+
+    def test_five_hour_none_ineligible(self):
+        assert ccx.fable_eligible(None, 10.0) is False
+
+    def test_five_hour_at_cap_ineligible(self):
+        assert ccx.fable_eligible(95.0, 10.0) is False  # 5h floor
+
+    def test_fable_headroom_useless_when_5h_capped(self):
+        # 0% fable used but 5h maxed → nothing can run → not usable for fable
+        assert ccx.fable_eligible(100.0, 0.0) is False
+
+
+class TestRoutePickFable:
+    def test_lowest_fable_eligible_wins(self):
+        rows = [ccx_row("A", 10.0, active=True, fable=5.0),
+                ccx_row("gmail", 10.0, fable=80.0),
+                ccx_row("ymail", 10.0, fable=20.0)]
+        assert ccx.route_pick_fable(rows, set()) == "ymail"
+
+    def test_skips_active_and_expired_even_if_lower_fable(self):
+        rows = [ccx_row("A", 10.0, active=True, fable=1.0),        # lowest but active
+                ccx_row("dead", 10.0, fable=2.0, expired=True),    # 2nd but expired
+                ccx_row("gmail", 10.0, fable=40.0)]
+        assert ccx.route_pick_fable(rows, set()) == "gmail"
+
+    def test_five_hour_floor_excludes(self):
+        # B has 0% fable but 100% 5h → unusable; only C qualifies
+        rows = [ccx_row("A", 10.0, active=True, fable=90.0),
+                ccx_row("B", 100.0, fable=0.0),
+                ccx_row("C", 50.0, fable=40.0)]
+        assert ccx.route_pick_fable(rows, set()) == "C"
+
+    def test_none_when_all_fable_capped(self):
+        rows = [ccx_row("A", 10.0, active=True, fable=10.0),
+                ccx_row("B", 10.0, fable=100.0),
+                ccx_row("C", 10.0, fable=96.0)]
+        assert ccx.route_pick_fable(rows, set()) is None
+
+    def test_none_when_all_5h_capped(self):
+        rows = [ccx_row("A", 10.0, active=True, fable=10.0),
+                ccx_row("B", 99.0, fable=10.0)]
+        assert ccx.route_pick_fable(rows, set()) is None
+
+    def test_respects_excludes(self):
+        rows = [ccx_row("A", 10.0, active=True, fable=90.0),
+                ccx_row("gmail", 10.0, fable=20.0),
+                ccx_row("ymail", 10.0, fable=30.0)]
+        assert ccx.route_pick_fable(rows, {"gmail"}) == "ymail"
+
+    def test_fable_none_rows_skipped(self):
+        rows = [ccx_row("A", 10.0, active=True, fable=10.0),
+                ccx_row("B", 10.0, fable=None)]
+        assert ccx.route_pick_fable(rows, set()) is None
+
+
+class TestPickEnvFable:
+    NOW = 1_784_000_000.0
+    VAULT = {"tokens": {
+        "gmail": {"token": "sk-gmail", "expires_at": NOW + 1000},
+        "brown": {"token": "sk-brown", "expires_at": NOW + 1000},
+        "ymail": {"token": "sk-ymail", "expires_at": NOW + 1000},
+    }}
+
+    def test_fable_first_orders_eligible_by_fable(self):
+        rows = [_route_row("gmail", 10.0, fable=80.0),
+                _route_row("brown", 50.0, fable=10.0),
+                _route_row("ymail", 20.0, fable=40.0)]
+        assert [r["label"] for r in ccx._fable_first(rows)] == ["brown", "ymail", "gmail"]
+
+    def test_prefers_fable_over_headroom(self):
+        # gmail is best 5h (5) but fable-capped; brown worse 5h (50) but fable @10.
+        rows = [_route_row("gmail", 5.0, fable=100.0), _route_row("brown", 50.0, fable=10.0)]
+        picked = ccx.pick_route(ccx._fable_first(rows), self.VAULT, set(), self.NOW, None)
+        assert picked == ("brown", "sk-brown")
+
+    def test_falls_back_to_headroom_when_none_eligible(self):
+        # all fable-capped → _fable_first keeps headroom order → best 5h (gmail) wins
+        rows = [_route_row("gmail", 5.0, fable=100.0), _route_row("brown", 50.0, fable=100.0)]
+        picked = ccx.pick_route(ccx._fable_first(rows), self.VAULT, set(), self.NOW, None)
+        assert picked == ("gmail", "sk-gmail")
+
+    def test_skips_eligible_without_token(self):
+        # brown is the freshest fable but has NO token → fall through to the next
+        # eligible tokened account (ymail).
+        vault = {"tokens": {"ymail": {"token": "sk-ymail", "expires_at": self.NOW + 1000}}}
+        rows = [_route_row("brown", 20.0, fable=10.0), _route_row("ymail", 30.0, fable=40.0)]
+        picked = ccx.pick_route(ccx._fable_first(rows), vault, set(), self.NOW, None)
+        assert picked == ("ymail", "sk-ymail")

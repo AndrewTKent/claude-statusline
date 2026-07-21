@@ -789,7 +789,7 @@ BLOBS_PATH = HOME / ".ccx" / "blobs.json"
 def load_mode() -> dict:
     try:
         m = json.loads(MODE_PATH.read_text())
-        if m.get("mode") in ("auto", "set"):
+        if m.get("mode") in ("auto", "set", "fable"):
             return m
     except (OSError, json.JSONDecodeError):
         pass
@@ -1003,6 +1003,7 @@ def route_rows(blobs: dict, active_label: str | None, now_ts: float) -> list[dic
                 "label": label,
                 "email": e.get("email"),
                 "five_hour": effs["five_hour"],
+                "fable": effs["fable"],
                 "expired": blob_expired(e.get("blob", ""), now_ts),
                 "active": label == active_label,
             }
@@ -1169,14 +1170,32 @@ def cmd_tokens(_args) -> None:
         print(f"  {label:<12} minted {datetime.fromtimestamp(e.get('minted_at', 0)).date()}  {state}")
 
 
+def _fable_first(rows: list[dict]) -> list[dict]:
+    """Reorder for fable mode: fable-eligible accounts first (least fable used),
+    everything else keeps its headroom_rank order. pick_route then takes the first
+    with a live token, so fallback (no eligible or no-token fable account) is
+    automatic. Stable sort preserves the headroom order inside each group."""
+
+    def key(r: dict) -> tuple:
+        effs = r["effs"]
+        if fable_eligible(effs["five_hour"], effs["fable"]):
+            return (0, effs["fable"])
+        return (1, 0.0)
+
+    return sorted(rows, key=key)
+
+
 def cmd_pick_env(_args) -> None:
     """Emit `export` lines for the best routable account (consumed by the
     `claude` shell wrapper). Prints nothing when there is no routable token —
     the wrapper then falls back to Claude Code's native keychain auth. Never
     fails: routing must never block launching claude."""
     try:
+        rows = _account_rows(load_meta())
+        if load_mode().get("mode") == "fable":
+            rows = _fable_first(rows)
         pick = pick_route(
-            _account_rows(load_meta()),
+            rows,
             load_token_vault(),
             excluded_labels(),
             time.time(),
@@ -1195,6 +1214,8 @@ ROUTE_AT_DEFAULT = 80.0  # switch when the active account's 5h usage crosses thi
 ROUTE_HYSTERESIS_PCT = 10.0  # below cap: only switch for a headroom gain this large
 ROUTE_CAP_PCT = 95.0  # at/above this the live account is ~capped: escape to a usable account
 ROUTE_MIN_DWELL_S = 300.0  # >= this long between AUTO switches (each cold-starts a prompt cache)
+FABLE_CAP_PCT = 95.0  # fable weekly window ~exhausted; separate axis from ROUTE_CAP_PCT (5h)
+FABLE_HYSTERESIS_PCT = 10.0  # fable mode: only chase a meaningfully fresher account (no near-tie churn)
 
 # Monotonic so an NTP step-back can't wedge routing; None = never switched this
 # process. Daemon is one long-lived process, so no persistence needed.
@@ -1208,6 +1229,77 @@ def notify(text: str, title: str = "ccx") -> None:
         capture_output=True,
         text=True,
     )
+
+
+def fable_eligible(five_hour: float | None, fable: float | None) -> bool:
+    """Usable for Fable work: headroom on BOTH the weekly fable window and the 5h
+    window — fable headroom is worthless if 5h is capped (nothing can run). fable
+    None (tier has no weekly_scoped limit) or either axis at/over cap → ineligible."""
+    return (
+        fable is not None
+        and fable < FABLE_CAP_PCT
+        and five_hour is not None
+        and five_hour < ROUTE_CAP_PCT
+    )
+
+
+def route_pick_fable(rows: list[dict], excludes: set[str]) -> str | None:
+    """Best OTHER account to switch to for Fable: eligible on both axes, not
+    active/expired/excluded, least fable used first (5h as tiebreak). None when no
+    other account qualifies — the caller then holds or falls back to the 5h router."""
+    eligible = [
+        r
+        for r in rows
+        if not r["active"]
+        and not r["expired"]
+        and r["label"] not in excludes
+        and fable_eligible(r["five_hour"], r["fable"])
+    ]
+    if not eligible:
+        return None
+    eligible.sort(key=lambda r: (r["fable"], r["five_hour"]))  # both non-None by eligibility
+    return eligible[0]["label"]
+
+
+def _auto_switch(
+    rows: list[dict],
+    by_label: dict,
+    active: str | None,
+    blobs: dict,
+    threshold: float,
+    excludes: set[str],
+) -> str | None:
+    """AUTO decision: switch to the freshest 5h account when the live one is past
+    `threshold`, with cap/hysteresis/dwell anti-thrash. Shared by AUTO and the
+    fable-mode fallback. Caller holds the lock."""
+    global _last_switch_ts
+    cur = by_label.get(active) if active else None
+    if cur is None or cur["five_hour"] is None or cur["five_hour"] < threshold:
+        return None
+    pick = route_pick(rows, excludes)
+    if pick is None:
+        return None
+    cur_pct = cur["five_hour"]
+    pick_pct = by_label[pick]["five_hour"]
+    if pick_pct is None:  # no board row for the pick: never switch (also no log crash)
+        return None
+    if cur_pct >= ROUTE_CAP_PCT:
+        # Live account is ~capped. Only worth escaping to one with real headroom
+        # (below the cap); if every account is capped there's nothing better, so
+        # hold — never thrash between two dead accounts (that was the flap).
+        if pick_pct >= ROUTE_CAP_PCT:
+            return None
+    elif pick_pct >= cur_pct - ROUTE_HYSTERESIS_PCT:
+        # Not capped: hold unless a MEANINGFULLY fresher account exists.
+        return None
+    # Each switch cold-starts the new account's prompt cache, so cap the rate at
+    # one per dwell regardless of how the board drifts under usage feedback.
+    if _last_switch_ts is not None and time.monotonic() - _last_switch_ts < ROUTE_MIN_DWELL_S:
+        return None
+    if apply_account(pick, blobs):
+        _last_switch_ts = time.monotonic()
+        return f"ROUTED {active} → {pick} (5h {cur_pct:.0f}% → {pick_pct:.0f}%)"
+    return None
 
 
 def route_once(threshold: float) -> str | None:
@@ -1252,34 +1344,36 @@ def route_once(threshold: float) -> str | None:
                 return f"SET {active or '?'} → {target}"
             return None
 
-        # AUTO: only act once the live account is genuinely low
-        cur = by_label.get(active) if active else None
-        if cur is None or cur["five_hour"] is None or cur["five_hour"] < threshold:
-            return None
-        pick = route_pick(rows, excluded_labels())
-        if pick is None:
-            return None
-        cur_pct = cur["five_hour"]
-        pick_pct = by_label[pick]["five_hour"]
-        if pick_pct is None:  # no board row for the pick: never switch (also no log crash)
-            return None
-        if cur_pct >= ROUTE_CAP_PCT:
-            # Live account is ~capped. Only worth escaping to one with real headroom
-            # (below the cap); if every account is capped there's nothing better, so
-            # hold — never thrash between two dead accounts (that was the flap).
-            if pick_pct >= ROUTE_CAP_PCT:
+        excludes = excluded_labels()
+
+        if mode["mode"] == "fable":
+            cur = by_label.get(active) if active else None
+            if cur is None:
+                return None  # unattributed/absent live cred — don't clobber (mirrors AUTO/SET)
+            pick = route_pick_fable(rows, excludes)  # best OTHER eligible account
+            if pick is None:
+                # No other Fable account. Stay if live is still Fable-usable; else the
+                # Fable window is spent everywhere → hand to the normal 5h router.
+                if fable_eligible(cur["five_hour"], cur["fable"]):
+                    return None
+                return _auto_switch(rows, by_label, active, blobs, threshold, excludes)
+            pick_fable = by_label[pick]["fable"]
+            # Live still usable → move only for a MEANINGFULLY fresher account (weekly
+            # fable drifts slowly, so this holds most passes). Live NOT usable → switch.
+            if (
+                fable_eligible(cur["five_hour"], cur["fable"])
+                and pick_fable >= cur["fable"] - FABLE_HYSTERESIS_PCT
+            ):
                 return None
-        elif pick_pct >= cur_pct - ROUTE_HYSTERESIS_PCT:
-            # Not capped: hold unless a MEANINGFULLY fresher account exists.
+            if _last_switch_ts is not None and time.monotonic() - _last_switch_ts < ROUTE_MIN_DWELL_S:
+                return None
+            if apply_account(pick, blobs):
+                _last_switch_ts = time.monotonic()
+                cur_f = f"{cur['fable']:.0f}%" if cur["fable"] is not None else "—"
+                return f"FABLE {active} → {pick} (fable {cur_f} → {pick_fable:.0f}%)"
             return None
-        # Each switch cold-starts the new account's prompt cache, so cap the rate at
-        # one per dwell regardless of how the board drifts under usage feedback.
-        if _last_switch_ts is not None and time.monotonic() - _last_switch_ts < ROUTE_MIN_DWELL_S:
-            return None
-        if apply_account(pick, blobs):
-            _last_switch_ts = time.monotonic()
-            return f"ROUTED {active} → {pick} (5h {cur_pct:.0f}% → {pick_pct:.0f}%)"
-    return None
+
+        return _auto_switch(rows, by_label, active, blobs, threshold, excludes)
 
 
 def cmd_route(args) -> None:
@@ -1342,19 +1436,60 @@ def cmd_auto(_args) -> None:
     print(f"  live: {active or '?'} · would pick now: {pick or '(none free)'}")
 
 
+def cmd_fable(_args) -> None:
+    """Prefer an account with Fable (premium weekly) headroom; degrade to normal
+    5h routing when none can do Fable. The daemon does the live switch."""
+    save_mode("fable", None)
+    with locked():
+        blobs = load_blobs()
+        active = capture_live_to_blobs(blobs)
+        rows = route_rows(blobs, active, time.time())
+    excludes = excluded_labels()
+    # Display-only: best eligible INCLUDING the active account (route_pick_fable excludes it).
+    usable = sorted(
+        (
+            r
+            for r in rows
+            if r["label"] not in excludes
+            and not r["expired"]
+            and fable_eligible(r["five_hour"], r["fable"])
+        ),
+        key=lambda r: (r["fable"], r["five_hour"]),
+    )
+    print("FABLE — daemon keeps you on a Fable-capable account; normal routing when none is")
+    if not usable:
+        print(
+            f"  live: {active or '?'} · no Fable headroom anywhere right now — "
+            f"routing normally (would pick {route_pick(rows, excludes) or '(none free)'})"
+        )
+    elif usable[0]["label"] == active:
+        print(f"  live: {active} · already on the best Fable account (fable {usable[0]['fable']:.0f}%)")
+    else:
+        print(
+            f"  live: {active or '?'} · will switch to {usable[0]['label']} "
+            f"(fable {usable[0]['fable']:.0f}%) within ~30s"
+        )
+
+
 def cmd_status(_args) -> None:
     mode = load_mode()
     with locked():
         blobs = load_blobs()
         active = capture_live_to_blobs(blobs)
         rows = route_rows(blobs, active, time.time())
-    tag = f"SET → {mode['label']}" if mode["mode"] == "set" else "AUTO"
+    if mode["mode"] == "set":
+        tag = f"SET → {mode['label']}"
+    elif mode["mode"] == "fable":
+        tag = "FABLE"
+    else:
+        tag = "AUTO"
     print(f"mode: {tag}   live: {active or '?'}")
     for r in rows:
         mark = "*" if r["active"] else " "
         pct = "—" if r["five_hour"] is None else f"{r['five_hour']:.0f}%"
+        fpct = "—" if r["fable"] is None else f"{r['fable']:.0f}%"
         flag = "  ⚠login" if r["expired"] else ""
-        print(f" {mark} {r['label']:<12} 5h {pct:>5}{flag}")
+        print(f" {mark} {r['label']:<12} 5h {pct:>5}  fable {fpct:>5}{flag}")
 
 
 def cmd_migrate(_args) -> None:
@@ -1538,6 +1673,9 @@ def main(argv: list[str] | None = None) -> None:
     p_set.set_defaults(fn=cmd_set)
 
     sub.add_parser("auto", help="hand routing back to the daemon").set_defaults(fn=cmd_auto)
+    sub.add_parser(
+        "fable", help="prefer a Fable-capable account; fall back to normal routing"
+    ).set_defaults(fn=cmd_fable)
     sub.add_parser("status", help="mode + per-account 5h + ⚠login flags").set_defaults(fn=cmd_status)
     sub.add_parser("migrate", help="seed ~/.ccx/blobs.json from the keychain vault").set_defaults(
         fn=cmd_migrate
