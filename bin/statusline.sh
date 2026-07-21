@@ -5,7 +5,6 @@ set -f
 input=$(cat)
 
 # Config: ~/.claude/statusline.conf (sourced as bash)
-#   HOURLY_RATE=150           # Billing rate in $/hour (enables cost tracking)
 #   DAILY_BUDGET=20           # Daily cost ceiling in $ (enables budget bar)
 #   CHALLENGE_GOAL_M=100      # Token goal in millions (enables challenge progress line)
 #   CHALLENGE_START=...       # ISO date (YYYY-MM-DD) for challenge window start
@@ -23,7 +22,6 @@ fi
 
 # ── Config ──────────────────────────────────────────────
 CONFIG_FILE="$HOME/.claude/statusline.conf"
-HOURLY_RATE=0
 DAILY_BUDGET=0
 CHALLENGE_GOAL_M=0                      # Challenge goal in millions (0 = disabled)
 CHALLENGE_LABEL="goal"
@@ -339,9 +337,9 @@ update_ledger() {
             ledger_date=$(jq -r '.date // ""' "$file" 2>/dev/null)
         else
             local info
-            info=$(jq -r --arg sid "$sid" '[.date // "", (.sessions[$sid].baseline // empty | tostring)] | join("|")' "$file" 2>/dev/null)
+            info=$(jq -r --arg sid "$sid" '[.date // "", ((.sessions[$sid] // {}) | has("baseline") | tostring)] | join("|")' "$file" 2>/dev/null)
             ledger_date="${info%%|*}"
-            has_baseline="${info#*|}"
+            has_baseline="${info#*|}"  # "true"/"false"
         fi
     fi
 
@@ -382,7 +380,7 @@ update_ledger() {
         return
     fi
 
-    if [ -z "$has_baseline" ]; then
+    if [ "$has_baseline" != "true" ]; then
         # First time seeing this session today — seed baseline from existing
         # current (if any) so delta counts from NOW forward.
         jq_update "$file" --arg sid "$sid" --argjson val "$value" --arg acct "$acct" \
@@ -1557,13 +1555,14 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
              (.value.seven_day_reset // ""),
              (.value.seven_day_pct // 0 | tostring),
              (.value.fable_reset // ""),
-             (.value.fable_pct // "" | tostring)] |
+             (.value.fable_pct // "" | tostring),
+             (.value.last_seen // 0 | tostring)] |
             join("")' "$ledger_file" 2>/dev/null)
         if [ -n "$entries" ]; then
             # Parse + compute projected epochs, find soonest
             parsed=""
             soonest_epoch=""
-            while IFS=$'\x1f' read -r em uuid iso pct seven_day_iso weekly_pct_ledger fbl_iso fable_pct_ledger; do
+            while IFS=$'\x1f' read -r em uuid iso pct seven_day_iso weekly_pct_ledger fbl_iso fable_pct_ledger last_seen_ts; do
                 [ -z "$em" ] && continue
                 ep=""
                 # pct_state: ok = use stored pct; reset = fresh window, show 0%;
@@ -1732,6 +1731,11 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
 
                 # accounts: flag a dead vaulted refresh token (needs /login to use).
                 exp_suffix=""
+                stale_suffix=""
+                if [ -n "$last_seen_ts" ] && [ "$last_seen_ts" -gt 0 ] 2>/dev/null && \
+                   [ $(( now_ar - last_seen_ts )) -gt 10800 ]; then
+                    stale_suffix=" ${dim}~ stale${reset}"
+                fi
                 if [ -n "$ACCOUNTS_EXPIRED_LOOKUP" ] && \
                    printf '%s\n' "$ACCOUNTS_EXPIRED_LOOKUP" | grep -qxF "${em}|${uuid}"; then
                     exp_suffix=" ${red}⚠ needs reauth${reset}"
@@ -1907,7 +1911,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 # Weekly-capped accounts are unusable regardless of 5h state — dim the name.
                 name_color="$white"
                 [ "$weekly_int" -ge 100 ] 2>/dev/null && name_color="$dim"
-                row_line="${marker}${name_color}$(_pad_to_cols "$display_name" 9)${reset} ${pct_color}$(_ralign "$pct_raw" 4)${reset}  ${dim}$(_ralign "$five_reset_rel" 6)${reset}   ${weekly_seg}   ${fable_seg}  ${dim}$(_ralign "$wk_reset_rel" 6)${reset}${exp_suffix}"
+                row_line="${marker}${name_color}$(_pad_to_cols "$display_name" 9)${reset} ${pct_color}$(_ralign "$pct_raw" 4)${reset}  ${dim}$(_ralign "$five_reset_rel" 6)${reset}   ${weekly_seg}   ${fable_seg}  ${dim}$(_ralign "$wk_reset_rel" 6)${reset}${exp_suffix}${stale_suffix}"
                 # Annotate with hard-wall warning when applicable. (Windfall
                 # is implicit from the hrs_col — no extra note needed.)
                 if [ "$has_wall" = "1" ]; then
@@ -2050,6 +2054,28 @@ fi
 # Write raw JSON sidecar for external consumers (menu bar app, widgets)
 [ -n "$input" ] && echo "$input" > /tmp/claude/statusline-raw.json
 
+# ── Routing-mode badge (accounts router) ─────────────────
+# mode.json is intent; the launchctl probe catches intent-without-engine
+# (mode says fable/auto but the route daemon is not loaded → nothing switches).
+ROUTE_MODE_SUFFIX=""
+_mode_file="$HOME/.accounts/mode.json"
+if [ -f "$_mode_file" ]; then
+    _rmode=$(jq -r '.mode // ""' "$_mode_file" 2>/dev/null)
+    case "$_rmode" in
+        fable) _rlabel="fable" ;;
+        auto)  _rlabel="auto" ;;
+        set)   _rlabel="pinned" ;;
+        *)     _rlabel="" ;;
+    esac
+    if [ -n "$_rlabel" ]; then
+        if launchctl list com.claude-accounts-route >/dev/null 2>&1; then
+            ROUTE_MODE_SUFFIX=" ${dim}· ${_rlabel}${reset}"
+        else
+            ROUTE_MODE_SUFFIX=" ${dim}· ${_rlabel}${reset} ${red}(off)${reset}"
+        fi
+    fi
+fi
+
 # ── Render: default (multi-line) ──────────────────────────
 render_default() {
     # Labeled identity block — one fact per row, consistent with
@@ -2058,7 +2084,7 @@ render_default() {
     [ -n "$SESSION_TIME" ] && \
         printf "${white}%-7s${reset} %b\n" "time"    "${dim}⏱${reset} ${white}${SESSION_TIME}${reset}${IDLE_DISPLAY}"
     [ -n "$ACCT_EMAIL" ] && \
-        printf "${white}%-7s${reset} %b\n" "account" "${ACCOUNT_LABEL}"
+        printf "${white}%-7s${reset} %b\n" "account" "${ACCOUNT_LABEL}${ROUTE_MODE_SUFFIX}"
     REPO_LABEL="${cyan}${DIR_NAME}${reset}"
     if [ -n "$BRANCH" ]; then
         if $IN_WORKTREE; then

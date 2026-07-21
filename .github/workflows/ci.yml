@@ -58,6 +58,8 @@ jobs:
           [ -f ~/.claude/statusline.sh ] || { echo "FAIL: script not installed"; exit 1; }
           jq -e '.statusLine' ~/.claude/settings.json || { echo "FAIL: settings not patched"; exit 1; }
           echo "PASS: install script works"
+      - name: Test ledger functions
+        run: bash test/test_ledger.sh
       - name: Test Codex monitor
         run: python3 test/test_codex_statusline.py
       - name: Set up Python 3.9
