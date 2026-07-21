@@ -8,12 +8,14 @@ on:
       - 'npm/**'
       - 'config/**'
       - 'install.sh'
+  workflow_dispatch:
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write   # commit the version bump
+      id-token: write   # OIDC trusted publishing — no NPM_TOKEN needed
     steps:
       - uses: actions/checkout@v4
         with:
@@ -23,6 +25,9 @@ jobs:
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
+
+      - name: Upgrade npm (OIDC trusted publishing needs >= 11.5.1)
+        run: npm install -g npm@latest
 
       - name: Bump patch version
         working-directory: npm
@@ -40,11 +45,9 @@ jobs:
           cp ../bin/statusline.sh assets/
           cp ../config/statusline.conf.example assets/
 
-      - name: Publish to npm
+      - name: Publish to npm (OIDC trusted publishing)
         working-directory: npm
         run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Commit version bump
         run: |
