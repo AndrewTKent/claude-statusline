@@ -43,7 +43,6 @@ function install() {
 
   console.log('\nDone! Restart Claude Code to see the status line.');
   console.log('\nConfigure: edit ~/.claude/statusline.conf');
-  console.log('  HOURLY_RATE=150    # cost tracking');
   console.log('  DAILY_BUDGET=20    # budget bar');
   console.log('  FORMAT=sigil       # compact mode');
 }
