@@ -63,7 +63,7 @@ if [ "$PURGE_FLAG" = "--purge" ]; then
     rm -f "$INSTALL_DIR/focus"
     info "Removed state files"
 
-    for agent in "com.claude-scan-tokens-watch" "com.claude-scan-tokens" "com.claude-ccx-route"; do
+    for agent in "com.claude-scan-tokens-watch" "com.claude-scan-tokens" "com.claude-accounts-route"; do
         if launchctl list "$agent" >/dev/null 2>&1; then
             launchctl unload "$HOME/Library/LaunchAgents/${agent}.plist" 2>/dev/null || true
             rm -f "$HOME/Library/LaunchAgents/${agent}.plist"
@@ -84,7 +84,7 @@ else
     printf "  ~/.claude/focus\n"
     printf "  ~/Library/LaunchAgents/com.claude-scan-tokens-watch.plist\n"
     printf "  ~/Library/LaunchAgents/com.claude-scan-tokens.plist\n"
-    printf "  ~/Library/LaunchAgents/com.claude-ccx-route.plist\n"
+    printf "  ~/Library/LaunchAgents/com.claude-accounts-route.plist\n"
     if [ -f "$0" ]; then
         purge_hint="$0 --purge"
     else

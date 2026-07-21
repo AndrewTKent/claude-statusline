@@ -29,7 +29,7 @@ Four tools, one repo, shared data files:
 
 - **Claude Code statusline** (`bin/statusline.sh`) — the multi-line dashboard below
 - **Codex statusline** (`bin/codex-statusline`, `codex-top`) — the same idea for the Codex CLI
-- **`accounts`** (`bin/ccx.py`) — multi-account router: headroom board, auto-switching, pin-follows-login
+- **`accounts`** (`bin/accounts.py`) — multi-account router: headroom board, auto-switching, pin-follows-login
 - **Token scanning & redaction** (`bin/scan-tokens*`) — attribute every token, redact before sharing
 
 ```
@@ -276,10 +276,10 @@ Create `~/.claude/statusline.conf` (bash, sourced directly). Full annotated vers
 
 ## Accounts: Multi-Account Routing
 
-`accounts` (`bin/ccx.py`; `ccx` still works as the legacy alias) is a router +
+`accounts` (`bin/accounts.py`) is a router +
 headroom board for accounts logged in via `/login`. Onboarding is automatic: log
-into an account, then run a routing command (`route`, `set`, `auto`, `status`) —
-it folds the live credential into `~/.ccx/blobs.json` on its own. No separate
+into an account, then run a routing command (`route`, `set`, `auto`, `fable`, `status`) —
+it folds the live credential into `~/.accounts/blobs.json` on its own. No separate
 enrollment step.
 
 | Command | What it does |
@@ -287,6 +287,7 @@ enrollment step.
 | `accounts route` | Router daemon: polls all accounts, auto-switches the live one when it runs low (`--interval`, `--at`, `--once`) |
 | `accounts set <label>` | Pin the live account to `<label>` (manual mode) |
 | `accounts auto` | Hand routing back to the daemon |
+| `accounts fable` | Prefer a Fable-capable account; fall back to normal 5h routing when none can |
 | `accounts status` | Mode + per-account 5h headroom + ⚠login flags |
 | `accounts poll` | Refresh the usage board for all stored accounts now |
 | `accounts refresh [label]` | Re-auth stale blobs via their own refresh token, no browser (default: every stale-but-refreshable account) |
@@ -298,7 +299,7 @@ enrollment step.
 A fresh `/login` always wins: the daemon adopts the account you just logged into
 instead of switching away from it.
 
-Routing never adds to or modifies the Keychain's live `Claude Code-credentials` slot — every switch is a plain file write to `~/.claude/.credentials.json`, followed by a delete of the keychain slot so Claude Code's own ~30s re-read lands on the file. Minted long-lived tokens live outside `~/.claude` (`~/.ccx/vault.json`), since the nightly transcript-archival chain mirrors `~/.claude` in plaintext.
+Routing never adds to or modifies the Keychain's live `Claude Code-credentials` slot — every switch is a plain file write to `~/.claude/.credentials.json`, followed by a delete of the keychain slot so Claude Code's own ~30s re-read lands on the file. Minted long-lived tokens live outside `~/.claude` (`~/.accounts/vault.json`), since the nightly transcript-archival chain mirrors `~/.claude` in plaintext.
 
 ---
 

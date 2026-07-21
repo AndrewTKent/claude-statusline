@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""ccx — Claude Code multi-account router and headroom board.
+"""accounts — Claude Code multi-account router and headroom board.
 
 cc's credential store (decompiled 2.1.214) is 'keychain-with-plaintext-fallback',
 re-read on a ~30s TTL: the Keychain item "Claude Code-credentials" wins whenever
 it exists; ~/.claude/.credentials.json is read only when it doesn't. On refresh,
-cc recreates the keychain slot itself and deletes the file. ccx therefore stores
-every account's full OAuth blob in ~/.ccx/blobs.json and switches by writing the
+cc recreates the keychain slot itself and deletes the file. accounts therefore stores
+every account's full OAuth blob in ~/.accounts/blobs.json and switches by writing the
 FILE then DELETING the keychain slot — cc's next ~30s re-read lands on the file,
 mid-session. Accounts are ranked by remaining rate-limit headroom (reset-aware).
 
-ccx NEVER adds or modifies the Keychain live slot. macOS pins the slot's
+accounts NEVER adds or modifies the Keychain live slot. macOS pins the slot's
 partition list to whoever writes it, so a programmatic Keychain write makes
 every reader storm password prompts (2026-07-17 incident). Deleting the slot
 re-pins nothing — cc recreates it itself — and is cc's own logout primitive.
@@ -47,12 +47,12 @@ HOME = Path.home()
 LIVE_SERVICE = "Claude Code-credentials"
 VAULT_SERVICE = "Claude Code-cred-vault"
 SELFTEST_SERVICE = "Claude Code-cred-vault-selftest"
-META_PATH = HOME / ".claude" / "ccx-vault.json"
-LOCK_PATH = HOME / ".claude" / "ccx.lock"
+META_PATH = HOME / ".claude" / "accounts-vault.json"
+LOCK_PATH = HOME / ".claude" / "accounts.lock"
 RESETS_PATH = HOME / ".claude" / "account-resets.json"
 CLAUDE_JSON = HOME / ".claude.json"
 CONF_PATH = HOME / ".claude" / "statusline.conf"
-MIRROR_LOG = HOME / ".claude" / "ccx-mirror.log"
+MIRROR_LOG = HOME / ".claude" / "accounts-mirror.log"
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
@@ -60,11 +60,11 @@ OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"  # public Claude Code O
 STALE_AFTER_S = 3 * 3600
 
 
-class CcxError(RuntimeError):
+class AccountsError(RuntimeError):
     pass
 
 
-class TokenRefreshError(CcxError):
+class TokenRefreshError(AccountsError):
     """Non-200 from the OAuth token endpoint. `.code` is the HTTP status string
     ("429" = the edge in front of the endpoint is throttling this client)."""
 
@@ -74,7 +74,7 @@ class TokenRefreshError(CcxError):
 
 
 def die(msg: str) -> None:
-    print(f"ccx: {msg}", file=sys.stderr)
+    print(f"accounts: {msg}", file=sys.stderr)
     sys.exit(1)
 
 
@@ -123,7 +123,7 @@ def kc_slot_status(service: str) -> str:
 
 
 def kc_vault_put(account: str, secret: str, service: str = VAULT_SERVICE) -> None:
-    """Write a vault item with an allow-all ACL (`-A`) so ccx reads it back
+    """Write a vault item with an allow-all ACL (`-A`) so accounts reads it back
     without a keychain prompt — matching the live "Claude Code-credentials"
     item's posture (a local attacker reads the live token anyway, so gating
     the copy stricter than the original only adds friction).
@@ -145,7 +145,7 @@ def kc_vault_put(account: str, secret: str, service: str = VAULT_SERVICE) -> Non
         text=True,
     )
     if r.returncode != 0:
-        raise CcxError(f"vault write failed: {r.stderr.strip()[:200]}")
+        raise AccountsError(f"vault write failed: {r.stderr.strip()[:200]}")
 
 
 
@@ -475,7 +475,7 @@ def resolve_label(email: str | None, org_uuid: str | None, pairs) -> str:
 
 
 def excluded_labels() -> set[str]:
-    raw = os.environ.get("CCX_EXCLUDE") or _conf_var("CCX_EXCLUDE")
+    raw = os.environ.get("ACCOUNTS_EXCLUDE") or _conf_var("ACCOUNTS_EXCLUDE")
     return set(raw.split())
 
 
@@ -539,7 +539,7 @@ def resets_row(resets: dict, email: str | None, org_uuid: str | None) -> dict:
 # ── core ops ──────────────────────────────────────────────────────────────
 
 
-_lock_depth = 0  # ccx is single-threaded; nested locked() must not re-flock
+_lock_depth = 0  # accounts is single-threaded; nested locked() must not re-flock
 
 
 @contextmanager
@@ -582,7 +582,7 @@ def snapshot_live(meta: dict, *, force: bool = False) -> tuple[str, dict] | None
     """Park the live slot's cred into the vault. Returns (uuid, entry) or None if unchanged."""
     blob = kc_read(LIVE_SERVICE)
     if blob is None:
-        raise CcxError(f'no live credential in keychain slot "{LIVE_SERVICE}"')
+        raise AccountsError(f'no live credential in keychain slot "{LIVE_SERVICE}"')
     blob_sha = sha256(blob)
     if not force and meta.get("last_live_sha") == blob_sha:
         return None
@@ -591,18 +591,18 @@ def snapshot_live(meta: dict, *, force: bool = False) -> tuple[str, dict] | None
     # actually in the slot. ~/.claude.json can lag it and would mis-file the blob.
     token = blob_access_token(blob)
     if not token:
-        raise CcxError("live credential blob has no access token; not vaulting")
+        raise AccountsError("live credential blob has no access token; not vaulting")
     profile = fetch_profile(token)
     if not profile:
-        raise CcxError("profile fetch failed; cannot attribute live credential (will retry)")
+        raise AccountsError("profile fetch failed; cannot attribute live credential (will retry)")
     ident = identity_from_profile(profile)
     key = vault_key(ident)
     if key is None:
-        raise CcxError("profile response missing account/org uuid; not vaulting")
+        raise AccountsError("profile response missing account/org uuid; not vaulting")
 
     kc_vault_put(key, blob)
     if kc_read(VAULT_SERVICE, key) != blob:
-        raise CcxError("vault write verification failed (read-back mismatch)")
+        raise AccountsError("vault write verification failed (read-back mismatch)")
 
     entry = meta["accounts"].get(key, {})
     oa = read_claude_json().get("oauthAccount") or {}
@@ -639,7 +639,7 @@ def resolve_target(meta: dict, needle: str, pairs) -> tuple[str, dict]:
         die(
             f"'{needle}' is not in the vault. Vaulted: "
             + (", ".join(sorted(vault_labels(meta, pairs))) or "(none)")
-            + ". Run `ccx enroll` while it is active and it will be captured."
+            + ". Run `accounts enroll` while it is active and it will be captured."
         )
     if len(matches) > 1:
         labels = ", ".join(
@@ -690,7 +690,7 @@ def cmd_enroll(_args) -> None:
 
 def merge_reset_rows(rows: dict[str, dict]) -> None:
     """Write freshly-polled rows into account-resets.json, preserving every row
-    we didn't poll. Re-reads under the ccx lock (serializes ccx writers only —
+    we didn't poll. Re-reads under the accounts lock (serializes accounts writers only —
     the statusline writes this file without the lock). Atomic rename."""
     if not rows:
         return
@@ -698,7 +698,7 @@ def merge_reset_rows(rows: dict[str, dict]) -> None:
         current = load_resets()
         current.update(rows)
         RESETS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp = RESETS_PATH.with_suffix(".ccx-tmp")
+        tmp = RESETS_PATH.with_suffix(".accounts-tmp")
         tmp.write_text(json.dumps(current, indent=1) + "\n")
         os.replace(tmp, RESETS_PATH)
 
@@ -720,7 +720,7 @@ def cmd_refresh(args) -> None:
     accounts = load_blobs().get("accounts") or {}
     if args.label:
         if args.label not in accounts:
-            raise CcxError(f"no stored blob for '{args.label}'")
+            raise AccountsError(f"no stored blob for '{args.label}'")
         targets = [args.label]
     else:
         targets = []
@@ -767,7 +767,7 @@ def cmd_refresh(args) -> None:
 # CLAUDE_CODE_OAUTH_TOKEN into the child env, which outranks keychain auth;
 # the live keychain slot stays 100% Claude-Code-owned.
 
-TOKEN_VAULT_PATH = HOME / ".ccx" / "vault.json"
+TOKEN_VAULT_PATH = HOME / ".accounts" / "vault.json"
 TOKEN_LIFETIME_S = 364 * 24 * 3600
 TOKEN_RE = re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}")
 
@@ -775,15 +775,15 @@ TOKEN_RE = re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}")
 # it is a plain FILE write — no keychain, no ACL/partition, so it can never
 # storm. We write the account's static setup-token blob; cc adopts that account.
 # The system, plainly: full OAuth blobs for every account live in a 0600 FILE
-# (~/.ccx/blobs.json). The daemon polls each blob's usage, and when the active
+# (~/.accounts/blobs.json). The daemon polls each blob's usage, and when the active
 # account runs low it OVERWRITES the single file cc reads (~/.claude/
 # .credentials.json) with the best account's blob — cc re-reads it and switches.
 # Every write is a plain file write: no keychain, no ACL/partition, cannot storm.
 # Full blobs (not setup-tokens) because only they carry the refresh token cc
 # needs and the scope the usage endpoint needs.
 CRED_FILE = HOME / ".claude" / ".credentials.json"
-MODE_PATH = HOME / ".ccx" / "mode.json"
-BLOBS_PATH = HOME / ".ccx" / "blobs.json"
+MODE_PATH = HOME / ".accounts" / "mode.json"
+BLOBS_PATH = HOME / ".accounts" / "blobs.json"
 
 
 def load_mode() -> dict:
@@ -805,7 +805,7 @@ def save_mode(mode: str, label: str | None) -> None:
 
 def _write_0600(path: Path, text: str) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    tmp = path.with_suffix(".ccx-tmp")
+    tmp = path.with_suffix(".accounts-tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         f.write(text)
@@ -838,7 +838,7 @@ def load_blobs() -> dict:
     except OSError as exc:
         # Present but unreadable (perms, I/O): treating it as empty would let the
         # next capture overwrite the store with one account. Refuse instead.
-        raise CcxError(f"{BLOBS_PATH} unreadable ({exc}) — refusing to treat as empty") from exc
+        raise AccountsError(f"{BLOBS_PATH} unreadable ({exc}) — refusing to treat as empty") from exc
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
@@ -1062,7 +1062,7 @@ def pick_route(rows: list[dict], vault: dict, excludes: set[str], now_ts: float,
 
 
 HOUND_HOSTS = ("hound", "hound-ts")
-HOUND_VAULT = "~/.ccx/vault.json"
+HOUND_VAULT = "~/.accounts/vault.json"
 
 
 def hound_host(timeout: int = 3) -> str | None:
@@ -1095,7 +1095,7 @@ def sync_with_hound(quiet: bool = False) -> bool:
     host = hound_host()
     if host is None:
         if not quiet:
-            print("hound unreachable — vault stays local-only (run `ccx sync` later)")
+            print("hound unreachable — vault stays local-only (run `accounts sync` later)")
         return False
     r = subprocess.run(
         ["ssh", "-o", "BatchMode=yes", host, f"cat {HOUND_VAULT} 2>/dev/null || true"],
@@ -1114,7 +1114,7 @@ def sync_with_hound(quiet: bool = False) -> bool:
             "-o",
             "BatchMode=yes",
             host,
-            f"mkdir -p ~/.ccx && chmod 700 ~/.ccx && cat > {HOUND_VAULT} && chmod 600 {HOUND_VAULT}",
+            f"mkdir -p ~/.accounts && chmod 700 ~/.accounts && cat > {HOUND_VAULT} && chmod 600 {HOUND_VAULT}",
         ],
         input=json.dumps(merged, indent=2, sort_keys=True) + "\n",
         capture_output=True,
@@ -1130,7 +1130,7 @@ def sync_with_hound(quiet: bool = False) -> bool:
 
 
 def cmd_sync(_args) -> None:
-    """Converge ~/.ccx/vault.json between this machine and hound."""
+    """Converge ~/.accounts/vault.json between this machine and hound."""
     sync_with_hound()
 
 
@@ -1160,7 +1160,7 @@ def cmd_tokens(_args) -> None:
     vault = load_token_vault()
     tokens = vault.get("tokens") or {}
     if not tokens:
-        print("no minted tokens — run `ccx mint <label>` per account you want routable")
+        print("no minted tokens — run `accounts mint <label>` per account you want routable")
         return
     now = time.time()
     for label in sorted(tokens):
@@ -1199,7 +1199,7 @@ def cmd_pick_env(_args) -> None:
             load_token_vault(),
             excluded_labels(),
             time.time(),
-            os.environ.get("CCX_ACCOUNT") or None,
+            os.environ.get("ACCOUNTS_PIN") or None,
         )
     except Exception:
         return
@@ -1207,7 +1207,7 @@ def cmd_pick_env(_args) -> None:
         return
     label, token = pick
     print(f"export CLAUDE_CODE_OAUTH_TOKEN='{token}'")
-    print(f"export CCX_ROUTED_LABEL='{label}'")
+    print(f"export ACCOUNTS_ROUTED_LABEL='{label}'")
 
 
 ROUTE_AT_DEFAULT = 80.0  # switch when the active account's 5h usage crosses this
@@ -1222,7 +1222,7 @@ FABLE_HYSTERESIS_PCT = 10.0  # fable mode: only chase a meaningfully fresher acc
 _last_switch_ts: float | None = None
 
 
-def notify(text: str, title: str = "ccx") -> None:
+def notify(text: str, title: str = "accounts") -> None:
     safe = text.replace('"', "'")
     subprocess.run(
         ["osascript", "-e", f'display notification "{safe}" with title "{title}"'],
@@ -1382,7 +1382,7 @@ def cmd_route(args) -> None:
     .json to the freshest account when the current one runs low, or (SET) hold
     the pinned account. All file writes — cannot storm."""
     log_line(
-        f"ccx route started (interval {args.interval}s; switch at ≥{args.at:.0f}% 5h; "
+        f"accounts route started (interval {args.interval}s; switch at ≥{args.at:.0f}% 5h; "
         f"mode={load_mode()['mode']})"
     )
     while True:
@@ -1390,8 +1390,8 @@ def cmd_route(args) -> None:
             line = route_once(args.at)
             if line:
                 log_line(line)
-                notify(line.split(" (")[0], "ccx")
-        except CcxError as exc:
+                notify(line.split(" (")[0], "accounts")
+        except AccountsError as exc:
             log_line(f"warn: {exc}")
         except Exception as exc:  # daemon must survive anything
             log_line(f"error: {type(exc).__name__}: {exc}")
@@ -1406,7 +1406,7 @@ def cmd_set(args) -> None:
         blobs = load_blobs()
         e = (blobs.get("accounts") or {}).get(args.label)
         if not e:
-            die(f"'{args.label}' has no stored blob — run `ccx migrate` or mint/login it first")
+            die(f"'{args.label}' has no stored blob — run `accounts migrate` or mint/login it first")
         if blob_expired(e.get("blob", ""), time.time()):
             die(f"'{args.label}' refresh token is expired — /login it first (won't write a dead cred)")
         active = capture_live_to_blobs(blobs)  # fold any unsaved rotation of the outgoing account
@@ -1543,7 +1543,7 @@ def cmd_ls(_args) -> None:
     meta = load_meta()
     rows = _account_rows(meta)
     if not rows:
-        print("vault is empty — run `ccx enroll` on each account once")
+        print("vault is empty — run `accounts enroll` on each account once")
         return
     excludes = excluded_labels()
     print(f"{'':2}{'label':<12} {'email':<32} {'5h':>6} {'7d':>6} {'fable':>6}")
@@ -1597,7 +1597,7 @@ def _org_hint(entry: dict) -> str:
 
 
 def cmd_switch(args) -> None:
-    """Advisory only — ccx never writes the live keychain slot. macOS pins the
+    """Advisory only — accounts never writes the live keychain slot. macOS pins the
     slot's partition list to whoever writes it, so a programmatic swap makes
     every reader (Claude Code, statusline) storm password prompts (2026-07-17
     incident). Switching goes through Claude Code's own /login; this command
@@ -1623,7 +1623,7 @@ def cmd_switch(args) -> None:
     print(f"to land on {label}:")
     print("  1. in Claude Code, run /login")
     print(f"  2. sign in as {entry.get('email')} and pick {_org_hint(entry)}")
-    print("(ccx does not switch accounts itself: writing the live keychain slot")
+    print("(accounts does not switch accounts itself: writing the live keychain slot")
     print(" poisons its ACL and storms password prompts — 2026-07-17 incident)")
 
 
@@ -1657,7 +1657,7 @@ def cmd_selftest(_args) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(prog="ccx", description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(prog="accounts", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("enroll", help="vault the active account now").set_defaults(fn=cmd_enroll)
@@ -1677,7 +1677,7 @@ def main(argv: list[str] | None = None) -> None:
         "fable", help="prefer a Fable-capable account; fall back to normal routing"
     ).set_defaults(fn=cmd_fable)
     sub.add_parser("status", help="mode + per-account 5h + ⚠login flags").set_defaults(fn=cmd_status)
-    sub.add_parser("migrate", help="seed ~/.ccx/blobs.json from the keychain vault").set_defaults(
+    sub.add_parser("migrate", help="seed ~/.accounts/blobs.json from the keychain vault").set_defaults(
         fn=cmd_migrate
     )
 
@@ -1720,7 +1720,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     try:
         args.fn(args)
-    except CcxError as exc:
+    except AccountsError as exc:
         die(str(exc))
 
 

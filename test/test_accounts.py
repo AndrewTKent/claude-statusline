@@ -1,4 +1,4 @@
-"""Unit tests for bin/ccx.py — pure logic only (no keychain, no network)."""
+"""Unit tests for bin/accounts.py — pure logic only (no keychain, no network)."""
 
 import json
 import sys
@@ -12,7 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bin"))
 
-import ccx  # noqa: E402
+import accounts  # noqa: E402
 
 NOW = datetime(2026, 7, 16, 20, 0, 0, tzinfo=timezone.utc)
 
@@ -26,22 +26,22 @@ PAIRS = [
 
 class TestResolveLabel:
     def test_uuid_qualified_beats_bare(self):
-        assert ccx.resolve_label("andrew.kent@coram.ai", "52ae", PAIRS) == "coram-work"
+        assert accounts.resolve_label("andrew.kent@coram.ai", "52ae", PAIRS) == "coram-work"
 
     def test_uuid_qualified_exact(self):
-        assert ccx.resolve_label("andrew.kent@coram.ai", "e1c8", PAIRS) == "coram-max"
+        assert accounts.resolve_label("andrew.kent@coram.ai", "e1c8", PAIRS) == "coram-max"
 
     def test_bare_fallback_when_uuid_unknown(self):
-        assert ccx.resolve_label("andrew.kent@coram.ai", "zzzz", PAIRS) == "work"
+        assert accounts.resolve_label("andrew.kent@coram.ai", "zzzz", PAIRS) == "work"
 
     def test_bare_glob(self):
-        assert ccx.resolve_label("other@coram.ai", None, PAIRS) == "work"
+        assert accounts.resolve_label("other@coram.ai", None, PAIRS) == "work"
 
     def test_no_match_falls_back_to_localpart(self):
-        assert ccx.resolve_label("x@nowhere.io", None, PAIRS) == "x"
+        assert accounts.resolve_label("x@nowhere.io", None, PAIRS) == "x"
 
     def test_no_email(self):
-        assert ccx.resolve_label(None, None, PAIRS) == "?"
+        assert accounts.resolve_label(None, None, PAIRS) == "?"
 
 
 class TestEffectivePcts:
@@ -53,21 +53,21 @@ class TestEffectivePcts:
             "five_hour_reset": (NOW - timedelta(minutes=1)).isoformat(),
             "last_seen": NOW.timestamp(),
         }
-        assert ccx.effective_pcts(row, NOW)["five_hour"] == 0.0
+        assert accounts.effective_pcts(row, NOW)["five_hour"] == 0.0
 
     def test_future_reset_keeps_pct(self):
         row = {
             "five_hour_pct": 55.0,
             "five_hour_reset": (NOW + timedelta(hours=2)).isoformat(),
         }
-        assert ccx.effective_pcts(row, NOW)["five_hour"] == 55.0
+        assert accounts.effective_pcts(row, NOW)["five_hour"] == 55.0
 
     def test_missing_pct_is_none(self):
-        assert ccx.effective_pcts({}, NOW)["five_hour"] is None
+        assert accounts.effective_pcts({}, NOW)["five_hour"] is None
 
     def test_missing_reset_keeps_pct(self):
         row = {"seven_day_pct": 31.0}
-        assert ccx.effective_pcts(row, NOW)["seven_day"] == 31.0
+        assert accounts.effective_pcts(row, NOW)["seven_day"] == 31.0
 
 
     def test_stale_passed_reset_does_not_show_false_headroom(self):
@@ -83,7 +83,7 @@ class TestEffectivePcts:
             "fable_reset": reset_past.isoformat(),
             "last_seen": polled_before_reset,
         }
-        assert ccx.effective_pcts(row, now)["fable"] == 100.0
+        assert accounts.effective_pcts(row, now)["fable"] == 100.0
 
     def test_confirmed_reset_shows_empty(self):
         # Polled AFTER the reset (last_seen newer) → the window really rolled
@@ -96,7 +96,7 @@ class TestEffectivePcts:
             "fable_reset": reset_past.isoformat(),
             "last_seen": polled_after_reset,
         }
-        assert ccx.effective_pcts(row, now)["fable"] == 0.0
+        assert accounts.effective_pcts(row, now)["fable"] == 0.0
 
 
 class TestHeadroomRank:
@@ -104,33 +104,33 @@ class TestHeadroomRank:
         a = {"five_hour": 10.0, "seven_day": 90.0, "fable": None}
         b = {"five_hour": 10.0, "seven_day": 5.0, "fable": None}
         c = {"five_hour": 0.0, "seven_day": 99.0, "fable": None}
-        ranked = sorted([a, b, c], key=ccx.headroom_rank)
+        ranked = sorted([a, b, c], key=accounts.headroom_rank)
         assert ranked == [c, b, a]
 
     def test_unknown_ranks_last(self):
         known = {"five_hour": 99.0, "seven_day": 99.0, "fable": 99.0}
         unknown = {"five_hour": None, "seven_day": None, "fable": None}
-        assert sorted([unknown, known], key=ccx.headroom_rank) == [known, unknown]
+        assert sorted([unknown, known], key=accounts.headroom_rank) == [known, unknown]
 
 
 class TestBlobAccessToken:
     def test_nested(self):
         blob = json.dumps({"claudeAiOauth": {"accessToken": "tok-1"}})
-        assert ccx.blob_access_token(blob) == "tok-1"
+        assert accounts.blob_access_token(blob) == "tok-1"
 
     def test_flat(self):
-        assert ccx.blob_access_token(json.dumps({"accessToken": "tok-2"})) == "tok-2"
+        assert accounts.blob_access_token(json.dumps({"accessToken": "tok-2"})) == "tok-2"
 
     def test_invalid(self):
-        assert ccx.blob_access_token("not json") is None
-        assert ccx.blob_access_token(json.dumps(["nope"])) is None
+        assert accounts.blob_access_token("not json") is None
+        assert accounts.blob_access_token(json.dumps(["nope"])) is None
 
 
 class TestSynthesizeOauthAccount:
     def test_identifiers_land(self):
         ident = {"uuid": "u1", "email": "e@x.y", "org_uuid": "o1", "org_type": "claude_max",
                  "rate_limit_tier": "default_claude_max_20x"}
-        oa = ccx.synthesize_oauth_account(ident, None)
+        oa = accounts.synthesize_oauth_account(ident, None)
         assert oa["accountUuid"] == "u1"
         assert oa["emailAddress"] == "e@x.y"
         assert oa["organizationUuid"] == "o1"
@@ -140,23 +140,23 @@ class TestSynthesizeOauthAccount:
 class TestCredExpiry:
     def test_blob_refresh_expiry_ms_to_seconds(self):
         blob = json.dumps({"claudeAiOauth": {"refreshTokenExpiresAt": 1784337371728}})
-        assert ccx.blob_refresh_expiry(blob) == 1784337371  # ms floored to s
+        assert accounts.blob_refresh_expiry(blob) == 1784337371  # ms floored to s
 
     def test_blob_refresh_expiry_missing(self):
-        assert ccx.blob_refresh_expiry(json.dumps({"claudeAiOauth": {}})) is None
-        assert ccx.blob_refresh_expiry("not json") is None
+        assert accounts.blob_refresh_expiry(json.dumps({"claudeAiOauth": {}})) is None
+        assert accounts.blob_refresh_expiry("not json") is None
 
     def test_blob_refresh_expiry_flat(self):
-        assert ccx.blob_refresh_expiry(json.dumps({"refreshTokenExpiresAt": 2000000000000})) == 2000000000
+        assert accounts.blob_refresh_expiry(json.dumps({"refreshTokenExpiresAt": 2000000000000})) == 2000000000
 
     def test_cred_expired_past(self):
-        assert ccx.cred_expired(1) is True  # epoch 1 is long past
+        assert accounts.cred_expired(1) is True  # epoch 1 is long past
 
     def test_cred_expired_future(self):
-        assert ccx.cred_expired(4000000000) is False  # year 2096
+        assert accounts.cred_expired(4000000000) is False  # year 2096
 
     def test_cred_expired_none_is_not_expired(self):
-        assert ccx.cred_expired(None) is False
+        assert accounts.cred_expired(None) is False
 
 
 def _route_row(label, eff5, active=False, expired=False, fable=0.0):
@@ -179,53 +179,53 @@ class TestPickRoute:
     def test_best_with_token_wins(self):
         rows = [_route_row("alumni", 5.0), _route_row("gmail", 20.0), _route_row("ymail", 1.0)]
         # alumni has no token, ymail's token is expired -> gmail
-        assert ccx.pick_route(rows, self.VAULT, set(), self.NOW, None) == ("gmail", "sk-ant-gmail-tok")
+        assert accounts.pick_route(rows, self.VAULT, set(), self.NOW, None) == ("gmail", "sk-ant-gmail-tok")
 
     def test_pin_overrides_headroom(self):
         rows = [_route_row("alumni", 5.0), _route_row("gmail", 90.0)]
-        assert ccx.pick_route(rows, self.VAULT, set(), self.NOW, "gmail")[0] == "gmail"
+        assert accounts.pick_route(rows, self.VAULT, set(), self.NOW, "gmail")[0] == "gmail"
 
     def test_excluded_skipped(self):
         rows = [_route_row("gmail", 5.0)]
-        assert ccx.pick_route(rows, self.VAULT, {"gmail"}, self.NOW, None) is None
+        assert accounts.pick_route(rows, self.VAULT, {"gmail"}, self.NOW, None) is None
 
     def test_expired_cred_row_skipped(self):
         rows = [_route_row("gmail", 5.0, expired=True)]
-        assert ccx.pick_route(rows, self.VAULT, set(), self.NOW, None) is None
+        assert accounts.pick_route(rows, self.VAULT, set(), self.NOW, None) is None
 
     def test_no_tokens_none(self):
         rows = [_route_row("alumni", 5.0)]
-        assert ccx.pick_route(rows, self.VAULT, set(), self.NOW, None) is None
+        assert accounts.pick_route(rows, self.VAULT, set(), self.NOW, None) is None
 
 
 class TestMergeTokenVaults:
     def test_union(self):
         a = {"tokens": {"gmail": {"token": "g", "minted_at": 1}}}
         b = {"tokens": {"ymail": {"token": "y", "minted_at": 2}}}
-        assert set(ccx.merge_token_vaults(a, b)["tokens"]) == {"gmail", "ymail"}
+        assert set(accounts.merge_token_vaults(a, b)["tokens"]) == {"gmail", "ymail"}
 
     def test_newer_mint_wins(self):
         a = {"tokens": {"gmail": {"token": "old", "minted_at": 1}}}
         b = {"tokens": {"gmail": {"token": "new", "minted_at": 9}}}
-        assert ccx.merge_token_vaults(a, b)["tokens"]["gmail"]["token"] == "new"
-        assert ccx.merge_token_vaults(b, a)["tokens"]["gmail"]["token"] == "new"
+        assert accounts.merge_token_vaults(a, b)["tokens"]["gmail"]["token"] == "new"
+        assert accounts.merge_token_vaults(b, a)["tokens"]["gmail"]["token"] == "new"
 
     def test_empty_sides(self):
-        assert ccx.merge_token_vaults({}, {})["tokens"] == {}
+        assert accounts.merge_token_vaults({}, {})["tokens"] == {}
 
 
 class TestTokenVault:
     def test_round_trip_and_perms(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(ccx, "TOKEN_VAULT_PATH", tmp_path / "sub" / "vault.json")
+        monkeypatch.setattr(accounts, "TOKEN_VAULT_PATH", tmp_path / "sub" / "vault.json")
         vault = {"version": 1, "tokens": {"x": {"token": "sk-ant-t", "expires_at": 2}}}
-        ccx.save_token_vault(vault)
-        assert ccx.load_token_vault() == vault
-        assert (ccx.TOKEN_VAULT_PATH.stat().st_mode & 0o777) == 0o600
-        assert (ccx.TOKEN_VAULT_PATH.parent.stat().st_mode & 0o777) == 0o700
+        accounts.save_token_vault(vault)
+        assert accounts.load_token_vault() == vault
+        assert (accounts.TOKEN_VAULT_PATH.stat().st_mode & 0o777) == 0o600
+        assert (accounts.TOKEN_VAULT_PATH.parent.stat().st_mode & 0o777) == 0o700
 
     def test_missing_file_empty(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(ccx, "TOKEN_VAULT_PATH", tmp_path / "none.json")
-        assert ccx.load_token_vault() == {"version": 1, "tokens": {}}
+        monkeypatch.setattr(accounts, "TOKEN_VAULT_PATH", tmp_path / "none.json")
+        assert accounts.load_token_vault() == {"version": 1, "tokens": {}}
 
 
 class TestRouterCore:
@@ -236,35 +236,35 @@ class TestRouterCore:
                                              "refreshTokenExpiresAt": rt_exp_ms}})
 
     def test_blob_expired_by_refresh_expiry(self):
-        assert ccx.blob_expired(self._blob("a", 1_000_000_000_000), self.NOW) is True   # 2001, past
-        assert ccx.blob_expired(self._blob("a", 3_000_000_000_000), self.NOW) is False  # 2065, future
-        assert ccx.blob_expired('{"claudeAiOauth":{}}', self.NOW) is True    # no refresh token at all
-        assert ccx.blob_expired("", self.NOW) is True                        # unparseable
+        assert accounts.blob_expired(self._blob("a", 1_000_000_000_000), self.NOW) is True   # 2001, past
+        assert accounts.blob_expired(self._blob("a", 3_000_000_000_000), self.NOW) is False  # 2065, future
+        assert accounts.blob_expired('{"claudeAiOauth":{}}', self.NOW) is True    # no refresh token at all
+        assert accounts.blob_expired("", self.NOW) is True                        # unparseable
         # regression: cc's rotation rewrites omit refreshTokenExpiresAt — alive, not dead
         rotation = json.dumps({"claudeAiOauth": {"accessToken": "a", "refreshToken": "r"}})
-        assert ccx.blob_expired(rotation, self.NOW) is False
+        assert accounts.blob_expired(rotation, self.NOW) is False
 
     def _rows(self):
         return [
-            ccx_row("gmail", 12.0, expired=False, active=False),
-            ccx_row("alumni", 4.0, expired=True, active=False),   # freshest but cred dead
-            ccx_row("ymail", 30.0, expired=False, active=False),
-            ccx_row("coram-max", 88.0, expired=False, active=True),
+            accounts_row("gmail", 12.0, expired=False, active=False),
+            accounts_row("alumni", 4.0, expired=True, active=False),   # freshest but cred dead
+            accounts_row("ymail", 30.0, expired=False, active=False),
+            accounts_row("coram-max", 88.0, expired=False, active=True),
         ]
 
     def test_route_pick_skips_expired_and_active(self):
         # alumni is lowest but expired -> skip; active coram-max -> skip -> gmail
-        assert ccx.route_pick(self._rows(), set()) == "gmail"
+        assert accounts.route_pick(self._rows(), set()) == "gmail"
 
     def test_route_pick_respects_excludes(self):
-        assert ccx.route_pick(self._rows(), {"gmail"}) == "ymail"
+        assert accounts.route_pick(self._rows(), {"gmail"}) == "ymail"
 
     def test_route_pick_none_when_all_blocked(self):
-        rows = [ccx_row("a", 5.0, expired=True), ccx_row("b", 6.0, active=True)]
-        assert ccx.route_pick(rows, set()) is None
+        rows = [accounts_row("a", 5.0, expired=True), accounts_row("b", 6.0, active=True)]
+        assert accounts.route_pick(rows, set()) is None
 
 
-def ccx_row(label, five_hour, expired=False, active=False, fable=0.0):
+def accounts_row(label, five_hour, expired=False, active=False, fable=0.0):
     return {"label": label, "email": f"{label}@x", "five_hour": five_hour,
             "fable": fable, "expired": expired, "active": active}
 
@@ -281,7 +281,7 @@ class TestUsageMapping:
     }
 
     def test_maps_all_fields(self):
-        row = ccx.usage_to_reset_row("e@x.io", "org1", self.USAGE, 1784300000)
+        row = accounts.usage_to_reset_row("e@x.io", "org1", self.USAGE, 1784300000)
         assert row["email"] == "e@x.io" and row["org_uuid"] == "org1"
         assert row["five_hour_pct"] == 42
         assert row["five_hour_reset"] == "2026-07-17T22:00:00Z"
@@ -291,35 +291,35 @@ class TestUsageMapping:
         assert row["last_seen"] == 1784300000
 
     def test_missing_weekly_is_none(self):
-        row = ccx.usage_to_reset_row("e@x.io", "org1", {"five_hour": {}, "seven_day": {}}, 1)
+        row = accounts.usage_to_reset_row("e@x.io", "org1", {"five_hour": {}, "seven_day": {}}, 1)
         assert row["fable_pct"] is None and row["fable_label"] is None
         assert row["five_hour_pct"] == 0  # None utilization -> 0
 
     def test_access_expiry_ms_to_s(self):
         blob = json.dumps({"claudeAiOauth": {"expiresAt": 1784337371728}})
-        assert ccx.blob_access_expiry(blob) == 1784337371
+        assert accounts.blob_access_expiry(blob) == 1784337371
 
     def test_access_expiry_missing(self):
-        assert ccx.blob_access_expiry(json.dumps({"claudeAiOauth": {}})) is None
+        assert accounts.blob_access_expiry(json.dumps({"claudeAiOauth": {}})) is None
 
 
 class TestVaultKey:
     def test_composite_of_account_and_org(self):
         ident = {"uuid": "acct1", "org_uuid": "orgA"}
-        assert ccx.vault_key(ident) == "acct1|orgA"
+        assert accounts.vault_key(ident) == "acct1|orgA"
 
     def test_shared_account_two_orgs_distinct_keys(self):
         # coram-max and coram-work: same account, different org -> must not collide
-        maxk = ccx.vault_key({"uuid": "d9eb", "org_uuid": "e1c8"})
-        workk = ccx.vault_key({"uuid": "d9eb", "org_uuid": "52ae"})
+        maxk = accounts.vault_key({"uuid": "d9eb", "org_uuid": "e1c8"})
+        workk = accounts.vault_key({"uuid": "d9eb", "org_uuid": "52ae"})
         assert maxk != workk
 
     def test_missing_org_is_none(self):
-        assert ccx.vault_key({"uuid": "acct1", "org_uuid": None}) is None
-        assert ccx.vault_key({"uuid": None, "org_uuid": "orgA"}) is None
+        assert accounts.vault_key({"uuid": "acct1", "org_uuid": None}) is None
+        assert accounts.vault_key({"uuid": None, "org_uuid": "orgA"}) is None
 
     def test_short_key_shows_both_parts(self):
-        assert ccx.short_key("d9eb92c0-xxxx|52ae57ff-yyyy") == "d9eb92c0|52ae57ff"
+        assert accounts.short_key("d9eb92c0-xxxx|52ae57ff-yyyy") == "d9eb92c0|52ae57ff"
 
 
 class TestResolveTargetSharedEmail:
@@ -335,12 +335,12 @@ class TestResolveTargetSharedEmail:
     ]
 
     def test_label_disambiguates_shared_email(self):
-        k, _ = ccx.resolve_target(self.META, "coram-work", self.PAIRS)
+        k, _ = accounts.resolve_target(self.META, "coram-work", self.PAIRS)
         assert k == "d9eb|52ae"
 
     def test_shared_email_is_ambiguous(self):
         with pytest.raises(SystemExit):
-            ccx.resolve_target(self.META, "andrew.kent@coram.ai", self.PAIRS)
+            accounts.resolve_target(self.META, "andrew.kent@coram.ai", self.PAIRS)
 
 
 class TestResolveTarget:
@@ -352,20 +352,20 @@ class TestResolveTarget:
     }
 
     def test_by_label(self):
-        uuid, _ = ccx.resolve_target(self.META, "coram-max", PAIRS)
+        uuid, _ = accounts.resolve_target(self.META, "coram-max", PAIRS)
         assert uuid == "uuid-a"
 
     def test_by_email(self):
-        uuid, _ = ccx.resolve_target(self.META, "andrewkent10@gmail.com", PAIRS)
+        uuid, _ = accounts.resolve_target(self.META, "andrewkent10@gmail.com", PAIRS)
         assert uuid == "uuid-b"
 
     def test_by_uuid(self):
-        uuid, _ = ccx.resolve_target(self.META, "uuid-b", PAIRS)
+        uuid, _ = accounts.resolve_target(self.META, "uuid-b", PAIRS)
         assert uuid == "uuid-b"
 
     def test_missing_dies(self):
         with pytest.raises(SystemExit):
-            ccx.resolve_target(self.META, "nope", PAIRS)
+            accounts.resolve_target(self.META, "nope", PAIRS)
 
 
 def _live_blob(atok, future_ms=3_000_000_000_000):
@@ -379,13 +379,13 @@ class TestLockedReentrant:
     re-takes it on a second fd — non-reentrant flock self-blocks in-process."""
 
     def test_nested_locked_does_not_deadlock(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(ccx, "LOCK_PATH", tmp_path / "ccx.lock")
-        monkeypatch.setattr(ccx, "_lock_depth", 0)
+        monkeypatch.setattr(accounts, "LOCK_PATH", tmp_path / "accounts.lock")
+        monkeypatch.setattr(accounts, "_lock_depth", 0)
         done = threading.Event()
 
         def run():
-            with ccx.locked():
-                with ccx.locked():  # nested acquire must return, not block
+            with accounts.locked():
+                with accounts.locked():  # nested acquire must return, not block
                     pass
             done.set()
 
@@ -395,17 +395,17 @@ class TestLockedReentrant:
 
 class TestRouteOnceNoDeadlock:
     def _paths(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(ccx, "LOCK_PATH", tmp_path / "ccx.lock")
-        monkeypatch.setattr(ccx, "BLOBS_PATH", tmp_path / "blobs.json")
-        monkeypatch.setattr(ccx, "RESETS_PATH", tmp_path / "resets.json")
-        monkeypatch.setattr(ccx, "MODE_PATH", tmp_path / "mode.json")
-        monkeypatch.setattr(ccx, "CRED_FILE", tmp_path / ".credentials.json")
-        monkeypatch.setattr(ccx, "_lock_depth", 0)
-        monkeypatch.setattr(ccx, "_last_switch_ts", None)
+        monkeypatch.setattr(accounts, "LOCK_PATH", tmp_path / "accounts.lock")
+        monkeypatch.setattr(accounts, "BLOBS_PATH", tmp_path / "blobs.json")
+        monkeypatch.setattr(accounts, "RESETS_PATH", tmp_path / "resets.json")
+        monkeypatch.setattr(accounts, "MODE_PATH", tmp_path / "mode.json")
+        monkeypatch.setattr(accounts, "CRED_FILE", tmp_path / ".credentials.json")
+        monkeypatch.setattr(accounts, "_lock_depth", 0)
+        monkeypatch.setattr(accounts, "_last_switch_ts", None)
         # hermetic: never read/delete the REAL keychain from tests
-        monkeypatch.setattr(ccx, "kc_read", lambda service, account=None: None)
-        monkeypatch.setattr(ccx, "kc_slot_status", lambda service: "absent")
-        monkeypatch.setattr(ccx, "kc_delete", lambda service, account=None: None)
+        monkeypatch.setattr(accounts, "kc_read", lambda service, account=None: None)
+        monkeypatch.setattr(accounts, "kc_slot_status", lambda service: "absent")
+        monkeypatch.setattr(accounts, "kc_delete", lambda service, account=None: None)
 
     def test_route_once_completes_when_poll_yields_rows(self, tmp_path, monkeypatch):
         # Real poll -> merge_reset_rows re-enters the lock. Pre-fix: hangs here.
@@ -413,15 +413,15 @@ class TestRouteOnceNoDeadlock:
         blobs = {"accounts": {"gmail": {"email": "g@x", "org_uuid": "o1",
                                         "blob": _live_blob("tok-g")}}}
         (tmp_path / "blobs.json").write_text(json.dumps(blobs))
-        monkeypatch.setattr(ccx, "fetch_usage", lambda tok: {
+        monkeypatch.setattr(accounts, "fetch_usage", lambda tok: {
             "five_hour": {"utilization": 10, "resets_at": "2026-07-17T22:00:00Z"},
             "seven_day": {"utilization": 5, "resets_at": "2026-07-23T10:00:00Z"}, "limits": []})
-        monkeypatch.setattr(ccx, "fetch_profile", lambda tok: None)
+        monkeypatch.setattr(accounts, "fetch_profile", lambda tok: None)
         done, errbox = threading.Event(), []
 
         def run():
             try:
-                ccx.route_once(80.0)
+                accounts.route_once(80.0)
             except Exception as exc:  # noqa: BLE001
                 errbox.append(exc)
             finally:
@@ -438,221 +438,221 @@ class TestRouteDecision:
     the decision path runs. apply_account (the real file write) is NOT stubbed."""
 
     def _wire(self, tmp_path, monkeypatch, rows, active, mode, blobs):
-        monkeypatch.setattr(ccx, "LOCK_PATH", tmp_path / "ccx.lock")
-        monkeypatch.setattr(ccx, "CRED_FILE", tmp_path / ".credentials.json")
-        monkeypatch.setattr(ccx, "_lock_depth", 0)
-        monkeypatch.setattr(ccx, "_last_switch_ts", None)  # never switched: dwell open
-        monkeypatch.setattr(ccx, "load_blobs", lambda: blobs)
-        monkeypatch.setattr(ccx, "poll_blobs_usage", lambda b: 0)
-        monkeypatch.setattr(ccx, "capture_live_to_blobs", lambda b: active)
-        monkeypatch.setattr(ccx, "route_rows", lambda b, a, t: rows)
-        monkeypatch.setattr(ccx, "load_mode", lambda: mode)
-        monkeypatch.setattr(ccx, "excluded_labels", lambda: set())
+        monkeypatch.setattr(accounts, "LOCK_PATH", tmp_path / "accounts.lock")
+        monkeypatch.setattr(accounts, "CRED_FILE", tmp_path / ".credentials.json")
+        monkeypatch.setattr(accounts, "_lock_depth", 0)
+        monkeypatch.setattr(accounts, "_last_switch_ts", None)  # never switched: dwell open
+        monkeypatch.setattr(accounts, "load_blobs", lambda: blobs)
+        monkeypatch.setattr(accounts, "poll_blobs_usage", lambda b: 0)
+        monkeypatch.setattr(accounts, "capture_live_to_blobs", lambda b: active)
+        monkeypatch.setattr(accounts, "route_rows", lambda b, a, t: rows)
+        monkeypatch.setattr(accounts, "load_mode", lambda: mode)
+        monkeypatch.setattr(accounts, "excluded_labels", lambda: set())
         # hermetic: never read/delete the REAL keychain from tests
         self.kc_deletes = []
-        monkeypatch.setattr(ccx, "kc_read", lambda service, account=None: None)
-        monkeypatch.setattr(ccx, "kc_slot_status", lambda service: "absent")
-        monkeypatch.setattr(ccx, "kc_delete",
+        monkeypatch.setattr(accounts, "kc_read", lambda service, account=None: None)
+        monkeypatch.setattr(accounts, "kc_slot_status", lambda service: "absent")
+        monkeypatch.setattr(accounts, "kc_delete",
                             lambda service, account=None: self.kc_deletes.append(service))
 
     def test_auto_holds_when_pick_not_meaningfully_fresher(self, tmp_path, monkeypatch):
         # A active @85 (>=80), B @82 — 3 pts fresher. Pre-fix switches A->B then
         # B->A every pass (ping-pong). Fixed: holds (needs >= hysteresis fresher).
-        rows = [ccx_row("A", 85.0, active=True), ccx_row("B", 82.0)]
+        rows = [accounts_row("A", 85.0, active=True), accounts_row("B", 82.0)]
         self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "auto"},
                    {"accounts": {"B": {"blob": "BLOB-B"}}})
-        assert ccx.route_once(80.0) is None
-        assert not ccx.CRED_FILE.exists()  # no switch written
+        assert accounts.route_once(80.0) is None
+        assert not accounts.CRED_FILE.exists()  # no switch written
 
     def test_auto_switches_when_pick_much_fresher(self, tmp_path, monkeypatch):
-        rows = [ccx_row("A", 85.0, active=True), ccx_row("B", 70.0)]
+        rows = [accounts_row("A", 85.0, active=True), accounts_row("B", 70.0)]
         self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "auto"},
                    {"accounts": {"B": {"blob": "BLOB-B"}}})
-        line = ccx.route_once(80.0)
+        line = accounts.route_once(80.0)
         assert line and "ROUTED A → B" in line
-        assert ccx.CRED_FILE.read_text() == "BLOB-B"
+        assert accounts.CRED_FILE.read_text() == "BLOB-B"
 
     def test_auto_no_switch_below_threshold(self, tmp_path, monkeypatch):
-        rows = [ccx_row("A", 50.0, active=True), ccx_row("B", 5.0)]
+        rows = [accounts_row("A", 50.0, active=True), accounts_row("B", 5.0)]
         self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "auto"},
                    {"accounts": {"B": {"blob": "BLOB-B"}}})
-        assert ccx.route_once(80.0) is None
-        assert not ccx.CRED_FILE.exists()
+        assert accounts.route_once(80.0) is None
+        assert not accounts.CRED_FILE.exists()
 
     def test_auto_pick_without_board_row_does_not_crash(self, tmp_path, monkeypatch):
         # B has no five_hour (poll skipped it) -> pick_pct None must not TypeError
-        rows = [ccx_row("A", 90.0, active=True), ccx_row("B", None)]
+        rows = [accounts_row("A", 90.0, active=True), accounts_row("B", None)]
         self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "auto"},
                    {"accounts": {"B": {"blob": "BLOB-B"}}})
-        assert ccx.route_once(80.0) is None
-        assert not ccx.CRED_FILE.exists()
+        assert accounts.route_once(80.0) is None
+        assert not accounts.CRED_FILE.exists()
 
     def test_set_holds_when_live_present_but_unattributed(self, tmp_path, monkeypatch):
         # CRED_FILE present, capture returns None (profile down) -> a cc-rotated
         # token may be live; must NOT overwrite it with the stored blob.
-        rows = [ccx_row("B", 5.0)]
+        rows = [accounts_row("B", 5.0)]
         self._wire(tmp_path, monkeypatch, rows, None, {"mode": "set", "label": "B"},
                    {"accounts": {"B": {"blob": "BLOB-B"}}})
-        ccx.CRED_FILE.write_text("LIVE-ROTATED")
-        assert ccx.route_once(80.0) is None
-        assert ccx.CRED_FILE.read_text() == "LIVE-ROTATED"  # untouched
+        accounts.CRED_FILE.write_text("LIVE-ROTATED")
+        assert accounts.route_once(80.0) is None
+        assert accounts.CRED_FILE.read_text() == "LIVE-ROTATED"  # untouched
 
     def test_set_seeds_when_no_cred_file(self, tmp_path, monkeypatch):
-        rows = [ccx_row("B", 5.0)]
+        rows = [accounts_row("B", 5.0)]
         self._wire(tmp_path, monkeypatch, rows, None, {"mode": "set", "label": "B"},
                    {"accounts": {"B": {"blob": "BLOB-B"}}})
-        assert "SET" in (ccx.route_once(80.0) or "")
-        assert ccx.CRED_FILE.read_text() == "BLOB-B"
+        assert "SET" in (accounts.route_once(80.0) or "")
+        assert accounts.CRED_FILE.read_text() == "BLOB-B"
 
     def test_auto_capped_escapes_to_a_usable_account(self, tmp_path, monkeypatch):
         # active @100 (>= cap 95), best alt @91 (below cap = real headroom). Below
         # cap the 9-pt gap would hold on hysteresis; capped, we escape to it.
-        rows = [ccx_row("A", 100.0, active=True), ccx_row("B", 91.0)]
+        rows = [accounts_row("A", 100.0, active=True), accounts_row("B", 91.0)]
         self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "auto"},
                    {"accounts": {"B": {"blob": "BLOB-B"}}})
-        line = ccx.route_once(80.0)
+        line = accounts.route_once(80.0)
         assert line and "ROUTED A → B" in line
-        assert ccx.CRED_FILE.read_text() == "BLOB-B"
+        assert accounts.CRED_FILE.read_text() == "BLOB-B"
 
     def test_auto_capped_holds_when_every_alt_is_also_capped(self, tmp_path, monkeypatch):
         # active capped @96, only alt @98 also >= cap -> hold. Two near-capped
         # accounts never swap: this is what stops the feedback ping-pong.
-        rows = [ccx_row("A", 96.0, active=True), ccx_row("B", 98.0)]
+        rows = [accounts_row("A", 96.0, active=True), accounts_row("B", 98.0)]
         self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "auto"},
                    {"accounts": {"B": {"blob": "BLOB-B"}}})
-        assert ccx.route_once(80.0) is None
-        assert not ccx.CRED_FILE.exists()
+        assert accounts.route_once(80.0) is None
+        assert not accounts.CRED_FILE.exists()
 
     def test_auto_dwell_rate_limits_switching(self, tmp_path, monkeypatch):
         # Even a far-fresher pick is held if we switched within the dwell — each
         # switch cold-starts a prompt cache, so the daemon switches at most once
         # per ROUTE_MIN_DWELL_S.
-        rows = [ccx_row("A", 100.0, active=True), ccx_row("B", 20.0)]
+        rows = [accounts_row("A", 100.0, active=True), accounts_row("B", 20.0)]
         self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "auto"},
                    {"accounts": {"B": {"blob": "BLOB-B"}}})
-        monkeypatch.setattr(ccx, "_last_switch_ts", time.monotonic())  # just switched
-        assert ccx.route_once(80.0) is None
-        assert not ccx.CRED_FILE.exists()
-        monkeypatch.setattr(ccx, "_last_switch_ts", time.monotonic() - ccx.ROUTE_MIN_DWELL_S - 1)
-        line = ccx.route_once(80.0)
+        monkeypatch.setattr(accounts, "_last_switch_ts", time.monotonic())  # just switched
+        assert accounts.route_once(80.0) is None
+        assert not accounts.CRED_FILE.exists()
+        monkeypatch.setattr(accounts, "_last_switch_ts", time.monotonic() - accounts.ROUTE_MIN_DWELL_S - 1)
+        line = accounts.route_once(80.0)
         assert line and "ROUTED A → B" in line
-        assert ccx._last_switch_ts is not None and ccx._last_switch_ts > 1  # stamp advanced
+        assert accounts._last_switch_ts is not None and accounts._last_switch_ts > 1  # stamp advanced
 
     # ---- fable mode: greedy chase of the freshest Fable-capable account ----
 
     def test_fable_holds_when_live_is_best_fable(self, tmp_path, monkeypatch):
         # Live A has the most fable headroom; the only other eligible (B@90) is
         # not >= hysteresis fresher, so hold — no cold-start for nothing.
-        rows = [ccx_row("A", 20.0, active=True, fable=10.0), ccx_row("B", 20.0, fable=90.0)]
+        rows = [accounts_row("A", 20.0, active=True, fable=10.0), accounts_row("B", 20.0, fable=90.0)]
         self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "fable"},
                    {"accounts": {"B": {"blob": "BLOB-B"}}})
-        assert ccx.route_once(80.0) is None
-        assert not ccx.CRED_FILE.exists()
+        assert accounts.route_once(80.0) is None
+        assert not accounts.CRED_FILE.exists()
 
     def test_fable_holds_on_near_tie(self, tmp_path, monkeypatch):
         # Live @45, best alt @40 — only 5 pts fresher (< hysteresis 10) → hold.
-        rows = [ccx_row("A", 20.0, active=True, fable=45.0), ccx_row("B", 20.0, fable=40.0)]
+        rows = [accounts_row("A", 20.0, active=True, fable=45.0), accounts_row("B", 20.0, fable=40.0)]
         self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "fable"},
                    {"accounts": {"B": {"blob": "BLOB-B"}}})
-        assert ccx.route_once(80.0) is None
-        assert not ccx.CRED_FILE.exists()
+        assert accounts.route_once(80.0) is None
+        assert not accounts.CRED_FILE.exists()
 
     def test_fable_switches_to_meaningfully_fresher(self, tmp_path, monkeypatch):
         # Live @80 (eligible), B @10 — 70 pts fresher (>= hysteresis) → switch.
-        rows = [ccx_row("A", 30.0, active=True, fable=80.0), ccx_row("B", 10.0, fable=10.0)]
+        rows = [accounts_row("A", 30.0, active=True, fable=80.0), accounts_row("B", 10.0, fable=10.0)]
         self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "fable"},
                    {"accounts": {"B": {"blob": "BLOB-B"}}})
-        line = ccx.route_once(80.0)
+        line = accounts.route_once(80.0)
         assert line and "FABLE A → B" in line
-        assert ccx.CRED_FILE.read_text() == "BLOB-B"
+        assert accounts.CRED_FILE.read_text() == "BLOB-B"
 
     def test_fable_switches_when_live_fable_capped(self, tmp_path, monkeypatch):
         # Live fable exhausted (@97) → live ineligible → switch to eligible B@50.
-        rows = [ccx_row("A", 20.0, active=True, fable=97.0), ccx_row("B", 10.0, fable=50.0)]
+        rows = [accounts_row("A", 20.0, active=True, fable=97.0), accounts_row("B", 10.0, fable=50.0)]
         self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "fable"},
                    {"accounts": {"B": {"blob": "BLOB-B"}}})
-        line = ccx.route_once(80.0)
+        line = accounts.route_once(80.0)
         assert line and "FABLE A → B" in line
-        assert ccx.CRED_FILE.read_text() == "BLOB-B"
+        assert accounts.CRED_FILE.read_text() == "BLOB-B"
 
     def test_fable_switches_when_live_5h_capped(self, tmp_path, monkeypatch):
         # Live fable fine (@20) but 5h capped (@97) → live unusable → switch.
-        rows = [ccx_row("A", 97.0, active=True, fable=20.0), ccx_row("B", 10.0, fable=50.0)]
+        rows = [accounts_row("A", 97.0, active=True, fable=20.0), accounts_row("B", 10.0, fable=50.0)]
         self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "fable"},
                    {"accounts": {"B": {"blob": "BLOB-B"}}})
-        line = ccx.route_once(80.0)
+        line = accounts.route_once(80.0)
         assert line and "FABLE A → B" in line
-        assert ccx.CRED_FILE.read_text() == "BLOB-B"
+        assert accounts.CRED_FILE.read_text() == "BLOB-B"
 
     def test_fable_dwell_rate_limits(self, tmp_path, monkeypatch):
         # A switch is due (live fable capped, B fresh) but held within the dwell.
-        rows = [ccx_row("A", 20.0, active=True, fable=97.0), ccx_row("B", 10.0, fable=10.0)]
+        rows = [accounts_row("A", 20.0, active=True, fable=97.0), accounts_row("B", 10.0, fable=10.0)]
         self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "fable"},
                    {"accounts": {"B": {"blob": "BLOB-B"}}})
-        monkeypatch.setattr(ccx, "_last_switch_ts", time.monotonic())  # just switched
-        assert ccx.route_once(80.0) is None
-        assert not ccx.CRED_FILE.exists()
-        monkeypatch.setattr(ccx, "_last_switch_ts", time.monotonic() - ccx.ROUTE_MIN_DWELL_S - 1)
-        line = ccx.route_once(80.0)
+        monkeypatch.setattr(accounts, "_last_switch_ts", time.monotonic())  # just switched
+        assert accounts.route_once(80.0) is None
+        assert not accounts.CRED_FILE.exists()
+        monkeypatch.setattr(accounts, "_last_switch_ts", time.monotonic() - accounts.ROUTE_MIN_DWELL_S - 1)
+        line = accounts.route_once(80.0)
         assert line and "FABLE A → B" in line
 
     def test_fable_fallback_holds_below_threshold(self, tmp_path, monkeypatch):
         # No account has fable headroom, but live 5h @30 (< threshold) → the 5h
         # router holds; the session still does normal work, so no pointless switch.
-        rows = [ccx_row("A", 30.0, active=True, fable=100.0), ccx_row("B", 5.0, fable=100.0)]
+        rows = [accounts_row("A", 30.0, active=True, fable=100.0), accounts_row("B", 5.0, fable=100.0)]
         self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "fable"},
                    {"accounts": {"B": {"blob": "BLOB-B"}}})
-        assert ccx.route_once(80.0) is None
-        assert not ccx.CRED_FILE.exists()
+        assert accounts.route_once(80.0) is None
+        assert not accounts.CRED_FILE.exists()
 
     def test_fable_fallback_escapes_capped_5h(self, tmp_path, monkeypatch):
         # No fable anywhere AND live 5h capped (@97) → fall back to the 5h router,
         # which escapes to B (@40, real headroom). Log is ROUTED (the 5h path).
-        rows = [ccx_row("A", 97.0, active=True, fable=100.0), ccx_row("B", 40.0, fable=100.0)]
+        rows = [accounts_row("A", 97.0, active=True, fable=100.0), accounts_row("B", 40.0, fable=100.0)]
         self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "fable"},
                    {"accounts": {"B": {"blob": "BLOB-B"}}})
-        line = ccx.route_once(80.0)
+        line = accounts.route_once(80.0)
         assert line and "ROUTED A → B" in line
-        assert ccx.CRED_FILE.read_text() == "BLOB-B"
+        assert accounts.CRED_FILE.read_text() == "BLOB-B"
 
     def test_fable_holds_when_live_unattributed(self, tmp_path, monkeypatch):
         # active None (profile down) + CRED_FILE present → don't clobber a possibly
         # cc-rotated live token (mirrors the AUTO/SET guard).
-        rows = [ccx_row("B", 5.0, fable=5.0)]
+        rows = [accounts_row("B", 5.0, fable=5.0)]
         self._wire(tmp_path, monkeypatch, rows, None, {"mode": "fable"},
                    {"accounts": {"B": {"blob": "BLOB-B"}}})
-        ccx.CRED_FILE.write_text("LIVE-ROTATED")
-        assert ccx.route_once(80.0) is None
-        assert ccx.CRED_FILE.read_text() == "LIVE-ROTATED"
+        accounts.CRED_FILE.write_text("LIVE-ROTATED")
+        assert accounts.route_once(80.0) is None
+        assert accounts.CRED_FILE.read_text() == "LIVE-ROTATED"
 
 
 class TestCmdSet:
     def _paths(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(ccx, "LOCK_PATH", tmp_path / "ccx.lock")
-        monkeypatch.setattr(ccx, "CRED_FILE", tmp_path / ".credentials.json")
-        monkeypatch.setattr(ccx, "MODE_PATH", tmp_path / "mode.json")
-        monkeypatch.setattr(ccx, "BLOBS_PATH", tmp_path / "blobs.json")
-        monkeypatch.setattr(ccx, "_lock_depth", 0)
+        monkeypatch.setattr(accounts, "LOCK_PATH", tmp_path / "accounts.lock")
+        monkeypatch.setattr(accounts, "CRED_FILE", tmp_path / ".credentials.json")
+        monkeypatch.setattr(accounts, "MODE_PATH", tmp_path / "mode.json")
+        monkeypatch.setattr(accounts, "BLOBS_PATH", tmp_path / "blobs.json")
+        monkeypatch.setattr(accounts, "_lock_depth", 0)
         # never reach the network / real store / real keychain from tests
-        monkeypatch.setattr(ccx, "fetch_profile", lambda tok: None)
-        monkeypatch.setattr(ccx, "kc_read", lambda service, account=None: None)
-        monkeypatch.setattr(ccx, "kc_slot_status", lambda service: "absent")
-        monkeypatch.setattr(ccx, "kc_delete", lambda service, account=None: None)
+        monkeypatch.setattr(accounts, "fetch_profile", lambda tok: None)
+        monkeypatch.setattr(accounts, "kc_read", lambda service, account=None: None)
+        monkeypatch.setattr(accounts, "kc_slot_status", lambda service: "absent")
+        monkeypatch.setattr(accounts, "kc_delete", lambda service, account=None: None)
 
     def test_refuses_expired_blob(self, tmp_path, monkeypatch):
         self._paths(tmp_path, monkeypatch)
         expired = _live_blob("a", future_ms=1_000_000_000_000)  # 2001, past
-        monkeypatch.setattr(ccx, "load_blobs", lambda: {"accounts": {"B": {"blob": expired}}})
+        monkeypatch.setattr(accounts, "load_blobs", lambda: {"accounts": {"B": {"blob": expired}}})
         with pytest.raises(SystemExit):
-            ccx.cmd_set(types.SimpleNamespace(label="B"))
-        assert not ccx.CRED_FILE.exists()  # dead cred NOT written
+            accounts.cmd_set(types.SimpleNamespace(label="B"))
+        assert not accounts.CRED_FILE.exists()  # dead cred NOT written
 
     def test_applies_live_blob(self, tmp_path, monkeypatch):
         self._paths(tmp_path, monkeypatch)
         live = _live_blob("a")
-        monkeypatch.setattr(ccx, "load_blobs", lambda: {"accounts": {"B": {"blob": live}}})
-        ccx.cmd_set(types.SimpleNamespace(label="B"))
-        assert ccx.CRED_FILE.read_text() == live
+        monkeypatch.setattr(accounts, "load_blobs", lambda: {"accounts": {"B": {"blob": live}}})
+        accounts.cmd_set(types.SimpleNamespace(label="B"))
+        assert accounts.CRED_FILE.read_text() == live
 
     def test_captures_live_before_applying(self, tmp_path, monkeypatch):
         # regression: cmd_set must fold an outgoing rotation into blobs (capture)
@@ -660,46 +660,46 @@ class TestCmdSet:
         # departing account's freshly-rotated token.
         self._paths(tmp_path, monkeypatch)
         live = _live_blob("a")
-        monkeypatch.setattr(ccx, "load_blobs", lambda: {"accounts": {"B": {"blob": live}}})
-        monkeypatch.setattr(ccx, "save_mode", lambda m, label: None)
+        monkeypatch.setattr(accounts, "load_blobs", lambda: {"accounts": {"B": {"blob": live}}})
+        monkeypatch.setattr(accounts, "save_mode", lambda m, label: None)
         calls = []
-        monkeypatch.setattr(ccx, "capture_live_to_blobs", lambda b: calls.append("capture"))
-        real_apply = ccx.apply_account
-        monkeypatch.setattr(ccx, "apply_account",
+        monkeypatch.setattr(accounts, "capture_live_to_blobs", lambda b: calls.append("capture"))
+        real_apply = accounts.apply_account
+        monkeypatch.setattr(accounts, "apply_account",
                             lambda label, b: (calls.append("apply"), real_apply(label, b))[1])
-        ccx.cmd_set(types.SimpleNamespace(label="B"))
+        accounts.cmd_set(types.SimpleNamespace(label="B"))
         assert calls == ["capture", "apply"]
-        assert ccx.CRED_FILE.read_text() == live
+        assert accounts.CRED_FILE.read_text() == live
 
     def test_refuses_when_live_present_but_unattributable(self, tmp_path, monkeypatch):
         # cc rotated the live token (not yet in the store) and profile fetch fails
         # (stubbed None in _paths) -> capture can't attribute it. Overwriting would
         # lose that account's login, so refuse and leave the live cred untouched.
         self._paths(tmp_path, monkeypatch)
-        monkeypatch.setattr(ccx, "load_blobs",
+        monkeypatch.setattr(accounts, "load_blobs",
                             lambda: {"accounts": {"B": {"blob": _live_blob("b")}}})
-        ccx.CRED_FILE.write_text(_live_blob("ROTATED-UNKNOWN"))
+        accounts.CRED_FILE.write_text(_live_blob("ROTATED-UNKNOWN"))
         with pytest.raises(SystemExit):
-            ccx.cmd_set(types.SimpleNamespace(label="B"))
-        assert "ROTATED-UNKNOWN" in ccx.CRED_FILE.read_text()  # not clobbered
+            accounts.cmd_set(types.SimpleNamespace(label="B"))
+        assert "ROTATED-UNKNOWN" in accounts.CRED_FILE.read_text()  # not clobbered
 
 
 class TestLoadBlobs:
     def test_corrupt_store_is_preserved_not_destroyed(self, tmp_path, monkeypatch):
         blobs_path = tmp_path / "blobs.json"
         blobs_path.write_text("NOT JSON {{{")
-        monkeypatch.setattr(ccx, "BLOBS_PATH", blobs_path)
-        monkeypatch.setattr(ccx, "MIRROR_LOG", tmp_path / "log")  # keep log_line off real paths
-        assert ccx.load_blobs() == {"version": 1, "accounts": {}}
+        monkeypatch.setattr(accounts, "BLOBS_PATH", blobs_path)
+        monkeypatch.setattr(accounts, "MIRROR_LOG", tmp_path / "log")  # keep log_line off real paths
+        assert accounts.load_blobs() == {"version": 1, "accounts": {}}
         backups = list(tmp_path.glob("blobs.json.corrupt.*"))
         assert len(backups) == 1 and backups[0].read_text() == "NOT JSON {{{"
         # still-corrupt on the next read: no second identical backup piles up
-        assert ccx.load_blobs() == {"version": 1, "accounts": {}}
+        assert accounts.load_blobs() == {"version": 1, "accounts": {}}
         assert len(list(tmp_path.glob("blobs.json.corrupt.*"))) == 1
 
     def test_missing_store_returns_empty_without_backup(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(ccx, "BLOBS_PATH", tmp_path / "nope.json")
-        assert ccx.load_blobs() == {"version": 1, "accounts": {}}
+        monkeypatch.setattr(accounts, "BLOBS_PATH", tmp_path / "nope.json")
+        assert accounts.load_blobs() == {"version": 1, "accounts": {}}
         assert not list(tmp_path.glob("*.corrupt.*"))
 
     def test_unreadable_store_refuses_instead_of_empty(self, tmp_path, monkeypatch):
@@ -708,19 +708,19 @@ class TestLoadBlobs:
         blobs_path = tmp_path / "blobs.json"
         blobs_path.write_text('{"version": 1, "accounts": {"a": {}, "b": {}}}')
         blobs_path.chmod(0o000)
-        monkeypatch.setattr(ccx, "BLOBS_PATH", blobs_path)
+        monkeypatch.setattr(accounts, "BLOBS_PATH", blobs_path)
         try:
-            with pytest.raises(ccx.CcxError):
-                ccx.load_blobs()
+            with pytest.raises(accounts.AccountsError):
+                accounts.load_blobs()
         finally:
             blobs_path.chmod(0o600)
 
     def test_non_dict_store_is_preserved_and_empty(self, tmp_path, monkeypatch):
         blobs_path = tmp_path / "blobs.json"
         blobs_path.write_text("[1, 2, 3]")
-        monkeypatch.setattr(ccx, "BLOBS_PATH", blobs_path)
-        monkeypatch.setattr(ccx, "MIRROR_LOG", tmp_path / "log")
-        assert ccx.load_blobs() == {"version": 1, "accounts": {}}
+        monkeypatch.setattr(accounts, "BLOBS_PATH", blobs_path)
+        monkeypatch.setattr(accounts, "MIRROR_LOG", tmp_path / "log")
+        assert accounts.load_blobs() == {"version": 1, "accounts": {}}
         assert len(list(tmp_path.glob("blobs.json.corrupt.*"))) == 1
 
 
@@ -729,66 +729,66 @@ class TestLiveCredAndSwitch:
     plaintext-fallback', ~30s TTL), so a switch = write file + DELETE slot."""
 
     def test_live_cred_prefers_keychain_over_file(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(ccx, "CRED_FILE", tmp_path / ".credentials.json")
-        ccx.CRED_FILE.write_text("FILE-BLOB")
-        monkeypatch.setattr(ccx, "kc_read", lambda service, account=None: "KC-BLOB")
-        assert ccx.live_cred() == ("KC-BLOB", "keychain")
+        monkeypatch.setattr(accounts, "CRED_FILE", tmp_path / ".credentials.json")
+        accounts.CRED_FILE.write_text("FILE-BLOB")
+        monkeypatch.setattr(accounts, "kc_read", lambda service, account=None: "KC-BLOB")
+        assert accounts.live_cred() == ("KC-BLOB", "keychain")
 
     def test_live_cred_falls_back_to_file_then_none(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(ccx, "CRED_FILE", tmp_path / ".credentials.json")
-        monkeypatch.setattr(ccx, "kc_read", lambda service, account=None: None)
-        assert ccx.live_cred() == (None, None)
-        ccx.CRED_FILE.write_text("FILE-BLOB")
-        assert ccx.live_cred() == ("FILE-BLOB", "file")
+        monkeypatch.setattr(accounts, "CRED_FILE", tmp_path / ".credentials.json")
+        monkeypatch.setattr(accounts, "kc_read", lambda service, account=None: None)
+        assert accounts.live_cred() == (None, None)
+        accounts.CRED_FILE.write_text("FILE-BLOB")
+        assert accounts.live_cred() == ("FILE-BLOB", "file")
 
     def test_capture_reads_the_keychain_source(self, tmp_path, monkeypatch):
         # cc refreshed into the keychain (file deleted): capture must still
         # attribute the live account without any profile fetch when unchanged.
-        monkeypatch.setattr(ccx, "CRED_FILE", tmp_path / ".credentials.json")
+        monkeypatch.setattr(accounts, "CRED_FILE", tmp_path / ".credentials.json")
         kc_blob = _live_blob("tok-kc")
-        monkeypatch.setattr(ccx, "kc_read", lambda service, account=None: kc_blob)
-        monkeypatch.setattr(ccx, "fetch_profile",
+        monkeypatch.setattr(accounts, "kc_read", lambda service, account=None: kc_blob)
+        monkeypatch.setattr(accounts, "fetch_profile",
                             lambda tok: (_ for _ in ()).throw(AssertionError("no network")))
         blobs = {"accounts": {"gmail": {"blob": kc_blob}}}
-        assert ccx.capture_live_to_blobs(blobs) == "gmail"
+        assert accounts.capture_live_to_blobs(blobs) == "gmail"
 
     def test_apply_account_deletes_keychain_slot(self, tmp_path, monkeypatch):
         # While the slot exists the file is invisible to cc — apply must write
         # the file AND delete the slot so the ~30s re-read lands on the file.
-        monkeypatch.setattr(ccx, "CRED_FILE", tmp_path / ".credentials.json")
-        monkeypatch.setattr(ccx, "MIRROR_LOG", tmp_path / "log")
+        monkeypatch.setattr(accounts, "CRED_FILE", tmp_path / ".credentials.json")
+        monkeypatch.setattr(accounts, "MIRROR_LOG", tmp_path / "log")
         kc_state = {"present": True}
         deletes = []
-        monkeypatch.setattr(ccx, "kc_slot_status",
+        monkeypatch.setattr(accounts, "kc_slot_status",
                             lambda service: "present" if kc_state["present"] else "absent")
 
         def fake_delete(service, account=None):
             deletes.append(service)
             kc_state["present"] = False
-        monkeypatch.setattr(ccx, "kc_delete", fake_delete)
-        assert ccx.apply_account("B", {"accounts": {"B": {"blob": "BLOB-B"}}}) is True
-        assert ccx.CRED_FILE.read_text() == "BLOB-B"
-        assert deletes == [ccx.LIVE_SERVICE]
+        monkeypatch.setattr(accounts, "kc_delete", fake_delete)
+        assert accounts.apply_account("B", {"accounts": {"B": {"blob": "BLOB-B"}}}) is True
+        assert accounts.CRED_FILE.read_text() == "BLOB-B"
+        assert deletes == [accounts.LIVE_SERVICE]
         assert not (tmp_path / "log").exists()  # clean switch: no warn logged
 
     def test_apply_account_skips_delete_when_no_slot(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(ccx, "CRED_FILE", tmp_path / ".credentials.json")
+        monkeypatch.setattr(accounts, "CRED_FILE", tmp_path / ".credentials.json")
         deletes = []
-        monkeypatch.setattr(ccx, "kc_slot_status", lambda service: "absent")
-        monkeypatch.setattr(ccx, "kc_delete", lambda service, account=None: deletes.append(service))
-        assert ccx.apply_account("B", {"accounts": {"B": {"blob": "BLOB-B"}}}) is True
+        monkeypatch.setattr(accounts, "kc_slot_status", lambda service: "absent")
+        monkeypatch.setattr(accounts, "kc_delete", lambda service, account=None: deletes.append(service))
+        assert accounts.apply_account("B", {"accounts": {"B": {"blob": "BLOB-B"}}}) is True
         assert deletes == []  # nothing to delete; no gratuitous keychain ops
 
     def test_apply_account_warns_when_slot_state_unknown(self, tmp_path, monkeypatch):
         # Locked keychain / wedged securityd: the probe can't tell — apply must
         # NOT claim a clean switch (cc may keep reading the intact slot) and
         # must not fire a blind delete.
-        monkeypatch.setattr(ccx, "CRED_FILE", tmp_path / ".credentials.json")
-        monkeypatch.setattr(ccx, "MIRROR_LOG", tmp_path / "log")
+        monkeypatch.setattr(accounts, "CRED_FILE", tmp_path / ".credentials.json")
+        monkeypatch.setattr(accounts, "MIRROR_LOG", tmp_path / "log")
         deletes = []
-        monkeypatch.setattr(ccx, "kc_slot_status", lambda service: "unknown")
-        monkeypatch.setattr(ccx, "kc_delete", lambda service, account=None: deletes.append(service))
-        assert ccx.apply_account("B", {"accounts": {"B": {"blob": "BLOB-B"}}}) is True
+        monkeypatch.setattr(accounts, "kc_slot_status", lambda service: "unknown")
+        monkeypatch.setattr(accounts, "kc_delete", lambda service, account=None: deletes.append(service))
+        assert accounts.apply_account("B", {"accounts": {"B": {"blob": "BLOB-B"}}}) is True
         assert deletes == []
         assert "unknown" in (tmp_path / "log").read_text()
 
@@ -809,20 +809,20 @@ class TestRouteOnceAdoptsLogin:
         from contextlib import nullcontext
 
         calls = {"save_mode": [], "apply": []}
-        monkeypatch.setattr(ccx, "locked", lambda blocking=True: nullcontext())
-        monkeypatch.setattr(ccx, "load_blobs", lambda: {"accounts": {}})
-        monkeypatch.setattr(ccx, "capture_live_to_blobs", lambda blobs: active)
-        monkeypatch.setattr(ccx, "poll_blobs_usage", lambda blobs: 0)
-        monkeypatch.setattr(ccx, "route_rows", lambda blobs, a, now: [])
-        monkeypatch.setattr(ccx, "load_mode", lambda: {"mode": "set", "label": mode_label})
-        monkeypatch.setattr(ccx, "live_cred", lambda: live_pair)
+        monkeypatch.setattr(accounts, "locked", lambda blocking=True: nullcontext())
+        monkeypatch.setattr(accounts, "load_blobs", lambda: {"accounts": {}})
+        monkeypatch.setattr(accounts, "capture_live_to_blobs", lambda blobs: active)
+        monkeypatch.setattr(accounts, "poll_blobs_usage", lambda blobs: 0)
+        monkeypatch.setattr(accounts, "route_rows", lambda blobs, a, now: [])
+        monkeypatch.setattr(accounts, "load_mode", lambda: {"mode": "set", "label": mode_label})
+        monkeypatch.setattr(accounts, "live_cred", lambda: live_pair)
         monkeypatch.setattr(
-            ccx, "save_mode", lambda mode, label: calls["save_mode"].append((mode, label))
+            accounts, "save_mode", lambda mode, label: calls["save_mode"].append((mode, label))
         )
         monkeypatch.setattr(
-            ccx, "apply_account", lambda label, blobs: calls["apply"].append(label) or True
+            accounts, "apply_account", lambda label, blobs: calls["apply"].append(label) or True
         )
-        return ccx.route_once(80.0), calls
+        return accounts.route_once(80.0), calls
 
     def test_keychain_login_blob_moves_the_pin(self, monkeypatch):
         line, calls = self._run(monkeypatch, (self.LOGIN_BLOB, "keychain"))
@@ -845,85 +845,85 @@ class TestRouteOnceAdoptsLogin:
 
 class TestLoadModeFable:
     def test_fable_round_trips(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(ccx, "MODE_PATH", tmp_path / "mode.json")
-        ccx.save_mode("fable", None)
-        assert ccx.load_mode() == {"mode": "fable", "label": None}
+        monkeypatch.setattr(accounts, "MODE_PATH", tmp_path / "mode.json")
+        accounts.save_mode("fable", None)
+        assert accounts.load_mode() == {"mode": "fable", "label": None}
 
     def test_unknown_mode_defaults_to_auto(self, tmp_path, monkeypatch):
         p = tmp_path / "mode.json"
         p.write_text(json.dumps({"mode": "bogus", "label": None}))
-        monkeypatch.setattr(ccx, "MODE_PATH", p)
-        assert ccx.load_mode() == {"mode": "auto", "label": None}
+        monkeypatch.setattr(accounts, "MODE_PATH", p)
+        assert accounts.load_mode() == {"mode": "auto", "label": None}
 
 
 class TestFableEligible:
     def test_both_under_cap(self):
-        assert ccx.fable_eligible(30.0, 40.0) is True
+        assert accounts.fable_eligible(30.0, 40.0) is True
 
     def test_boundary_just_under_cap(self):
-        assert ccx.fable_eligible(94.0, 94.0) is True
+        assert accounts.fable_eligible(94.0, 94.0) is True
 
     def test_fable_none_ineligible(self):
-        assert ccx.fable_eligible(10.0, None) is False
+        assert accounts.fable_eligible(10.0, None) is False
 
     def test_fable_at_cap_ineligible(self):
-        assert ccx.fable_eligible(10.0, 95.0) is False  # cap is exclusive
+        assert accounts.fable_eligible(10.0, 95.0) is False  # cap is exclusive
 
     def test_fable_over_cap_ineligible(self):
-        assert ccx.fable_eligible(10.0, 100.0) is False
+        assert accounts.fable_eligible(10.0, 100.0) is False
 
     def test_five_hour_none_ineligible(self):
-        assert ccx.fable_eligible(None, 10.0) is False
+        assert accounts.fable_eligible(None, 10.0) is False
 
     def test_five_hour_at_cap_ineligible(self):
-        assert ccx.fable_eligible(95.0, 10.0) is False  # 5h floor
+        assert accounts.fable_eligible(95.0, 10.0) is False  # 5h floor
 
     def test_fable_headroom_useless_when_5h_capped(self):
         # 0% fable used but 5h maxed → nothing can run → not usable for fable
-        assert ccx.fable_eligible(100.0, 0.0) is False
+        assert accounts.fable_eligible(100.0, 0.0) is False
 
 
 class TestRoutePickFable:
     def test_lowest_fable_eligible_wins(self):
-        rows = [ccx_row("A", 10.0, active=True, fable=5.0),
-                ccx_row("gmail", 10.0, fable=80.0),
-                ccx_row("ymail", 10.0, fable=20.0)]
-        assert ccx.route_pick_fable(rows, set()) == "ymail"
+        rows = [accounts_row("A", 10.0, active=True, fable=5.0),
+                accounts_row("gmail", 10.0, fable=80.0),
+                accounts_row("ymail", 10.0, fable=20.0)]
+        assert accounts.route_pick_fable(rows, set()) == "ymail"
 
     def test_skips_active_and_expired_even_if_lower_fable(self):
-        rows = [ccx_row("A", 10.0, active=True, fable=1.0),        # lowest but active
-                ccx_row("dead", 10.0, fable=2.0, expired=True),    # 2nd but expired
-                ccx_row("gmail", 10.0, fable=40.0)]
-        assert ccx.route_pick_fable(rows, set()) == "gmail"
+        rows = [accounts_row("A", 10.0, active=True, fable=1.0),        # lowest but active
+                accounts_row("dead", 10.0, fable=2.0, expired=True),    # 2nd but expired
+                accounts_row("gmail", 10.0, fable=40.0)]
+        assert accounts.route_pick_fable(rows, set()) == "gmail"
 
     def test_five_hour_floor_excludes(self):
         # B has 0% fable but 100% 5h → unusable; only C qualifies
-        rows = [ccx_row("A", 10.0, active=True, fable=90.0),
-                ccx_row("B", 100.0, fable=0.0),
-                ccx_row("C", 50.0, fable=40.0)]
-        assert ccx.route_pick_fable(rows, set()) == "C"
+        rows = [accounts_row("A", 10.0, active=True, fable=90.0),
+                accounts_row("B", 100.0, fable=0.0),
+                accounts_row("C", 50.0, fable=40.0)]
+        assert accounts.route_pick_fable(rows, set()) == "C"
 
     def test_none_when_all_fable_capped(self):
-        rows = [ccx_row("A", 10.0, active=True, fable=10.0),
-                ccx_row("B", 10.0, fable=100.0),
-                ccx_row("C", 10.0, fable=96.0)]
-        assert ccx.route_pick_fable(rows, set()) is None
+        rows = [accounts_row("A", 10.0, active=True, fable=10.0),
+                accounts_row("B", 10.0, fable=100.0),
+                accounts_row("C", 10.0, fable=96.0)]
+        assert accounts.route_pick_fable(rows, set()) is None
 
     def test_none_when_all_5h_capped(self):
-        rows = [ccx_row("A", 10.0, active=True, fable=10.0),
-                ccx_row("B", 99.0, fable=10.0)]
-        assert ccx.route_pick_fable(rows, set()) is None
+        rows = [accounts_row("A", 10.0, active=True, fable=10.0),
+                accounts_row("B", 99.0, fable=10.0)]
+        assert accounts.route_pick_fable(rows, set()) is None
 
     def test_respects_excludes(self):
-        rows = [ccx_row("A", 10.0, active=True, fable=90.0),
-                ccx_row("gmail", 10.0, fable=20.0),
-                ccx_row("ymail", 10.0, fable=30.0)]
-        assert ccx.route_pick_fable(rows, {"gmail"}) == "ymail"
+        rows = [accounts_row("A", 10.0, active=True, fable=90.0),
+                accounts_row("gmail", 10.0, fable=20.0),
+                accounts_row("ymail", 10.0, fable=30.0)]
+        assert accounts.route_pick_fable(rows, {"gmail"}) == "ymail"
 
     def test_fable_none_rows_skipped(self):
-        rows = [ccx_row("A", 10.0, active=True, fable=10.0),
-                ccx_row("B", 10.0, fable=None)]
-        assert ccx.route_pick_fable(rows, set()) is None
+        rows = [accounts_row("A", 10.0, active=True, fable=10.0),
+                accounts_row("B", 10.0, fable=None)]
+        assert accounts.route_pick_fable(rows, set()) is None
 
 
 class TestPickEnvFable:
@@ -938,18 +938,18 @@ class TestPickEnvFable:
         rows = [_route_row("gmail", 10.0, fable=80.0),
                 _route_row("brown", 50.0, fable=10.0),
                 _route_row("ymail", 20.0, fable=40.0)]
-        assert [r["label"] for r in ccx._fable_first(rows)] == ["brown", "ymail", "gmail"]
+        assert [r["label"] for r in accounts._fable_first(rows)] == ["brown", "ymail", "gmail"]
 
     def test_prefers_fable_over_headroom(self):
         # gmail is best 5h (5) but fable-capped; brown worse 5h (50) but fable @10.
         rows = [_route_row("gmail", 5.0, fable=100.0), _route_row("brown", 50.0, fable=10.0)]
-        picked = ccx.pick_route(ccx._fable_first(rows), self.VAULT, set(), self.NOW, None)
+        picked = accounts.pick_route(accounts._fable_first(rows), self.VAULT, set(), self.NOW, None)
         assert picked == ("brown", "sk-brown")
 
     def test_falls_back_to_headroom_when_none_eligible(self):
         # all fable-capped → _fable_first keeps headroom order → best 5h (gmail) wins
         rows = [_route_row("gmail", 5.0, fable=100.0), _route_row("brown", 50.0, fable=100.0)]
-        picked = ccx.pick_route(ccx._fable_first(rows), self.VAULT, set(), self.NOW, None)
+        picked = accounts.pick_route(accounts._fable_first(rows), self.VAULT, set(), self.NOW, None)
         assert picked == ("gmail", "sk-gmail")
 
     def test_skips_eligible_without_token(self):
@@ -957,5 +957,5 @@ class TestPickEnvFable:
         # eligible tokened account (ymail).
         vault = {"tokens": {"ymail": {"token": "sk-ymail", "expires_at": self.NOW + 1000}}}
         rows = [_route_row("brown", 20.0, fable=10.0), _route_row("ymail", 30.0, fable=40.0)]
-        picked = ccx.pick_route(ccx._fable_first(rows), vault, set(), self.NOW, None)
+        picked = accounts.pick_route(accounts._fable_first(rows), vault, set(), self.NOW, None)
         assert picked == ("ymail", "sk-ymail")
