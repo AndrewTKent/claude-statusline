@@ -83,6 +83,5 @@ fi
 # ── Done ───────────────────────────────────────────────
 printf "\n${green}Done!${reset} Restart Claude Code to see the status line.\n"
 printf "\nConfigure: edit ${dim}~/.claude/statusline.conf${reset}\n"
-printf "  ${dim}HOURLY_RATE=150${reset}    # enables cost tracking\n"
 printf "  ${dim}DAILY_BUDGET=20${reset}    # enables budget bar\n"
 printf "  ${dim}FORMAT=sigil${reset}       # single-line compact mode\n"
