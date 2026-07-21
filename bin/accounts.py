@@ -1494,9 +1494,10 @@ def cmd_status(_args) -> None:
     for r in rows:
         mark = "*" if r["active"] else " "
         pct = "—" if r["five_hour"] is None else f"{r['five_hour']:.0f}%"
+        spct = "—" if r["seven_day"] is None else f"{r['seven_day']:.0f}%"
         fpct = "—" if r["fable"] is None else f"{r['fable']:.0f}%"
         flag = "  ⚠login" if r["expired"] else ""
-        print(f" {mark} {r['label']:<12} 5h {pct:>5}  fable {fpct:>5}{flag}")
+        print(f" {mark} {r['label']:<12} 5h {pct:>5}  7d {spct:>5}  fable {fpct:>5}{flag}")
 
 
 def cmd_migrate(_args) -> None:
