@@ -296,11 +296,7 @@ enrollment step.
 | `accounts pick-env` | Emit env exports for the best routable account (wrapper hook) |
 
 A fresh `/login` always wins: the daemon adopts the account you just logged into
-instead of switching away from it. In AUTO mode, routing also weighs per-model
-(fable) capacity automatically while the live account is actually spending it —
-`CCX_FABLE_AWARE=0` in the conf turns that off, and the thresholds
-(`CCX_ROUTE_AT`, `CCX_ROUTE_HYSTERESIS`, `CCX_ROUTE_CAP`, `CCX_ROUTE_DWELL_S`,
-`CCX_FABLE_AT`) are tunable in `statusline.conf`.
+instead of switching away from it.
 
 Routing never adds to or modifies the Keychain's live `Claude Code-credentials` slot — every switch is a plain file write to `~/.claude/.credentials.json`, followed by a delete of the keychain slot so Claude Code's own ~30s re-read lands on the file. Minted long-lived tokens live outside `~/.claude` (`~/.ccx/vault.json`), since the nightly transcript-archival chain mirrors `~/.claude` in plaintext.
 
