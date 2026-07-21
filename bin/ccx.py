@@ -505,7 +505,16 @@ def effective_pcts(row: dict, now: datetime) -> dict:
             return None
         reset = parse_iso(row.get(reset_key))
         if reset is not None and now >= reset:
-            return 0.0
+            # A passed reset means the window is empty ONLY if we polled after
+            # it. A stale row (access token lapsed, so the poller skipped it and
+            # never advanced this reset) must NOT read as replenished — that
+            # showed false headroom and stranded switches onto spent accounts.
+            last_seen = row.get("last_seen")
+            if last_seen is not None:
+                seen = datetime.fromtimestamp(last_seen, tz=timezone.utc)
+                if seen >= reset:
+                    return 0.0
+            return float(pct)
         return float(pct)
 
     return {
