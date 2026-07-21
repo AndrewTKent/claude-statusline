@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Live account-headroom board. Re-renders on its own timer, independent of
+# Claude Code's statusline invocation — the route daemon keeps
+# ~/.claude/account-resets.json fresh (~30s), this just reads it on a loop.
+# Usage: accounts-watch [interval_seconds]   (default 5)
+set -euo pipefail
+
+INTERVAL="${1:-5}"
+CCX="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ccx.py"
+
+cleanup() { tput cnorm 2>/dev/null || true; printf '\n'; }
+trap cleanup EXIT INT TERM
+tput civis 2>/dev/null || true  # hide cursor while looping
+
+while true; do
+    board="$(python3 "$CCX" ls 2>/dev/null || python3 "$CCX" status 2>/dev/null || echo 'board unavailable')"
+    printf '\033[H\033[2J'  # home + clear
+    printf 'accounts — live board (every %ss, Ctrl-C to quit)   %s\n\n' \
+        "$INTERVAL" "$(date '+%-I:%M:%S%p' | tr 'APM' 'apm')"
+    printf '%s\n' "$board"
+    sleep "$INTERVAL"
+done
