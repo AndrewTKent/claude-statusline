@@ -784,10 +784,26 @@ def route_rows(blobs: dict, active_label: str | None, now_ts: float) -> list[dic
     return rows
 
 
+def _rate_eligible(five_hour: float | None, seven_day: float | None) -> bool:
+    """Usable for general work: headroom on BOTH rate windows. A maxed weekly
+    blocks requests as hard as a maxed 5h, so an escape target must clear both
+    or the switch just re-walls you (and, escaping onto the other axis's wall,
+    ping-pongs). None on either axis is unknown → ineligible."""
+    return (
+        five_hour is not None
+        and five_hour < ROUTE_CAP_PCT
+        and seven_day is not None
+        and seven_day < ROUTE_CAP_PCT
+    )
+
+
 def route_pick(rows: list[dict], excludes: set[str]) -> str | None:
-    """Best switchable account: lowest 5h, not active, not excluded, cred live."""
+    """Best switchable account: freshest 5h among rate-eligible (both windows
+    below cap), not active, not excluded, cred live."""
     for r in rows:
         if r["active"] or r["expired"] or r["label"] in excludes:
+            continue
+        if not _rate_eligible(r["five_hour"], r["seven_day"]):
             continue
         return r["label"]
     return None
@@ -1053,31 +1069,40 @@ def _auto_switch(
     fable-mode fallback. Caller holds the lock."""
     global _last_switch_ts
     cur = by_label.get(active) if active else None
-    if cur is None or cur["five_hour"] is None or cur["five_hour"] < threshold:
+    if cur is None:
+        return None
+    cur_5h = cur["five_hour"]
+    cur_7d = cur["seven_day"]
+    # Walled = past the 5h soft threshold OR near the weekly hard cap. Weekly
+    # exhaustion blocks the session as hard as 5h but is a separate axis; the
+    # old trigger watched only 5h, so a maxed weekly stranded the live session
+    # with no rescue.
+    past_5h = cur_5h is not None and cur_5h >= threshold
+    weekly_walled = cur_7d is not None and cur_7d >= ROUTE_CAP_PCT
+    if not (past_5h or weekly_walled):
         return None
     pick = route_pick(rows, excludes)
     if pick is None:
+        # No rate-viable account anywhere (every candidate walled on some axis).
+        # Hold — never thrash between two dead accounts.
         return None
-    cur_pct = cur["five_hour"]
-    pick_pct = by_label[pick]["five_hour"]
-    if pick_pct is None:  # no board row for the pick: never switch (also no log crash)
-        return None
-    if cur_pct >= ROUTE_CAP_PCT:
-        # Live account is ~capped. Only worth escaping to one with real headroom
-        # (below the cap); if every account is capped there's nothing better, so
-        # hold — never thrash between two dead accounts (that was the flap).
-        if pick_pct >= ROUTE_CAP_PCT:
+    # Soft case: 5h merely past threshold, both windows still usable → only move
+    # for a MEANINGFULLY fresher account (no near-tie churn). A hard wall on
+    # either axis (capped 5h, or weekly walled) skips the hysteresis: the live
+    # account can't serve requests at all, so escape regardless of the margin.
+    cur_capped = (cur_5h is not None and cur_5h >= ROUTE_CAP_PCT) or weekly_walled
+    if not cur_capped:
+        pick_5h = by_label[pick]["five_hour"]
+        if pick_5h is None or cur_5h is None or pick_5h >= cur_5h - ROUTE_HYSTERESIS_PCT:
             return None
-    elif pick_pct >= cur_pct - ROUTE_HYSTERESIS_PCT:
-        # Not capped: hold unless a MEANINGFULLY fresher account exists.
-        return None
     # Each switch cold-starts the new account's prompt cache, so cap the rate at
     # one per dwell regardless of how the board drifts under usage feedback.
     if _last_switch_ts is not None and time.monotonic() - _last_switch_ts < ROUTE_MIN_DWELL_S:
         return None
     if apply_account(pick, blobs):
         _last_switch_ts = time.monotonic()
-        return f"ROUTED {active} → {pick} (5h {cur_pct:.0f}% → {pick_pct:.0f}%)"
+        reason = "weekly" if weekly_walled else "5h"
+        return f"ROUTED {active} → {pick} ({reason} wall)"
     return None
 
 

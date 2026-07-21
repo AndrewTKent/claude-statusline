@@ -220,6 +220,24 @@ class TestRouterCore:
         rows = [accounts_row("a", 5.0, expired=True), accounts_row("b", 6.0, active=True)]
         assert accounts.route_pick(rows, set()) is None
 
+    def test_route_pick_skips_weekly_walled(self):
+        # gmail is freshest on 5h but weekly-dead (7d>=cap); must skip to ymail.
+        rows = [accounts_row("gmail", 0.0, seven_day=100.0),
+                accounts_row("ymail", 30.0, seven_day=50.0)]
+        assert accounts.route_pick(rows, set()) == "ymail"
+
+    def test_route_pick_none_when_all_weekly_walled(self):
+        rows = [accounts_row("gmail", 0.0, seven_day=100.0),
+                accounts_row("poynting", 0.0, seven_day=100.0)]
+        assert accounts.route_pick(rows, set()) is None
+
+    def test_rate_eligible_needs_both_windows(self):
+        assert accounts._rate_eligible(50.0, 50.0) is True
+        assert accounts._rate_eligible(96.0, 50.0) is False   # 5h capped
+        assert accounts._rate_eligible(50.0, 96.0) is False   # weekly capped
+        assert accounts._rate_eligible(None, 50.0) is False   # unknown 5h
+        assert accounts._rate_eligible(50.0, None) is False   # unknown weekly
+
 
 def accounts_row(label, five_hour, expired=False, active=False, fable=0.0, seven_day=0.0):
     return {"label": label, "email": f"{label}@x", "five_hour": five_hour,
@@ -378,6 +396,55 @@ class TestRouteDecision:
                    {"accounts": {"B": {"blob": "BLOB-B"}}})
         assert accounts.route_once(80.0) is None
         assert not accounts.CRED_FILE.exists()
+
+    def test_auto_switches_on_weekly_wall_below_5h_threshold(self, tmp_path, monkeypatch):
+        # The real-world miss: live account weekly-walled (7d 97) while 5h (71)
+        # is BELOW the switch threshold. Old trigger watched only 5h -> stranded.
+        rows = [accounts_row("A", 71.0, active=True, seven_day=97.0),
+                accounts_row("B", 30.0, seven_day=50.0)]
+        self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "auto"},
+                   {"accounts": {"B": {"blob": "BLOB-B"}}})
+        line = accounts.route_once(80.0)
+        assert line and "ROUTED A → B" in line and "weekly wall" in line
+        assert accounts.CRED_FILE.read_text() == "BLOB-B"
+
+    def test_auto_weekly_wall_holds_when_no_rate_eligible(self, tmp_path, monkeypatch):
+        # Weekly-walled live account, only alternative is ALSO weekly-dead -> hold.
+        rows = [accounts_row("A", 71.0, active=True, seven_day=97.0),
+                accounts_row("B", 0.0, seven_day=100.0)]
+        self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "auto"},
+                   {"accounts": {"B": {"blob": "BLOB-B"}}})
+        assert accounts.route_once(80.0) is None
+        assert not accounts.CRED_FILE.exists()
+
+    def test_5h_wall_skips_weekly_dead_pick(self, tmp_path, monkeypatch):
+        # Live 5h-walled; freshest-5h candidate is weekly-dead. Old route_pick
+        # took it (re-walling you); fixed pick skips to the rate-eligible one.
+        rows = [accounts_row("A", 90.0, active=True, seven_day=40.0),
+                accounts_row("B", 0.0, seven_day=100.0),   # freshest 5h, weekly dead
+                accounts_row("C", 20.0, seven_day=40.0)]   # rate-eligible
+        self._wire(tmp_path, monkeypatch, rows, "A", {"mode": "auto"},
+                   {"accounts": {"B": {"blob": "BLOB-B"}, "C": {"blob": "BLOB-C"}}})
+        line = accounts.route_once(80.0)
+        assert line and "ROUTED A → C" in line
+        assert accounts.CRED_FILE.read_text() == "BLOB-C"
+
+    def test_no_cross_metric_pingpong(self, tmp_path, monkeypatch):
+        # The thrash counterexample: A weekly-walled/5h-fresh, B 5h-walled/
+        # weekly-fresh. Tick 1 (A live) escapes to B. Tick 2 (B live) must HOLD
+        # (A is weekly-dead, not rate-eligible) -> no ping-pong across dwell.
+        rows1 = [accounts_row("A", 10.0, active=True, seven_day=97.0),
+                 accounts_row("B", 90.0, seven_day=50.0)]
+        self._wire(tmp_path, monkeypatch, rows1, "A", {"mode": "auto"},
+                   {"accounts": {"B": {"blob": "BLOB-B"}}})
+        line1 = accounts.route_once(80.0)
+        assert line1 and "ROUTED A → B" in line1  # A weekly-walled -> escape to B
+
+        rows2 = [accounts_row("A", 10.0, seven_day=97.0),
+                 accounts_row("B", 90.0, active=True, seven_day=50.0)]
+        self._wire(tmp_path, monkeypatch, rows2, "B", {"mode": "auto"},
+                   {"accounts": {"A": {"blob": "BLOB-A"}}})
+        assert accounts.route_once(80.0) is None  # B 5h-walled but A ineligible -> HOLD
 
     def test_set_holds_when_live_present_but_unattributed(self, tmp_path, monkeypatch):
         # CRED_FILE present, capture returns None (profile down) -> a cc-rotated
