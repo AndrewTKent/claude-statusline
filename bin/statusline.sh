@@ -115,6 +115,34 @@ secs_since_last_user() {
     echo $(( $(date +%s) - ts_epoch ))
 }
 
+# Live topic for the tab title: the freshest substantive user message in this
+# session's transcript. Claude Code's own session_name is generated once at
+# session start and never refreshed, so a long session's title goes stale.
+session_topic() {
+    local sid="$1" cwd="$2"
+    [ -z "$sid" ] || [ -z "$cwd" ] && return
+    local project_dir session_file cache
+    project_dir=$(echo "$cwd" | tr '/' '-')
+    session_file="$HOME/.claude/projects/${project_dir}/${sid}.jsonl"
+    [ -f "$session_file" ] || return
+    cache="/tmp/claude/statusline-topic-${sid}.txt"
+    if [ -f "$cache" ] && [ "$cache" -nt "$session_file" ]; then
+        cat "$cache"
+        return
+    fi
+    local topic
+    topic=$(tail -n 300 "$session_file" 2>/dev/null | grep '"type":"user"' | jq -r '
+        (.message.content // empty)
+        | if type == "string" then .
+          else ([.[]? | select(.type == "text") | .text] | join(" ")) end
+    ' 2>/dev/null | awk '
+        { gsub(/[[:space:]]+/, " "); sub(/^ /, ""); sub(/ $/, "") }
+        length($0) >= 18 && substr($0,1,1) != "<" && substr($0,1,1) != "[" { last = $0 }
+        END { if (last != "") { if (length(last) > 48) last = substr(last, 1, 47) "…"; print last } }
+    ')
+    [ -n "$topic" ] && printf '%s' "$topic" > "$cache" && printf '%s\n' "$topic"
+}
+
 #   PCT        integer 0..100
 #   DIRECTION  "high-bad" (default) — green low, red at 90+: usage, context, rate
 #              "low-bad"             — green high, red at 10-: remaining, headroom
@@ -2668,6 +2696,8 @@ FORMAT="${STATUSLINE_FORMAT:-${FORMAT:-default}}"
 # ── Set terminal tab title ────────────────────────────────
 TAB_TITLE="${DIR_NAME}"
 [ -n "$BRANCH" ] && [ "$BRANCH" != "main" ] && [ "$BRANCH" != "master" ] && TAB_TITLE="${DIR_NAME} (${SHORT_BRANCH})"
+SESSION_TOPIC=$(session_topic "$SESSION_ID" "$CWD")
+[ -n "$SESSION_TOPIC" ] && TAB_TITLE="${SESSION_TOPIC} — ${TAB_TITLE}"
 printf '\033]0;%s\007' "$TAB_TITLE"
 
 case "$FORMAT" in
