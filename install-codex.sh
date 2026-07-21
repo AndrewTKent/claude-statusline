@@ -48,3 +48,4 @@ case ":$PATH:" in
     *":$BIN_DIR:"*) printf "Run: codex-statusline\n" ;;
     *) printf "Run: %s/codex-statusline (add %s to PATH for the short command)\n" "$BIN_DIR" "$BIN_DIR" ;;
 esac
+printf "uninstall: ./uninstall-codex.sh\n"
