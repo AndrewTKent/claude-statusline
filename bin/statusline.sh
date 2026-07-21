@@ -121,6 +121,21 @@ secs_since_last_user() {
 session_topic() {
     local sid="$1" cwd="$2"
     [ -z "$sid" ] || [ -z "$cwd" ] && return
+    # A /retitle pin (keyed by TTY, written by set-tab-title.sh) outranks the
+    # derived topic so both title mechanisms agree.
+    local tpid=$$ ttty
+    for _ in 1 2 3 4; do
+        ttty=$(ps -o tty= -p "$tpid" 2>/dev/null | tr -d ' ')
+        if [ -n "$ttty" ] && [ "$ttty" != "??" ]; then
+            if [ -f "/tmp/claude/tab-title-pin-${ttty}.txt" ]; then
+                cat "/tmp/claude/tab-title-pin-${ttty}.txt"
+                return
+            fi
+            break
+        fi
+        tpid=$(ps -o ppid= -p "$tpid" 2>/dev/null | tr -d ' ')
+        [ -z "$tpid" ] || [ "$tpid" = "0" ] || [ "$tpid" = "1" ] && break
+    done
     local project_dir session_file cache
     project_dir=$(echo "$cwd" | tr '/' '-')
     session_file="$HOME/.claude/projects/${project_dir}/${sid}.jsonl"
