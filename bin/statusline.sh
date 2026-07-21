@@ -930,7 +930,7 @@ get_oauth_token() {
 
     # Keychain first, file fallback — mirrors cc's own credential store
     # ('keychain-with-plaintext-fallback'): the slot wins whenever it exists;
-    # a accounts route deletes the slot, so both readers fall through to the file
+    # an accounts route deletes the slot, so both readers fall through to the file
     # together and the board always shows the account cc is actually using.
     if command -v security >/dev/null 2>&1; then
         local blob

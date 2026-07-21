@@ -6,14 +6,14 @@
 set -euo pipefail
 
 INTERVAL="${1:-5}"
-CCX="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ccx.py"
+ACCOUNTS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/accounts.py"
 
 cleanup() { tput cnorm 2>/dev/null || true; printf '\n'; }
 trap cleanup EXIT INT TERM
 tput civis 2>/dev/null || true  # hide cursor while looping
 
 while true; do
-    board="$(python3 "$CCX" ls 2>/dev/null || python3 "$CCX" status 2>/dev/null || echo 'board unavailable')"
+    board="$(python3 "$ACCOUNTS" ls 2>/dev/null || python3 "$ACCOUNTS" status 2>/dev/null || echo 'board unavailable')"
     printf '\033[H\033[2J'  # home + clear
     printf 'accounts — live board (every %ss, Ctrl-C to quit)   %s\n\n' \
         "$INTERVAL" "$(date '+%-I:%M:%S%p' | tr 'APM' 'apm')"
