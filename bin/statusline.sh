@@ -1542,8 +1542,10 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
         if [ -f "$ccx_blobs" ]; then
             CCX_EXPIRED_LOOKUP=$(jq -r --argjson now "$now_ar" '
                 (.accounts // {}) | to_entries[] | .value |
-                (try ((.blob | fromjson).claudeAiOauth.refreshTokenExpiresAt) catch null) as $exp |
-                select($exp != null and ($exp / 1000) <= $now) |
+                (try ((.blob | fromjson).claudeAiOauth) catch null) as $oauth |
+                (($oauth.refreshTokenExpiresAt) // null) as $exp |
+                select($oauth == null or ($oauth.refreshToken // null) == null
+                       or ($exp != null and ($exp / 1000) <= $now)) |
                 "\(.email)|\(.org_uuid)"' "$ccx_blobs" 2>/dev/null)
         fi
         entries=$(jq -r --argjson now "$now_ar" '
@@ -1735,7 +1737,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 exp_suffix=""
                 if [ -n "$CCX_EXPIRED_LOOKUP" ] && \
                    printf '%s\n' "$CCX_EXPIRED_LOOKUP" | grep -qxF "${em}|${uuid}"; then
-                    exp_suffix=" ${red}⚠login${reset}"
+                    exp_suffix=" ${red}⚠ needs reauth${reset}"
                 fi
 
                 # ── Per-account row (new stacked layout) ──
@@ -1859,6 +1861,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 [ "$has_wall" = "1" ] && score=0
                 # Weekly-capped accounts are bricks regardless of 5h headroom.
                 [ "${weekly_int:-0}" -ge 100 ] 2>/dev/null && score=0
+                [ -n "$exp_suffix" ] && score=0
 
                 # Track best non-current account for the "✓ use now" marker.
                 if [ "$is_current" = "0" ] && [ "$score" -gt "${_best_score:-0}" ]; then
@@ -1907,7 +1910,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 # Weekly-capped accounts are unusable regardless of 5h state — dim the name.
                 name_color="$white"
                 [ "$weekly_int" -ge 100 ] 2>/dev/null && name_color="$dim"
-                row_line="${marker}${name_color}$(_pad_to_cols "$display_name" 9)${reset} ${pct_color}$(_ralign "$pct_raw" 4)${reset}  ${dim}$(_ralign "$five_reset_rel" 6)${reset}   ${weekly_seg}   ${fable_seg}  ${dim}$(_ralign "$wk_reset_rel" 6)${reset}"
+                row_line="${marker}${name_color}$(_pad_to_cols "$display_name" 9)${reset} ${pct_color}$(_ralign "$pct_raw" 4)${reset}  ${dim}$(_ralign "$five_reset_rel" 6)${reset}   ${weekly_seg}   ${fable_seg}  ${dim}$(_ralign "$wk_reset_rel" 6)${reset}${exp_suffix}"
                 # Annotate with hard-wall warning when applicable. (Windfall
                 # is implicit from the hrs_col — no extra note needed.)
                 if [ "$has_wall" = "1" ]; then
@@ -1924,7 +1927,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 row_em="${r%%:*}"
                 row_body="${r#*:}"
                 if [ -n "${_best_em:-}" ] && [ "$row_em" = "$_best_em" ] && [ "${five_hour_pct:-0}" -ge 70 ] 2>/dev/null; then
-                    row_body+="   ${green}✓ best next ~2h${reset}"
+                    row_body+="   ${green}✓ best next${reset}"
                 fi
                 # Prefix with the marker (already 2 cols) — no extra leading
                 # whitespace. Claude Code's status panel strips leading spaces
