@@ -66,6 +66,7 @@
 
 # ─── Row visibility toggles ────────────────────────────────────────────────
 # Each row is shown by default when its data is available. Set to 0 to hide.
+# SHOW_FABLE_ROW=1        # per-model weekly cap row (auto-shows when the account has one)
 # SHOW_TOKENS_ROW=1     # all-time work/personal token ratio bar
 # SHOW_CHALLENGE_ROW=1  # progress toward CHALLENGE_GOAL_M
 # SHOW_BOUNTY_ROW=1     # bounty ETA / cleared marker
