@@ -18,6 +18,21 @@ jobs:
           additional_files: install.sh uninstall.sh install-codex.sh
           severity: error
 
+  test-claude:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pytest
+        run: python3 -m pip install pytest
+      - name: Claude-side tests (ccx + scan-tokens)
+        run: python3 -m pytest test/test_ccx.py test/test_scan_tokens.py -q
+
   test:
     runs-on: ${{ matrix.os }}
     strategy:
