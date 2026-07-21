@@ -1890,7 +1890,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     five_reset_rel="—"
                 fi
 
-                # Weekly reset, relative only ("6d" / "12h" / "45m").
+                # Weekly reset, relative ("6d" / "12h30m" / "45m").
                 # `seven_day_iso` is the API's seven_day.resets_at via the ledger.
                 if [ -n "$seven_day_iso" ] && [ "$seven_day_iso" != "null" ]; then
                     seven_day_ep=$(iso_to_epoch "$seven_day_iso")
@@ -1901,7 +1901,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                         elif [ "$_delta" -lt 3600 ]; then
                             wk_reset_rel="$(( _delta / 60 ))m"
                         elif [ "$_delta" -lt 86400 ]; then
-                            wk_reset_rel="$(( _delta / 3600 ))h"
+                            wk_reset_rel="$(( _delta / 3600 ))h$(( (_delta % 3600) / 60 ))m"
                         else
                             wk_reset_rel="$(( _delta / 86400 ))d"
                         fi
