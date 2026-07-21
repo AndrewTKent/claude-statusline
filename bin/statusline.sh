@@ -930,7 +930,7 @@ get_oauth_token() {
 
     # Keychain first, file fallback — mirrors cc's own credential store
     # ('keychain-with-plaintext-fallback'): the slot wins whenever it exists;
-    # a ccx route deletes the slot, so both readers fall through to the file
+    # an accounts route deletes the slot, so both readers fall through to the file
     # together and the board always shows the account cc is actually using.
     if command -v security >/dev/null 2>&1; then
         local blob
@@ -1533,20 +1533,20 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
         # Legacy entries (bare email key, no .value.email) fall back to
         # splitting the key on "|".
         now_ar=$(date +%s)
-        # ccx blobs: which accounts have a dead refresh token (switching to them
+        # accounts blobs: which accounts have a dead refresh token (switching to them
         # needs a fresh /login). blobs.json is the router's live source of truth;
         # refresh expiry lives inside each blob (epoch-ms). Keyed email|org to
         # match the ledger rows below.
-        ccx_blobs="$HOME/.ccx/blobs.json"
-        CCX_EXPIRED_LOOKUP=""
-        if [ -f "$ccx_blobs" ]; then
-            CCX_EXPIRED_LOOKUP=$(jq -r --argjson now "$now_ar" '
+        accounts_blobs="$HOME/.accounts/blobs.json"
+        ACCOUNTS_EXPIRED_LOOKUP=""
+        if [ -f "$accounts_blobs" ]; then
+            ACCOUNTS_EXPIRED_LOOKUP=$(jq -r --argjson now "$now_ar" '
                 (.accounts // {}) | to_entries[] | .value |
                 (try ((.blob | fromjson).claudeAiOauth) catch null) as $oauth |
                 (($oauth.refreshTokenExpiresAt) // null) as $exp |
                 select($oauth == null or ($oauth.refreshToken // null) == null
                        or ($exp != null and ($exp / 1000) <= $now)) |
-                "\(.email)|\(.org_uuid)"' "$ccx_blobs" 2>/dev/null)
+                "\(.email)|\(.org_uuid)"' "$accounts_blobs" 2>/dev/null)
         fi
         entries=$(jq -r --argjson now "$now_ar" '
             to_entries[] |
@@ -1733,10 +1733,10 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     fi
                 fi
 
-                # ccx: flag a dead vaulted refresh token (needs /login to use).
+                # accounts: flag a dead vaulted refresh token (needs /login to use).
                 exp_suffix=""
-                if [ -n "$CCX_EXPIRED_LOOKUP" ] && \
-                   printf '%s\n' "$CCX_EXPIRED_LOOKUP" | grep -qxF "${em}|${uuid}"; then
+                if [ -n "$ACCOUNTS_EXPIRED_LOOKUP" ] && \
+                   printf '%s\n' "$ACCOUNTS_EXPIRED_LOOKUP" | grep -qxF "${em}|${uuid}"; then
                     exp_suffix=" ${red}⚠ needs reauth${reset}"
                 fi
 
