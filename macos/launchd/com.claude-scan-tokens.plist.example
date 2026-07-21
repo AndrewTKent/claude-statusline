@@ -19,7 +19,7 @@
         <string>/bin/bash</string>
         <string>-c</string>
         <!-- Edit path to point at your checkout. -->
-        <string>set -a; [ -f "$HOME/.claude/statusline.conf" ] &amp;&amp; source "$HOME/.claude/statusline.conf"; set +a; exec /opt/homebrew/bin/python3 "/PATH/TO/claude-statusline/bin/scan-tokens.py" --quiet</string>
+        <string>set -a; [ -f "$HOME/.claude/statusline.conf" ] &amp;&amp; source "$HOME/.claude/statusline.conf"; set +a; /opt/homebrew/bin/python3 "/PATH/TO/statusline/bin/scan-tokens.py" --quiet; exec /opt/homebrew/bin/python3 "/PATH/TO/statusline/bin/usage-ledger.py" --quiet</string>
     </array>
     <key>StartInterval</key>
     <integer>60</integer>
