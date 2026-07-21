@@ -1631,15 +1631,12 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 # Display name: friendly title-cased per-tag label, overriding
                 # the lowercase tag used internally for lookups. Fallback
                 # title-cases the tag so config-defined tags ("gmail",
-                # "acme", "acme-max") render cleanly without needing a
+                # "acme") render cleanly without needing a
                 # hardcoded case here.
                 case "$tag" in
-                    work|acme|acme-work) display_name="Acme"     ;;
-                    acme-max)             display_name="Acme-Max" ;;
                     alumni)                display_name="alumni"     ;;
-                    personal)              display_name="Andrew"    ;;
+                    personal|gmail)        display_name="Gmail"     ;;
                     acme)              display_name="Acme"  ;;
-                    gmail)                 display_name="Gmail"     ;;
                     *) display_name="$(tr '[:lower:]' '[:upper:]' <<< "${tag:0:1}")${tag:1}" ;;
                 esac
                 # All account tags render white; only the leading marker
@@ -1759,8 +1756,8 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                             else if (fall) print fp"|"fu"|"fl
                         }')
                 fi
-                # Account tags appear in title-case for display (Acme / alumni
-                # / Andrew) but we still key on the lowercased name for lookups.
+                # Account tags appear in title-case for display (alumni /
+                # Acme) but we still key on the lowercased name for lookups.
                 # Handled in the rendering block below.
                 # extra_int still feeds the hard-wall warning + best-next score
                 # below, even though the visible column now shows weekly util.
