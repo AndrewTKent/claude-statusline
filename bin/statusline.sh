@@ -316,142 +316,89 @@ resolve_account_label() {
     echo "$email"
 }
 
-# ── Reusable ledger function ─────────────────────────────
-# Usage: update_token_ledger <file> <session_id> <value> <today> [acct]
-# Like update_ledger but for non-monotonic values (context window tokens).
-# Accumulates positive deltas: when value grows, adds the increment; when
-# value drops (compaction), adds 0. Stores {last_seen, accumulated} per session.
-# Returns daily total via TOKEN_LEDGER_RESULT and session total via TOKEN_LEDGER_SESSION.
-TOKEN_LEDGER_RESULT=0
-TOKEN_LEDGER_SESSION=0
-update_token_ledger() {
-    local file="$1" sid="$2" value="$3" today="$4" acct="${5:-}"
-
-    if [ -f "$file" ]; then
-        local ledger_date
-        ledger_date=$(jq -r '.date // ""' "$file" 2>/dev/null)
-
-        if [ "$ledger_date" = "$today" ]; then
-            # Single jq call: read last_seen, compute delta, accumulate, write back.
-            if [ -n "$acct" ]; then
-                jq_update "$file" --arg sid "$sid" --argjson val "$value" --arg acct "$acct" '
-                    (.sessions[$sid].last_seen // $val) as $prev |
-                    (if $val > $prev then $val - $prev else 0 end) as $delta |
-                    .sessions[$sid] = ((.sessions[$sid] // {}) + {
-                        "last_seen": $val,
-                        "accumulated": ((.sessions[$sid].accumulated // 0) + $delta),
-                        "acct": $acct
-                    })'
-            else
-                jq_update "$file" --arg sid "$sid" --argjson val "$value" '
-                    (.sessions[$sid].last_seen // $val) as $prev |
-                    (if $val > $prev then $val - $prev else 0 end) as $delta |
-                    .sessions[$sid] = ((.sessions[$sid] // {}) + {
-                        "last_seen": $val,
-                        "accumulated": ((.sessions[$sid].accumulated // 0) + $delta)
-                    })'
-            fi
-            eval "$(jq -r --arg sid "$sid" '
-                "TOKEN_LEDGER_RESULT=" + ([.sessions[] | .accumulated // 0] | add // 0 | tostring),
-                "TOKEN_LEDGER_SESSION=" + (.sessions[$sid].accumulated // 0 | tostring)
-            ' "$file" 2>/dev/null)"
-            [ -z "$TOKEN_LEDGER_RESULT" ] && TOKEN_LEDGER_RESULT=0
-            [ -z "$TOKEN_LEDGER_SESSION" ] && TOKEN_LEDGER_SESSION=0
-        else
-            # New day — reset all sessions
-            if [ -n "$acct" ]; then
-                printf '{"date":"%s","sessions":{"%s":{"last_seen":%s,"accumulated":0,"acct":"%s"}}}' \
-                    "$today" "$sid" "$value" "$acct" > "$file"
-            else
-                printf '{"date":"%s","sessions":{"%s":{"last_seen":%s,"accumulated":0}}}' \
-                    "$today" "$sid" "$value" > "$file"
-            fi
-            TOKEN_LEDGER_RESULT=0
-            TOKEN_LEDGER_SESSION=0
-        fi
-    else
-        # First ever write
-        if [ -n "$acct" ]; then
-            printf '{"date":"%s","sessions":{"%s":{"last_seen":%s,"accumulated":0,"acct":"%s"}}}' \
-                "$today" "$sid" "$value" "$acct" > "$file"
-        else
-            printf '{"date":"%s","sessions":{"%s":{"last_seen":%s,"accumulated":0}}}' \
-                "$today" "$sid" "$value" > "$file"
-        fi
-        TOKEN_LEDGER_RESULT=0
-        TOKEN_LEDGER_SESSION=0
-    fi
-}
-
-# Usage: update_ledger <file> <session_id> <value> <today> [acct]
-# Returns daily delta (sum of all session deltas) via LEDGER_RESULT
-# and this session's delta (current - baseline) via LEDGER_SESSION_DELTA.
-# For monotonic values only (e.g., cost). Use update_token_ledger for tokens.
+# ── Reusable ledger writer ───────────────────────────────
+# Usage: update_ledger <mode> <file> <session_id> <value> <today> [acct]
+#
+# mode=cost:  monotonic values (e.g. cost). Stores {baseline, current} per
+#   session; daily delta (sum of current-baseline) via LEDGER_RESULT, this
+#   session's delta via LEDGER_SESSION_DELTA.
+# mode=token: non-monotonic values (context-window tokens). Accumulates
+#   positive deltas — growth adds the increment, a drop (compaction) adds 0 —
+#   storing {last_seen, accumulated} per session; daily total via
+#   TOKEN_LEDGER_RESULT, session total via TOKEN_LEDGER_SESSION.
 LEDGER_RESULT=0
 LEDGER_SESSION_DELTA=0
+TOKEN_LEDGER_RESULT=0
+TOKEN_LEDGER_SESSION=0
 update_ledger() {
-    local file="$1" sid="$2" value="$3" today="$4" acct="${5:-}"
+    local mode="$1" file="$2" sid="$3" value="$4" today="$5" acct="${6:-}"
 
+    local ledger_date="" has_baseline=""
     if [ -f "$file" ]; then
-        # Single jq call to get date + baseline existence
-        local info
-        info=$(jq -r --arg sid "$sid" '[.date // "", (.sessions[$sid].baseline // empty | tostring)] | join("|")' "$file" 2>/dev/null)
-        local ledger_date="${info%%|*}"
-        local has_baseline="${info#*|}"
-
-        if [ "$ledger_date" = "$today" ]; then
-            if [ -z "$has_baseline" ]; then
-                # First time seeing this session today — seed baseline from existing
-                # current (if any), so delta counts tokens from NOW forward.
-                # Preserves any prior current value already written by another code path.
-                if [ -n "$acct" ]; then
-                    jq_update "$file" --arg sid "$sid" --argjson val "$value" --arg acct "$acct" \
-                        '.sessions[$sid] = ((.sessions[$sid] // {}) + {"baseline": (.sessions[$sid].current // $val), "current": $val, "acct": $acct})'
-                else
-                    jq_update "$file" --arg sid "$sid" --argjson val "$value" \
-                        '.sessions[$sid] = ((.sessions[$sid] // {}) + {"baseline": (.sessions[$sid].current // $val), "current": $val})'
-                fi
-            else
-                if [ -n "$acct" ]; then
-                    jq_update "$file" --arg sid "$sid" --argjson val "$value" --arg acct "$acct" \
-                        '.sessions[$sid].current = $val | .sessions[$sid].acct = $acct'
-                else
-                    jq_update "$file" --arg sid "$sid" --argjson val "$value" \
-                        '.sessions[$sid].current = $val'
-                fi
-            fi
-            # Single jq call emits both totals; saves the follow-up SESSION_DELTA read.
-            # Null-coalesce both .current and .baseline inside the per-session expression
-            # so a stray {current: N} entry without a baseline (legacy ledger rows) doesn't
-            # make jq throw on "number - null" and leave both vars empty.
-            eval "$(jq -r --arg sid "$sid" '
-                "LEDGER_RESULT=" + ([.sessions[] | (.current // 0) - (.baseline // 0)] | add // 0 | tostring),
-                "LEDGER_SESSION_DELTA=" + ((.sessions[$sid].current // 0) - (.sessions[$sid].baseline // 0) | tostring)
-            ' "$file" 2>/dev/null)"
-            [ -z "$LEDGER_RESULT" ] && LEDGER_RESULT=0
-            [ -z "$LEDGER_SESSION_DELTA" ] && LEDGER_SESSION_DELTA=0
+        if [ "$mode" = token ]; then
+            ledger_date=$(jq -r '.date // ""' "$file" 2>/dev/null)
         else
-            if [ -n "$acct" ]; then
-                printf '{"date":"%s","sessions":{"%s":{"baseline":%s,"current":%s,"acct":"%s"}}}' \
-                    "$today" "$sid" "$value" "$value" "$acct" > "$file"
-            else
-                printf '{"date":"%s","sessions":{"%s":{"baseline":%s,"current":%s}}}' \
-                    "$today" "$sid" "$value" "$value" > "$file"
-            fi
+            local info
+            info=$(jq -r --arg sid "$sid" '[.date // "", (.sessions[$sid].baseline // empty | tostring)] | join("|")' "$file" 2>/dev/null)
+            ledger_date="${info%%|*}"
+            has_baseline="${info#*|}"
+        fi
+    fi
+
+    if [ ! -f "$file" ] || [ "$ledger_date" != "$today" ]; then
+        # New day or first ever write — reset all sessions.
+        local acct_tail=""
+        [ -n "$acct" ] && acct_tail=$(printf ',"acct":"%s"' "$acct")
+        if [ "$mode" = token ]; then
+            printf '{"date":"%s","sessions":{"%s":{"last_seen":%s,"accumulated":0%s}}}' \
+                "$today" "$sid" "$value" "$acct_tail" > "$file"
+            TOKEN_LEDGER_RESULT=0
+            TOKEN_LEDGER_SESSION=0
+        else
+            printf '{"date":"%s","sessions":{"%s":{"baseline":%s,"current":%s%s}}}' \
+                "$today" "$sid" "$value" "$value" "$acct_tail" > "$file"
             LEDGER_RESULT=0
             LEDGER_SESSION_DELTA=0
         fi
-    else
-        if [ -n "$acct" ]; then
-            printf '{"date":"%s","sessions":{"%s":{"baseline":%s,"current":%s,"acct":"%s"}}}' \
-                "$today" "$sid" "$value" "$value" "$acct" > "$file"
-        else
-            printf '{"date":"%s","sessions":{"%s":{"baseline":%s,"current":%s}}}' \
-                "$today" "$sid" "$value" "$value" > "$file"
-        fi
-        LEDGER_RESULT=0
-        LEDGER_SESSION_DELTA=0
+        return
     fi
+
+    # Same day, file exists — update this session in place.
+    if [ "$mode" = token ]; then
+        # Read last_seen, compute delta, accumulate, write back in one call.
+        jq_update "$file" --arg sid "$sid" --argjson val "$value" --arg acct "$acct" '
+            (.sessions[$sid].last_seen // $val) as $prev |
+            (if $val > $prev then $val - $prev else 0 end) as $delta |
+            .sessions[$sid] = ((.sessions[$sid] // {}) + {
+                "last_seen": $val,
+                "accumulated": ((.sessions[$sid].accumulated // 0) + $delta)
+            } + (if $acct != "" then {"acct": $acct} else {} end))'
+        eval "$(jq -r --arg sid "$sid" '
+            "TOKEN_LEDGER_RESULT=" + ([.sessions[] | .accumulated // 0] | add // 0 | tostring),
+            "TOKEN_LEDGER_SESSION=" + (.sessions[$sid].accumulated // 0 | tostring)
+        ' "$file" 2>/dev/null)"
+        [ -z "$TOKEN_LEDGER_RESULT" ] && TOKEN_LEDGER_RESULT=0
+        [ -z "$TOKEN_LEDGER_SESSION" ] && TOKEN_LEDGER_SESSION=0
+        return
+    fi
+
+    if [ -z "$has_baseline" ]; then
+        # First time seeing this session today — seed baseline from existing
+        # current (if any) so delta counts from NOW forward.
+        jq_update "$file" --arg sid "$sid" --argjson val "$value" --arg acct "$acct" \
+            '.sessions[$sid] = ((.sessions[$sid] // {}) + {"baseline": (.sessions[$sid].current // $val), "current": $val} + (if $acct != "" then {"acct": $acct} else {} end))'
+    else
+        jq_update "$file" --arg sid "$sid" --argjson val "$value" --arg acct "$acct" \
+            '.sessions[$sid].current = $val | (if $acct != "" then .sessions[$sid].acct = $acct else . end)'
+    fi
+    # Null-coalesce .current and .baseline so a legacy {current: N} row with no
+    # baseline doesn't make jq throw on "number - null" and blank both vars.
+    eval "$(jq -r --arg sid "$sid" '
+        "LEDGER_RESULT=" + ([.sessions[] | (.current // 0) - (.baseline // 0)] | add // 0 | tostring),
+        "LEDGER_SESSION_DELTA=" + ((.sessions[$sid].current // 0) - (.sessions[$sid].baseline // 0) | tostring)
+    ' "$file" 2>/dev/null)"
+    [ -z "$LEDGER_RESULT" ] && LEDGER_RESULT=0
+    [ -z "$LEDGER_SESSION_DELTA" ] && LEDGER_SESSION_DELTA=0
 }
 
 # ── Subagent token tracking ──────────────────────────────
@@ -633,7 +580,7 @@ DAILY_LEDGER="$HOME/.claude/daily-cost.json"
 TODAY=$(date +%Y-%m-%d)
 DAILY_COST="$COST"
 if [ -n "$SESSION_ID" ] && [ "$(awk "BEGIN {print ($COST > 0)}")" = "1" ]; then
-    update_ledger "$DAILY_LEDGER" "$SESSION_ID" "$COST" "$TODAY" "$ACCT_TAG"
+    update_ledger cost "$DAILY_LEDGER" "$SESSION_ID" "$COST" "$TODAY" "$ACCT_TAG"
     DAILY_COST="${LEDGER_RESULT:-0}"
 fi
 DAILY_FMT=$(printf "%.2f" "$DAILY_COST")
@@ -716,7 +663,7 @@ if [ -n "$SESSION_ID" ]; then
     fi
 
     DAILY_TOKEN_LEDGER="$HOME/.claude/daily-tokens.json"
-    update_token_ledger "$DAILY_TOKEN_LEDGER" "$SESSION_ID" "$SESSION_TOKENS" "$TODAY" "$ACCT_TAG"
+    update_ledger token "$DAILY_TOKEN_LEDGER" "$SESSION_ID" "$SESSION_TOKENS" "$TODAY" "$ACCT_TAG"
     DAILY_TOKENS="${TOKEN_LEDGER_RESULT:-0}"
     SESSION_DELTA="${TOKEN_LEDGER_SESSION:-0}"
     SESSION_TOKEN_FMT=$(awk "BEGIN {
@@ -1268,6 +1215,111 @@ elif [ -n "$ACCT_TAG" ]; then
     ACCOUNT_LABEL="${_label_color}${ACCT_TAG}${reset}"
 fi
 
+# Burn-down projection for a usage window ("5h" | "weekly"): estimate time to
+# 100% from utilization velocity, appending "→full ~X" plus a survive marker
+# (✓buffer / ✗downtime until reset) to rate_lines. 5h prefers the recent-poll
+# rate and falls back to the window-start average; weekly uses the window-start
+# average only. Int-minute (5h) vs float-hour (weekly) formatting differs by
+# window on purpose — parameterized, not normalized.
+burn_down_projection() {
+    local window="$1"
+    local pct reset_iso window_secs threshold
+    if [ "$window" = 5h ]; then
+        pct="$five_hour_pct"; reset_iso="$five_hour_reset_iso"; window_secs=18000; threshold=0
+    else
+        pct="$seven_day_pct"; reset_iso="$seven_day_reset_iso"; window_secs=604800; threshold=2
+    fi
+
+    [ "$pct" -gt "$threshold" ] 2>/dev/null && [ -n "$reset_iso" ] && [ "$reset_iso" != "" ] || return
+    local epoch
+    epoch=$(iso_to_epoch "$reset_iso")
+    [ -n "$epoch" ] || return
+
+    local now secs_to_reset secs_elapsed remaining_pct
+    now=$(date +%s)
+    secs_to_reset=$(( epoch - now ))
+    [ "$secs_to_reset" -lt 0 ] && secs_to_reset=0
+    secs_elapsed=$(( window_secs - secs_to_reset ))
+    [ "$secs_elapsed" -lt 60 ] && secs_elapsed=60
+    [ "$secs_elapsed" -gt 0 ] && [ "$pct" -gt 0 ] 2>/dev/null || return
+    remaining_pct=$(( 100 - pct ))
+    [ "$remaining_pct" -gt 0 ] || return
+
+    if [ "$window" = 5h ]; then
+        # Trust the recent-poll rate only when the gap is informative (>30s) and
+        # utilization moved up; else fall back to the window-start average.
+        local mins_to_full
+        mins_to_full=$(awk "BEGIN {
+            poll_interval = ${poll_interval:-0};
+            prev_pct      = ${prev_5h:-0};
+            cur_pct       = $pct;
+            delta_pct     = cur_pct - prev_pct;
+            if (poll_interval >= 30 && delta_pct > 0) {
+                rate = delta_pct / poll_interval;
+            } else {
+                rate = cur_pct / $secs_elapsed;
+            }
+            if (rate > 0) printf \"%.0f\", $remaining_pct / rate / 60;
+            else print 999
+        }")
+        [ "$mins_to_full" -gt 0 ] 2>/dev/null && [ "$mins_to_full" -lt 6000 ] 2>/dev/null || return
+
+        local bd_color="$green"
+        [ "$mins_to_full" -le 60 ] && bd_color="$orange"
+        [ "$mins_to_full" -le 30 ] && bd_color="$yellow"
+        [ "$mins_to_full" -le 15 ] && bd_color="$red"
+
+        local full_display
+        full_display=$(fmt_duration_m "$mins_to_full")
+        rate_lines+=" ${bd_color}$(pad_right "→full ~${full_display}" 14)${reset}"
+
+        # Survive: buffer or downtime until the window resets.
+        local mins_to_reset=$(( secs_to_reset / 60 ))
+        [ "$mins_to_reset" -gt 0 ] 2>/dev/null || return
+        if [ "$mins_to_full" -gt "$mins_to_reset" ] 2>/dev/null; then
+            local buf_display
+            buf_display=$(fmt_duration_m $(( mins_to_full - mins_to_reset )))
+            rate_lines+=" ${green}✓${buf_display}${reset}"
+        else
+            local dt_display
+            dt_display=$(fmt_duration_m $(( mins_to_reset - mins_to_full )))
+            rate_lines+=" ${red}✗${dt_display}${reset}"
+        fi
+        return
+    fi
+
+    local hrs_to_full hrs_to_reset mins_to_full_weekly display_to_full
+    hrs_to_full=$(awk "BEGIN {
+        rate = $pct / $secs_elapsed;
+        if (rate > 0) printf \"%.2f\", $remaining_pct / rate / 3600;
+        else print 999
+    }")
+    hrs_to_reset=$(awk "BEGIN { printf \"%.2f\", $secs_to_reset / 3600 }")
+    mins_to_full_weekly=$(awk "BEGIN { printf \"%.0f\", $hrs_to_full * 60 }")
+    display_to_full=$(fmt_duration_m "$mins_to_full_weekly")
+
+    # Only show if the projection lands within the 7-day window.
+    awk "BEGIN { exit ($hrs_to_full < 168) ? 0 : 1 }" 2>/dev/null || return
+    local wd_color="$green"
+    awk "BEGIN { exit ($hrs_to_full <= 72) ? 0 : 1 }" 2>/dev/null && wd_color="$orange"
+    awk "BEGIN { exit ($hrs_to_full <= 36) ? 0 : 1 }" 2>/dev/null && wd_color="$yellow"
+    awk "BEGIN { exit ($hrs_to_full <= 12) ? 0 : 1 }" 2>/dev/null && wd_color="$red"
+    rate_lines+=" ${wd_color}$(pad_right "→full ~${display_to_full}" 14)${reset}"
+
+    # Survive: buffer or downtime until the window resets.
+    local weekly_gap_mins
+    weekly_gap_mins=$(awk "BEGIN { printf \"%.0f\", ($hrs_to_full - $hrs_to_reset) * 60 }")
+    if awk "BEGIN { exit ($hrs_to_full > $hrs_to_reset) ? 0 : 1 }" 2>/dev/null; then
+        local weekly_buf_display
+        weekly_buf_display=$(fmt_duration_m "$weekly_gap_mins")
+        rate_lines+=" ${green}✓${weekly_buf_display}${reset}"
+    else
+        local weekly_dt_display
+        weekly_dt_display=$(fmt_duration_m "$weekly_gap_mins")
+        rate_lines+=" ${red}✗${weekly_dt_display}${reset}"
+    fi
+}
+
 # ── Build rate limit lines ─────────────────────────────
 rate_lines=""
 
@@ -1354,86 +1406,7 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
         fi
     fi
 
-    # ── Burn-down projection ──────────────────────────
-    # Estimate minutes until 100% based on utilization velocity.
-    #
-    # Rate preference (in order):
-    #   1. Recent-window rate: (pct - prev_5h) / (poll_ts - prev_ts).
-    #      Reflects actual current burn — idle time makes survive grow,
-    #      sprints make it shrink. Needs two consecutive polls.
-    #   2. Since-window-start average: pct / secs_elapsed. Coarse but
-    #      always available — used on first poll after a window reset
-    #      or when prev-poll data is missing.
-    #
-    # The old code used (2) exclusively. Because both "time to full"
-    # and "time to reset" shrink together under steady burn, the
-    # survive delta (difference between them) stayed nearly constant
-    # for hours — giving the impression the number was frozen. Using
-    # the recent-window rate makes survive actually respond to changes
-    # in behavior.
-    if [ "$five_hour_pct" -gt 0 ] 2>/dev/null && [ -n "$five_hour_reset_iso" ] && [ "$five_hour_reset_iso" != "" ]; then
-        reset_epoch=$(iso_to_epoch "$five_hour_reset_iso")
-        if [ -n "$reset_epoch" ]; then
-            now_bd=$(date +%s)
-            # The 5-hour window: reset is 5h from window start
-            # Time elapsed in window = 18000 - (reset - now)
-            secs_to_reset=$(( reset_epoch - now_bd ))
-            [ "$secs_to_reset" -lt 0 ] && secs_to_reset=0
-            secs_elapsed=$(( 18000 - secs_to_reset ))
-            [ "$secs_elapsed" -lt 60 ] && secs_elapsed=60
-
-            # Rate: pct per second
-            if [ "$secs_elapsed" -gt 0 ] && [ "$five_hour_pct" -gt 0 ] 2>/dev/null; then
-                remaining_pct=$(( 100 - five_hour_pct ))
-                if [ "$remaining_pct" -gt 0 ]; then
-                    # Minutes to full = remaining_pct / rate / 60. Prefer the
-                    # recent-poll delta when we have it; else fall back to the
-                    # since-window-start average.
-                    mins_to_full=$(awk "BEGIN {
-                        poll_interval = ${poll_interval:-0};
-                        prev_pct      = ${prev_5h:-0};
-                        cur_pct       = $five_hour_pct;
-                        delta_pct     = cur_pct - prev_pct;
-
-                        # Only trust the recent rate when the poll gap is
-                        # long enough to be informative (>30s) and utilization
-                        # actually moved up. Zero or negative deltas mean
-                        # no recent burn (or a reset) — fall through.
-                        if (poll_interval >= 30 && delta_pct > 0) {
-                            rate = delta_pct / poll_interval;
-                        } else {
-                            rate = cur_pct / $secs_elapsed;
-                        }
-
-                        if (rate > 0) printf \"%.0f\", $remaining_pct / rate / 60;
-                        else print 999
-                    }")
-                    if [ "$mins_to_full" -gt 0 ] 2>/dev/null && [ "$mins_to_full" -lt 6000 ] 2>/dev/null; then
-                        bd_color="$green"
-                        [ "$mins_to_full" -le 60 ] && bd_color="$orange"
-                        [ "$mins_to_full" -le 30 ] && bd_color="$yellow"
-                        [ "$mins_to_full" -le 15 ] && bd_color="$red"
-
-                        full_display=$(fmt_duration_m "$mins_to_full")
-                        # Pad "→full ~Xm" to 11 cols so "✗buf" lines up.
-                        rate_lines+=" ${bd_color}$(pad_right "→full ~${full_display}" 14)${reset}"
-
-                        # Survive indicator: buffer or downtime until window resets
-                        mins_to_reset=$(( secs_to_reset / 60 ))
-                        if [ "$mins_to_reset" -gt 0 ] 2>/dev/null; then
-                            if [ "$mins_to_full" -gt "$mins_to_reset" ] 2>/dev/null; then
-                                buf_display=$(fmt_duration_m $(( mins_to_full - mins_to_reset )))
-                                rate_lines+=" ${green}✓${buf_display}${reset}"
-                            else
-                                dt_display=$(fmt_duration_m $(( mins_to_reset - mins_to_full )))
-                                rate_lines+=" ${red}✗${dt_display}${reset}"
-                            fi
-                        fi
-                    fi
-                fi
-            fi
-        fi
-    fi
+    burn_down_projection 5h
 
     seven_day_pct=$(printf "%.0f" "$seven_day_pct_display" 2>/dev/null || echo 0)
     seven_day_reset=$(format_reset_time "$seven_day_reset_iso" "datetime")
@@ -1455,52 +1428,7 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
         rate_lines+=" $(printf '%16s' '')"
     fi
 
-    # ── Weekly burn-down projection ──────────────────
-    if [ "$seven_day_pct" -gt 2 ] 2>/dev/null && [ -n "$seven_day_reset_iso" ] && [ "$seven_day_reset_iso" != "" ]; then
-        weekly_reset_epoch=$(iso_to_epoch "$seven_day_reset_iso")
-        if [ -n "$weekly_reset_epoch" ]; then
-            now_wd=$(date +%s)
-            # 7-day window: 604800 seconds
-            weekly_secs_to_reset=$(( weekly_reset_epoch - now_wd ))
-            [ "$weekly_secs_to_reset" -lt 0 ] && weekly_secs_to_reset=0
-            weekly_secs_elapsed=$(( 604800 - weekly_secs_to_reset ))
-            [ "$weekly_secs_elapsed" -lt 60 ] && weekly_secs_elapsed=60
-
-            if [ "$weekly_secs_elapsed" -gt 0 ] && [ "$seven_day_pct" -gt 0 ] 2>/dev/null; then
-                weekly_remaining_pct=$(( 100 - seven_day_pct ))
-                if [ "$weekly_remaining_pct" -gt 0 ]; then
-                    # Hours to full
-                    hrs_to_full=$(awk "BEGIN {
-                        rate = $seven_day_pct / $weekly_secs_elapsed;
-                        if (rate > 0) printf \"%.2f\", $weekly_remaining_pct / rate / 3600;
-                        else print 999
-                    }")
-                    hrs_to_reset=$(awk "BEGIN { printf \"%.2f\", $weekly_secs_to_reset / 3600 }")
-                    mins_to_full_weekly=$(awk "BEGIN { printf \"%.0f\", $hrs_to_full * 60 }")
-                    display_to_full=$(fmt_duration_m "$mins_to_full_weekly")
-
-                    # Only show if projection is within the window (< 7 days)
-                    if awk "BEGIN { exit ($hrs_to_full < 168) ? 0 : 1 }" 2>/dev/null; then
-                        wd_color="$green"
-                        awk "BEGIN { exit ($hrs_to_full <= 72) ? 0 : 1 }" 2>/dev/null && wd_color="$orange"
-                        awk "BEGIN { exit ($hrs_to_full <= 36) ? 0 : 1 }" 2>/dev/null && wd_color="$yellow"
-                        awk "BEGIN { exit ($hrs_to_full <= 12) ? 0 : 1 }" 2>/dev/null && wd_color="$red"
-                        rate_lines+=" ${wd_color}$(pad_right "→full ~${display_to_full}" 14)${reset}"
-
-                        # Survive indicator: buffer or downtime
-                        weekly_gap_mins=$(awk "BEGIN { printf \"%.0f\", ($hrs_to_full - $hrs_to_reset) * 60 }")
-                        if awk "BEGIN { exit ($hrs_to_full > $hrs_to_reset) ? 0 : 1 }" 2>/dev/null; then
-                            weekly_buf_display=$(fmt_duration_m "$weekly_gap_mins")
-                            rate_lines+=" ${green}✓${weekly_buf_display}${reset}"
-                        else
-                            weekly_dt_display=$(fmt_duration_m "$weekly_gap_mins")
-                            rate_lines+=" ${red}✗${weekly_dt_display}${reset}"
-                        fi
-                    fi
-                fi
-            fi
-        fi
-    fi
+    burn_down_projection weekly
 
 fi
 
