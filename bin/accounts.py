@@ -991,13 +991,14 @@ def poll_blobs_usage(blobs: dict) -> int:
 
 def route_rows(blobs: dict, active_label: str | None, now_ts: float) -> list[dict]:
     """One row per stored account: label, effective 5h% (reset-aware, from the
-    board the poll just refreshed), whether its cred is expired, whether it's
-    the live account. Sorted best-first (lowest 5h)."""
+    board the poll just refreshed), staleness of that estimate, whether its
+    cred is expired, whether it's the live account. Sorted best-first (lowest 5h)."""
     resets = load_resets()
     rows = []
     for label, e in (blobs.get("accounts") or {}).items():
         row = resets_row(resets, e.get("email"), e.get("org_uuid"))
         effs = effective_pcts(row, now_utc())
+        last_seen = row.get("last_seen")
         rows.append(
             {
                 "label": label,
@@ -1007,6 +1008,7 @@ def route_rows(blobs: dict, active_label: str | None, now_ts: float) -> list[dic
                 "fable": effs["fable"],
                 "expired": blob_expired(e.get("blob", ""), now_ts),
                 "active": label == active_label,
+                "stale": bool(last_seen) and (now_ts - last_seen) > STALE_AFTER_S,
             }
         )
     rows.sort(key=lambda r: (float("inf") if r["five_hour"] is None else r["five_hour"]))
@@ -1173,14 +1175,13 @@ def cmd_tokens(_args) -> None:
 
 def _fable_first(rows: list[dict]) -> list[dict]:
     """Reorder for fable mode: fable-eligible accounts first (least fable used),
-    everything else keeps its headroom_rank order. pick_route then takes the first
+    everything else keeps its existing order. pick_route then takes the first
     with a live token, so fallback (no eligible or no-token fable account) is
-    automatic. Stable sort preserves the headroom order inside each group."""
+    automatic. Stable sort preserves the incoming (headroom) order inside each group."""
 
     def key(r: dict) -> tuple:
-        effs = r["effs"]
-        if fable_eligible(effs["five_hour"], effs["seven_day"], effs["fable"]):
-            return (0, effs["fable"])
+        if fable_eligible(r["five_hour"], r["seven_day"], r["fable"]):
+            return (0, r["fable"])
         return (1, 0.0)
 
     return sorted(rows, key=key)
@@ -1192,14 +1193,16 @@ def cmd_pick_env(_args) -> None:
     the wrapper then falls back to Claude Code's native keychain auth. Never
     fails: routing must never block launching claude."""
     try:
-        rows = _account_rows(load_meta())
+        now = time.time()
+        # active_label=None: a launch hook ranks by headroom+token; pick_route ignores `active`.
+        rows = route_rows(load_blobs(), None, now)
         if load_mode().get("mode") == "fable":
             rows = _fable_first(rows)
         pick = pick_route(
             rows,
             load_token_vault(),
             excluded_labels(),
-            time.time(),
+            now,
             os.environ.get("ACCOUNTS_PIN") or None,
         )
     except Exception:
@@ -1548,11 +1551,15 @@ def _fmt_pct(value: float | None, stale: bool) -> str:
 
 
 def cmd_ls(_args) -> None:
-    meta = load_meta()
-    rows = _account_rows(meta)
+    with locked():
+        blobs = load_blobs()
+        active = capture_live_to_blobs(blobs)
+    rows = route_rows(blobs, active, time.time())
     if not rows:
-        print("vault is empty — run `accounts enroll` on each account once")
+        print("no stored accounts — /login in Claude Code once; the next accounts command captures it")
         return
+    # stable sort: pushes dead creds last, keeps route_rows' five_hour order otherwise
+    rows = sorted(rows, key=lambda r: r["expired"])
     excludes = excluded_labels()
     print(f"{'':2}{'label':<12} {'email':<32} {'5h':>6} {'7d':>6} {'fable':>6}")
     any_expired = False
@@ -1567,14 +1574,14 @@ def cmd_ls(_args) -> None:
             suffix = ""
         print(
             f"{mark}{r['label']:<12} {r['email'] or '?':<32} "
-            f"{_fmt_pct(r['effs']['five_hour'], r['stale']):>6} "
-            f"{_fmt_pct(r['effs']['seven_day'], r['stale']):>6} "
-            f"{_fmt_pct(r['effs']['fable'], r['stale']):>6}{suffix}"
+            f"{_fmt_pct(r['five_hour'], r['stale']):>6} "
+            f"{_fmt_pct(r['seven_day'], r['stale']):>6} "
+            f"{_fmt_pct(r['fable'], r['stale']):>6}{suffix}"
         )
     print("\n* = matches live slot   ~ = estimate stale (>3h since that account was live)")
     print("pcts are USED (0% = full headroom), reset-aware; sorted best-first")
     if any_expired:
-        print("EXPIRED = vaulted refresh token dead; switch to it needs a fresh /login")
+        print("EXPIRED = stored refresh token dead; switch to it needs a fresh /login")
 
 
 def cmd_best(_args) -> None:
@@ -1713,7 +1720,7 @@ def main(argv: list[str] | None = None) -> None:
         "pick-env", help="emit env exports for the best routable account (wrapper hook)"
     ).set_defaults(fn=cmd_pick_env)
 
-    sub.add_parser("ls", help="list vaulted accounts with headroom").set_defaults(fn=cmd_ls)
+    sub.add_parser("ls", help="list stored accounts with headroom").set_defaults(fn=cmd_ls)
     sub.add_parser("best", help="print the highest-headroom account").set_defaults(fn=cmd_best)
 
     p_switch = sub.add_parser("switch", help="advise which account to /login into (never writes)")

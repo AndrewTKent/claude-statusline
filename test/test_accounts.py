@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 import types
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -159,16 +160,6 @@ class TestCredExpiry:
         assert accounts.cred_expired(None) is False
 
 
-def _route_row(label, eff5, active=False, expired=False, fable=0.0, seven_day=0.0):
-    return {
-        "uuid": label,
-        "label": label,
-        "active": active,
-        "expired": expired,
-        "effs": {"five_hour": eff5, "seven_day": seven_day, "fable": fable},
-    }
-
-
 class TestPickRoute:
     NOW = 1_784_000_000.0
     VAULT = {"tokens": {
@@ -177,24 +168,24 @@ class TestPickRoute:
     }}
 
     def test_best_with_token_wins(self):
-        rows = [_route_row("alumni", 5.0), _route_row("gmail", 20.0), _route_row("ymail", 1.0)]
+        rows = [accounts_row("alumni", 5.0), accounts_row("gmail", 20.0), accounts_row("ymail", 1.0)]
         # alumni has no token, ymail's token is expired -> gmail
         assert accounts.pick_route(rows, self.VAULT, set(), self.NOW, None) == ("gmail", "sk-ant-gmail-tok")
 
     def test_pin_overrides_headroom(self):
-        rows = [_route_row("alumni", 5.0), _route_row("gmail", 90.0)]
+        rows = [accounts_row("alumni", 5.0), accounts_row("gmail", 90.0)]
         assert accounts.pick_route(rows, self.VAULT, set(), self.NOW, "gmail")[0] == "gmail"
 
     def test_excluded_skipped(self):
-        rows = [_route_row("gmail", 5.0)]
+        rows = [accounts_row("gmail", 5.0)]
         assert accounts.pick_route(rows, self.VAULT, {"gmail"}, self.NOW, None) is None
 
     def test_expired_cred_row_skipped(self):
-        rows = [_route_row("gmail", 5.0, expired=True)]
+        rows = [accounts_row("gmail", 5.0, expired=True)]
         assert accounts.pick_route(rows, self.VAULT, set(), self.NOW, None) is None
 
     def test_no_tokens_none(self):
-        rows = [_route_row("alumni", 5.0)]
+        rows = [accounts_row("alumni", 5.0)]
         assert accounts.pick_route(rows, self.VAULT, set(), self.NOW, None) is None
 
 
@@ -954,20 +945,20 @@ class TestPickEnvFable:
     }}
 
     def test_fable_first_orders_eligible_by_fable(self):
-        rows = [_route_row("gmail", 10.0, fable=80.0),
-                _route_row("brown", 50.0, fable=10.0),
-                _route_row("ymail", 20.0, fable=40.0)]
+        rows = [accounts_row("gmail", 10.0, fable=80.0),
+                accounts_row("brown", 50.0, fable=10.0),
+                accounts_row("ymail", 20.0, fable=40.0)]
         assert [r["label"] for r in accounts._fable_first(rows)] == ["brown", "ymail", "gmail"]
 
     def test_prefers_fable_over_headroom(self):
         # gmail is best 5h (5) but fable-capped; brown worse 5h (50) but fable @10.
-        rows = [_route_row("gmail", 5.0, fable=100.0), _route_row("brown", 50.0, fable=10.0)]
+        rows = [accounts_row("gmail", 5.0, fable=100.0), accounts_row("brown", 50.0, fable=10.0)]
         picked = accounts.pick_route(accounts._fable_first(rows), self.VAULT, set(), self.NOW, None)
         assert picked == ("brown", "sk-brown")
 
     def test_falls_back_to_headroom_when_none_eligible(self):
         # all fable-capped → _fable_first keeps headroom order → best 5h (gmail) wins
-        rows = [_route_row("gmail", 5.0, fable=100.0), _route_row("brown", 50.0, fable=100.0)]
+        rows = [accounts_row("gmail", 5.0, fable=100.0), accounts_row("brown", 50.0, fable=100.0)]
         picked = accounts.pick_route(accounts._fable_first(rows), self.VAULT, set(), self.NOW, None)
         assert picked == ("gmail", "sk-gmail")
 
@@ -975,14 +966,211 @@ class TestPickEnvFable:
         # brown is the freshest fable but has NO token → fall through to the next
         # eligible tokened account (ymail).
         vault = {"tokens": {"ymail": {"token": "sk-ymail", "expires_at": self.NOW + 1000}}}
-        rows = [_route_row("brown", 20.0, fable=10.0), _route_row("ymail", 30.0, fable=40.0)]
+        rows = [accounts_row("brown", 20.0, fable=10.0), accounts_row("ymail", 30.0, fable=40.0)]
         picked = accounts.pick_route(accounts._fable_first(rows), vault, set(), self.NOW, None)
         assert picked == ("ymail", "sk-ymail")
 
     def test_skips_weekly_maxed_fable_account(self):
         # gmail: freshest fable but weekly (7d) maxed → _fable_first drops it below
         # brown (headroom on fable AND weekly), so pick_route lands on brown.
-        rows = [_route_row("gmail", 0.0, fable=8.0, seven_day=100.0),
-                _route_row("brown", 34.0, fable=41.0, seven_day=52.0)]
+        rows = [accounts_row("gmail", 0.0, fable=8.0, seven_day=100.0),
+                accounts_row("brown", 34.0, fable=41.0, seven_day=52.0)]
         picked = accounts.pick_route(accounts._fable_first(rows), self.VAULT, set(), self.NOW, None)
         assert picked == ("brown", "sk-brown")
+
+
+class TestRouteRowsStale:
+    def test_stale_flag_sourced_from_last_seen(self, monkeypatch):
+        now = 2_000_000_000.0
+        monkeypatch.setattr(accounts, "load_resets", lambda: {
+            "fresh@x|o1": {"five_hour_pct": 10.0, "last_seen": now - 60},
+            "old@x|o2": {"five_hour_pct": 20.0, "last_seen": now - accounts.STALE_AFTER_S - 1},
+        })
+        blobs = {"accounts": {
+            "fresh": {"blob": _live_blob("f"), "email": "fresh@x", "org_uuid": "o1"},
+            "old": {"blob": _live_blob("o"), "email": "old@x", "org_uuid": "o2"},
+        }}
+        rows = accounts.route_rows(blobs, None, now)
+        by_label = {r["label"]: r for r in rows}
+        assert by_label["fresh"]["stale"] is False
+        assert by_label["old"]["stale"] is True
+
+    def test_stale_false_when_never_seen(self, monkeypatch):
+        monkeypatch.setattr(accounts, "load_resets", lambda: {})
+        blobs = {"accounts": {"gmail": {"blob": _live_blob("g"), "email": "g@x", "org_uuid": "o1"}}}
+        rows = accounts.route_rows(blobs, None, time.time())
+        assert rows[0]["stale"] is False
+
+
+class TestCmdPickEnv:
+    """The live shell-launch hook: enumerate accounts from the blobs store,
+    match labels against the minted-token vault, emit export lines. Must never
+    raise — routing can't block launching claude."""
+
+    def _wire(self, monkeypatch, blobs, tokens, *, resets=None, excludes=frozenset(), mode="auto"):
+        monkeypatch.setattr(accounts, "load_blobs", lambda: {"accounts": blobs})
+        monkeypatch.setattr(accounts, "load_token_vault", lambda: {"tokens": tokens})
+        monkeypatch.setattr(accounts, "load_resets", lambda: resets or {})
+        monkeypatch.setattr(accounts, "excluded_labels", lambda: set(excludes))
+        monkeypatch.setattr(accounts, "load_mode", lambda: {"mode": mode, "label": None})
+        monkeypatch.delenv("ACCOUNTS_PIN", raising=False)
+
+    def _tok(self, name):
+        return {"token": f"sk-ant-{name}", "expires_at": 9_999_999_999}  # year 2286
+
+    def test_roster_from_blobs_store(self, monkeypatch, capsys):
+        # freshest-with-token wins. raising=False: this assertion must keep working
+        # once load_meta no longer exists post-legacy-delete.
+        monkeypatch.setattr(
+            accounts, "load_meta",
+            lambda: (_ for _ in ()).throw(AssertionError("meta store touched")),
+            raising=False,
+        )
+        blobs = {
+            "gmail": {"blob": _live_blob("g"), "email": "g@x", "org_uuid": "o1"},
+            "work": {"blob": _live_blob("w"), "email": "w@x", "org_uuid": "o2"},
+        }
+        resets = {"g@x|o1": {"five_hour_pct": 60.0}, "w@x|o2": {"five_hour_pct": 10.0}}
+        self._wire(monkeypatch, blobs, {"gmail": self._tok("gmail"), "work": self._tok("work")},
+                   resets=resets)
+        accounts.cmd_pick_env(types.SimpleNamespace())
+        out = capsys.readouterr().out
+        assert "export CLAUDE_CODE_OAUTH_TOKEN='sk-ant-work'" in out
+        assert "export ACCOUNTS_ROUTED_LABEL='work'" in out  # 10% < 60% -> best-first
+
+    def test_excluded_label_respected(self, monkeypatch, capsys):
+        blobs = {"gmail": {"blob": _live_blob("g"), "email": "g@x", "org_uuid": "o1"}}
+        self._wire(monkeypatch, blobs, {"gmail": self._tok("gmail")}, excludes={"gmail"})
+        accounts.cmd_pick_env(types.SimpleNamespace())
+        assert capsys.readouterr().out == ""
+
+    def test_pin_overrides_headroom(self, monkeypatch, capsys):
+        # pinned account wins even with worse headroom than the free pick
+        blobs = {
+            "gmail": {"blob": _live_blob("g"), "email": "g@x", "org_uuid": "o1"},
+            "work": {"blob": _live_blob("w"), "email": "w@x", "org_uuid": "o2"},
+        }
+        resets = {"g@x|o1": {"five_hour_pct": 5.0}, "w@x|o2": {"five_hour_pct": 90.0}}
+        self._wire(monkeypatch, blobs, {"gmail": self._tok("gmail"), "work": self._tok("work")},
+                   resets=resets)
+        monkeypatch.setenv("ACCOUNTS_PIN", "work")
+        accounts.cmd_pick_env(types.SimpleNamespace())
+        out = capsys.readouterr().out
+        assert "export CLAUDE_CODE_OAUTH_TOKEN='sk-ant-work'" in out
+        assert "export ACCOUNTS_ROUTED_LABEL='work'" in out
+
+    def test_expired_blob_filtered(self, monkeypatch, capsys):
+        # refresh-expired blob is skipped despite a live minted token
+        blobs = {"gmail": {"blob": _live_blob("g", future_ms=1_000_000_000_000),  # 2001, past
+                           "email": "g@x", "org_uuid": "o1"}}
+        self._wire(monkeypatch, blobs, {"gmail": self._tok("gmail")})
+        accounts.cmd_pick_env(types.SimpleNamespace())
+        assert capsys.readouterr().out == ""
+
+    def test_no_minted_token_prints_nothing(self, monkeypatch, capsys):
+        blobs = {"gmail": {"blob": _live_blob("g"), "email": "g@x", "org_uuid": "o1"}}
+        self._wire(monkeypatch, blobs, {})  # empty token vault
+        accounts.cmd_pick_env(types.SimpleNamespace())
+        assert capsys.readouterr().out == ""
+
+    def test_internal_exception_prints_nothing(self, monkeypatch, capsys):
+        # never-raise contract: any internal failure yields no output, no traceback
+        monkeypatch.setattr(accounts, "load_blobs",
+                            lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+        accounts.cmd_pick_env(types.SimpleNamespace())
+        assert capsys.readouterr().out == ""
+
+    def test_fable_mode_uses_flat_row_shape(self, monkeypatch, capsys):
+        # regression: _fable_first must read route_rows' flat five_hour/seven_day/fable
+        # fields; a legacy-shape mismatch here raises inside the try/except and
+        # pick-env silently emits nothing.
+        blobs = {
+            "gmail": {"blob": _live_blob("g"), "email": "g@x", "org_uuid": "o1"},
+            "brown": {"blob": _live_blob("b"), "email": "b@x", "org_uuid": "o2"},
+        }
+        resets = {
+            "g@x|o1": {"five_hour_pct": 5.0, "seven_day_pct": 5.0, "fable_pct": 90.0},
+            "b@x|o2": {"five_hour_pct": 50.0, "seven_day_pct": 50.0, "fable_pct": 10.0},
+        }
+        self._wire(monkeypatch, blobs, {"gmail": self._tok("gmail"), "brown": self._tok("brown")},
+                   resets=resets, mode="fable")
+        accounts.cmd_pick_env(types.SimpleNamespace())
+        out = capsys.readouterr().out
+        # gmail is best 5h but fable-heavy; brown has real fable headroom -> wins
+        assert "export CLAUDE_CODE_OAUTH_TOKEN='sk-ant-brown'" in out
+        assert "export ACCOUNTS_ROUTED_LABEL='brown'" in out
+
+
+class TestCmdLs:
+    """The blobs-based board: same visual contract as the old vault board
+    (marker, staleness, EXPIRED flag, footnotes), rebuilt from route_rows."""
+
+    def _wire(self, monkeypatch, blobs, *, resets=None, active=None, excludes=frozenset()):
+        monkeypatch.setattr(accounts, "locked", lambda blocking=True: nullcontext())
+        monkeypatch.setattr(accounts, "load_blobs", lambda: {"accounts": blobs})
+        monkeypatch.setattr(accounts, "capture_live_to_blobs", lambda b: active)
+        monkeypatch.setattr(accounts, "load_resets", lambda: resets or {})
+        monkeypatch.setattr(accounts, "excluded_labels", lambda: set(excludes))
+
+    def test_empty_store_prints_login_onboarding_not_enroll(self, monkeypatch, capsys):
+        self._wire(monkeypatch, {})
+        accounts.cmd_ls(types.SimpleNamespace())
+        out = capsys.readouterr().out
+        assert "enroll" not in out
+        assert "vault" not in out.lower()
+        assert "/login" in out
+
+    def test_renders_header_and_active_marker(self, monkeypatch, capsys):
+        blobs = {"gmail": {"blob": _live_blob("g"), "email": "g@x", "org_uuid": "o1"}}
+        resets = {"g@x|o1": {"five_hour_pct": 12.0, "seven_day_pct": 3.0, "fable_pct": 7.0}}
+        self._wire(monkeypatch, blobs, resets=resets, active="gmail")
+        accounts.cmd_ls(types.SimpleNamespace())
+        out = capsys.readouterr().out
+        assert "label" in out and "email" in out and "5h" in out and "7d" in out and "fable" in out
+        assert "* gmail" in out
+        assert "g@x" in out
+        assert "12%" in out and "3%" in out and "7%" in out
+
+    def test_expired_row_flagged_and_sorted_last(self, monkeypatch, capsys):
+        blobs = {
+            "dead": {"blob": _live_blob("d", future_ms=1_000_000_000_000), "email": "d@x", "org_uuid": "o1"},
+            "gmail": {"blob": _live_blob("g"), "email": "g@x", "org_uuid": "o2"},
+        }
+        resets = {"d@x|o1": {"five_hour_pct": 1.0}, "g@x|o2": {"five_hour_pct": 50.0}}
+        self._wire(monkeypatch, blobs, resets=resets)
+        accounts.cmd_ls(types.SimpleNamespace())
+        out = capsys.readouterr().out
+        assert "EXPIRED" in out
+        # dead has the lower 5h% (1 < 50) but must sort AFTER gmail (expired-last)
+        assert out.index("gmail") < out.index("dead")
+
+    def test_excluded_label_flagged(self, monkeypatch, capsys):
+        blobs = {"gmail": {"blob": _live_blob("g"), "email": "g@x", "org_uuid": "o1"}}
+        self._wire(monkeypatch, blobs, resets={"g@x|o1": {"five_hour_pct": 1.0}}, excludes={"gmail"})
+        accounts.cmd_ls(types.SimpleNamespace())
+        assert "[excluded]" in capsys.readouterr().out
+
+    def test_stale_row_marked(self, monkeypatch, capsys):
+        stale_seen = time.time() - accounts.STALE_AFTER_S - 60
+        blobs = {"gmail": {"blob": _live_blob("g"), "email": "g@x", "org_uuid": "o1"}}
+        resets = {"g@x|o1": {"five_hour_pct": 20.0, "last_seen": stale_seen}}
+        self._wire(monkeypatch, blobs, resets=resets)
+        accounts.cmd_ls(types.SimpleNamespace())
+        assert "20%~" in capsys.readouterr().out
+
+    def test_footnotes_present(self, monkeypatch, capsys):
+        blobs = {"gmail": {"blob": _live_blob("g"), "email": "g@x", "org_uuid": "o1"}}
+        self._wire(monkeypatch, blobs, resets={"g@x|o1": {"five_hour_pct": 1.0}})
+        accounts.cmd_ls(types.SimpleNamespace())
+        out = capsys.readouterr().out
+        assert "matches live slot" in out
+        assert "reset-aware; sorted best-first" in out
+
+    def test_expired_footnote_wording_is_not_legacy_vault(self, monkeypatch, capsys):
+        blobs = {"gmail": {"blob": _live_blob("g", future_ms=1_000_000_000_000),
+                           "email": "g@x", "org_uuid": "o1"}}
+        self._wire(monkeypatch, blobs, resets={"g@x|o1": {"five_hour_pct": 1.0}})
+        accounts.cmd_ls(types.SimpleNamespace())
+        out = capsys.readouterr().out
+        assert "EXPIRED = stored refresh token dead" in out
+        assert "vaulted" not in out
