@@ -46,9 +46,12 @@ class TestResolveLabel:
 
 class TestEffectivePcts:
     def test_past_reset_zeroes(self):
+        # A past reset zeroes only when confirmed by a poll after it
+        # (last_seen newer than the reset).
         row = {
             "five_hour_pct": 97.0,
             "five_hour_reset": (NOW - timedelta(minutes=1)).isoformat(),
+            "last_seen": NOW.timestamp(),
         }
         assert ccx.effective_pcts(row, NOW)["five_hour"] == 0.0
 
@@ -65,6 +68,35 @@ class TestEffectivePcts:
     def test_missing_reset_keeps_pct(self):
         row = {"seven_day_pct": 31.0}
         assert ccx.effective_pcts(row, NOW)["seven_day"] == 31.0
+
+
+    def test_stale_passed_reset_does_not_show_false_headroom(self):
+        # Access token lapsed → poller skipped this row → its reset slid into
+        # the past WITHOUT a re-poll (last_seen older than the reset). The
+        # window is NOT confirmed empty; effective must return the last-known
+        # pct, not 0, or it strands a switch onto a spent account.
+        now = datetime(2026, 7, 20, 19, 0, tzinfo=timezone.utc)
+        reset_past = datetime(2026, 7, 20, 18, 0, tzinfo=timezone.utc)
+        polled_before_reset = datetime(2026, 7, 20, 17, 30, tzinfo=timezone.utc).timestamp()
+        row = {
+            "fable_pct": 100.0,
+            "fable_reset": reset_past.isoformat(),
+            "last_seen": polled_before_reset,
+        }
+        assert ccx.effective_pcts(row, now)["fable"] == 100.0
+
+    def test_confirmed_reset_shows_empty(self):
+        # Polled AFTER the reset (last_seen newer) → the window really rolled
+        # over → 0 is correct.
+        now = datetime(2026, 7, 20, 19, 0, tzinfo=timezone.utc)
+        reset_past = datetime(2026, 7, 20, 18, 0, tzinfo=timezone.utc)
+        polled_after_reset = datetime(2026, 7, 20, 18, 30, tzinfo=timezone.utc).timestamp()
+        row = {
+            "fable_pct": 100.0,
+            "fable_reset": reset_past.isoformat(),
+            "last_seen": polled_after_reset,
+        }
+        assert ccx.effective_pcts(row, now)["fable"] == 0.0
 
 
 class TestHeadroomRank:
