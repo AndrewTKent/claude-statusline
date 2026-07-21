@@ -29,7 +29,8 @@ if [ -f "$SETTINGS_FILE" ] && jq -e '.statusLine' "$SETTINGS_FILE" >/dev/null 2>
 fi
 
 # Clean up runtime files
-rm -f /tmp/claude/statusline-*.json
+rm -f /tmp/claude/statusline-*
+rm -f /tmp/claude/ctx-history-*.txt
 rm -f "$INSTALL_DIR/rprompt.txt"
 rm -f "$INSTALL_DIR/session-history.jsonl"
 info "Cleaned up runtime files"
@@ -60,10 +61,9 @@ if [ "$PURGE_FLAG" = "--purge" ]; then
     rm -f "$INSTALL_DIR/account-caps.json"
     rm -f "$INSTALL_DIR/statusline-tz"
     rm -f "$INSTALL_DIR/focus"
-    rm -rf "$INSTALL_DIR/ctx-history"
     info "Removed state files"
 
-    for agent in "com.claude-scan-tokens-watch" "com.claude-ccx-route"; do
+    for agent in "com.claude-scan-tokens-watch" "com.claude-scan-tokens" "com.claude-ccx-route"; do
         if launchctl list "$agent" >/dev/null 2>&1; then
             launchctl unload "$HOME/Library/LaunchAgents/${agent}.plist" 2>/dev/null || true
             rm -f "$HOME/Library/LaunchAgents/${agent}.plist"
@@ -82,9 +82,14 @@ else
     printf "  ~/.claude/account-caps.json\n"
     printf "  ~/.claude/statusline-tz\n"
     printf "  ~/.claude/focus\n"
-    printf "  ~/.claude/ctx-history/\n"
     printf "  ~/Library/LaunchAgents/com.claude-scan-tokens-watch.plist\n"
+    printf "  ~/Library/LaunchAgents/com.claude-scan-tokens.plist\n"
     printf "  ~/Library/LaunchAgents/com.claude-ccx-route.plist\n"
-    printf "\n${green}Uninstalled.${reset} Run ${green}%s --purge${reset} to remove state files.\n" "$0"
+    if [ -f "$0" ]; then
+        purge_hint="$0 --purge"
+    else
+        purge_hint="curl -fsSL https://raw.githubusercontent.com/AndrewTKent/statusline/main/uninstall.sh | bash -s -- --purge"
+    fi
+    printf "\n${green}Uninstalled.${reset} Run ${green}%s${reset} to remove state files.\n" "$purge_hint"
     printf "Restart Claude Code to take effect.\n"
 fi

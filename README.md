@@ -267,7 +267,7 @@ Create `~/.claude/statusline.conf` (bash, sourced directly). Full annotated vers
 - `CHALLENGE_START`, `BOUNTY_TARGET_TOKENS`, `BOUNTY_LOOKBACK_DAYS`, `BOUNTY_SESSION_GAP_MIN`
 
 **Row visibility** (each defaults on when its data exists; `0` hides it)
-- `SHOW_TOKENS_ROW`, `SHOW_CHALLENGE_ROW`, `SHOW_BOUNTY_ROW`
+- `SHOW_FABLE_ROW`, `SHOW_TOKENS_ROW`, `SHOW_CHALLENGE_ROW`, `SHOW_BOUNTY_ROW`
 
 **Live state stack row** (opt-in)
 - `SHOW_BACKENDS_ROW=1` — adds a `stack` row from `bin/live-state.py`: a snapshot across Claude (`account-resets.json`), Codex (newest `state_N.sqlite`), and hound autobuild agents (`sessions.jsonl`)
