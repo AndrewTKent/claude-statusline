@@ -1186,8 +1186,8 @@ def cmd_route(args) -> None:
     .json to the freshest account when the current one runs low, or (SET) hold
     the pinned account. All file writes — cannot storm."""
     log_line(
-        f"accounts route started (interval {args.interval}s; switch at ≥{args.at:.0f}% 5h; "
-        f"mode={load_mode()['mode']})"
+        f"accounts route started (interval {args.interval}s; escape at ≥{args.at:.0f}% 5h "
+        f"or ≥{ROUTE_CAP_PCT:.0f}% weekly; mode={load_mode()['mode']})"
     )
     while True:
         try:
