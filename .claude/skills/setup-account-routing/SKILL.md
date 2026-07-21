@@ -1,27 +1,28 @@
 ---
 name: setup-account-routing
-description: Set up ccx multi-account routing on top of the base statusline — account labels, credential store, minted launch tokens, zsh wrapper, route daemon.
+description: Set up the accounts router (multi-account routing for Claude Code) on top of the base statusline — account labels, credential store, minted launch tokens, zsh wrapper, route daemon.
 ---
 
-# Setup: account routing (ccx)
+# Setup: account routing (accounts)
 
 Multi-account routing for Claude Code: a headroom board across accounts,
 automatic switching when the live account runs low, launch-time routing to the
-freshest account, and pin-follows-login. Run `/setup-statusline` first — the
-two share `~/.claude/statusline.conf`.
+freshest account, and pin-follows-login. The command is `accounts`; `ccx` is
+the legacy alias and keeps working. Run `/setup-statusline` first — the two
+share `~/.claude/statusline.conf`.
 
 Two independent layers; install both for full coverage:
 
 - **Route daemon** — rewrites `~/.claude/.credentials.json` so the *running*
   session switches accounts mid-flight.
-- **Launch injection** — the `claude()` zsh wrapper asks `ccx pick-env` for the
-  best account at launch and injects `CLAUDE_CODE_OAUTH_TOKEN`.
+- **Launch injection** — the `claude()` zsh wrapper asks `accounts pick-env`
+  for the best account at launch and injects `CLAUDE_CODE_OAUTH_TOKEN`.
 
 ## Hard rules
 
-- ccx NEVER writes the live keychain slot `Claude Code-credentials` (file
-  writes + sanctioned deletion only). Do not "fix" that; it prevents the
-  keychain prompt-storm failure class.
+- The router NEVER writes the live keychain slot `Claude Code-credentials`
+  (file writes + sanctioned deletion only). Do not "fix" that; it prevents
+  the keychain prompt-storm failure class.
 - Never display or log token values. `~/.ccx/` contents stay out of
   transcripts and commits.
 
@@ -41,49 +42,50 @@ Two independent layers; install both for full coverage:
 2. **Install the CLI:**
 
    ```bash
-   ln -sf "$REPO/bin/ccx.py" ~/.local/bin/ccx
+   ln -sf "$REPO/bin/ccx.py" ~/.local/bin/accounts
+   ln -sf "$REPO/bin/ccx.py" ~/.local/bin/ccx    # legacy alias
    ```
 
 3. **Seed each account into the store.** In Claude Code, `/login` as the
    account, then:
 
    ```bash
-   ccx status
+   accounts status
    ```
 
-   Any ccx command captures the live credential into `~/.ccx/blobs.json`
-   under its label. Repeat per account. (That is the whole onboarding — there
-   is no enroll step.)
+   Any `accounts` command captures the live credential into
+   `~/.ccx/blobs.json` under its label. Repeat per account. (That is the
+   whole onboarding — there is no enroll step.)
 
 4. **Mint launch tokens** (enables launch-time routing; ~1-year lifetime,
    values are vaulted, never displayed):
 
    ```bash
-   ccx mint <label>     # per account; approves in the browser
-   ccx tokens           # inventory + expiry
+   accounts mint <label>     # per account; approves in the browser
+   accounts tokens           # inventory + expiry
    ```
 
 5. **Add the launch wrapper** to `~/.zshrc` (canonical copy — the repo is the
    source of truth for this block):
 
    ```zsh
-   # >>> ccx auto-route (env-token injection; zero keychain) >>>
+   # >>> accounts auto-route (env-token injection; zero keychain) >>>
    claude() {
      local _bin _env _mode _k
      _bin="$(whence -p claude)" || { print -u2 "claude binary not found"; return 127; }
      case " $* " in
        *" -p "*|*" --print "*|*" --version "*|*" --help "*|*" setup-token "*|*" -c "*|*" --continue "*|*" --resume "*)
-         _env="$("$HOME/.local/bin/ccx" pick-env 2>/dev/null)" || _env=""
+         _env="$("$HOME/.local/bin/accounts" pick-env 2>/dev/null)" || _env=""
          ( [ -n "$_env" ] && eval "$_env"; exec "$_bin" "$@" )
          return $? ;;
      esac
      _mode="start"
      while true; do
-       _env="$("$HOME/.local/bin/ccx" pick-env 2>/dev/null)" || _env=""
+       _env="$("$HOME/.local/bin/accounts" pick-env 2>/dev/null)" || _env=""
        ( [ -n "$_env" ] && eval "$_env"
-         [ -n "${CCX_ROUTED_LABEL:-}" ] && print -u2 "ccx → $CCX_ROUTED_LABEL"
+         [ -n "${CCX_ROUTED_LABEL:-}" ] && print -u2 "accounts → $CCX_ROUTED_LABEL"
          if [ "$_mode" = "start" ]; then exec "$_bin" "$@"; else exec "$_bin" --continue; fi )
-       printf 'ccx: [Enter] resume this conversation on the freshest account · anything else quits  '
+       printf 'accounts: [Enter] resume this conversation on the freshest account · anything else quits  '
        _k=""
        read -t 5 -k 1 _k 2>/dev/null || _k="q"
        printf '\n'
@@ -93,7 +95,7 @@ Two independent layers; install both for full coverage:
        esac
      done
    }
-   # <<< ccx auto-route <<<
+   # <<< accounts auto-route <<<
    ```
 
    Pin one launch: `CCX_ACCOUNT=<label> claude`. No minted tokens → the
@@ -111,8 +113,8 @@ Two independent layers; install both for full coverage:
 7. **Pick a mode:**
 
    ```bash
-   ccx auto           # route to the freshest account when the live one runs low
-   ccx set <label>    # pin and hold
+   accounts auto           # route to the freshest account when the live one runs low
+   accounts set <label>    # pin and hold
    ```
 
    - A fresh `/login` always moves the pin to that account — the daemon adopts
@@ -123,8 +125,8 @@ Two independent layers; install both for full coverage:
 ## Verify
 
 ```bash
-ccx ls                              # board: 5h / 7d / fable per account
-ccx status                          # mode line + live account
+accounts ls                         # board: 5h / 7d / fable per account
+accounts status                     # mode line + live account
 tail -5 ~/.claude/ccx-mirror.log    # every switch is logged with a reason
 ```
 
@@ -133,8 +135,12 @@ poll has run.
 
 ## When routing misbehaves
 
-1. `ccx status` — a surprising `SET → <label>` explains "why am I on X".
-2. `ccx auto` releases a pin; `ccx set <label>` moves it.
+1. `accounts status` — a surprising `SET → <label>` explains "why am I on X".
+2. `accounts auto` releases a pin; `accounts set <label>` moves it.
 3. Still fighting you: `launchctl unload ~/Library/LaunchAgents/com.claude-ccx-route.plist`,
    then `/login` sticks unconditionally; `load` re-arms.
 4. `~/.claude/ccx-mirror.log` names every write (`SET`, `ROUTED`, `ADOPT`).
+
+State paths (`~/.ccx/`), `CCX_*` variables, and the plist keep their historical
+names on purpose — they hold live credentials, and renaming them would force a
+migration for zero functional gain.
