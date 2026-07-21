@@ -1003,6 +1003,7 @@ def route_rows(blobs: dict, active_label: str | None, now_ts: float) -> list[dic
                 "label": label,
                 "email": e.get("email"),
                 "five_hour": effs["five_hour"],
+                "seven_day": effs["seven_day"],
                 "fable": effs["fable"],
                 "expired": blob_expired(e.get("blob", ""), now_ts),
                 "active": label == active_label,
@@ -1178,7 +1179,7 @@ def _fable_first(rows: list[dict]) -> list[dict]:
 
     def key(r: dict) -> tuple:
         effs = r["effs"]
-        if fable_eligible(effs["five_hour"], effs["fable"]):
+        if fable_eligible(effs["five_hour"], effs["seven_day"], effs["fable"]):
             return (0, effs["fable"])
         return (1, 0.0)
 
@@ -1231,15 +1232,21 @@ def notify(text: str, title: str = "accounts") -> None:
     )
 
 
-def fable_eligible(five_hour: float | None, fable: float | None) -> bool:
-    """Usable for Fable work: headroom on BOTH the weekly fable window and the 5h
-    window — fable headroom is worthless if 5h is capped (nothing can run). fable
-    None (tier has no weekly_scoped limit) or either axis at/over cap → ineligible."""
+def fable_eligible(
+    five_hour: float | None, seven_day: float | None, fable: float | None
+) -> bool:
+    """Usable for Fable work: headroom on the fable window AND both rate windows
+    (5h and 7d). Fable headroom is worthless if either rate window is capped — you
+    can't make requests at all (a maxed weekly is why a fresh-fable account can
+    still be unusable). fable None (tier has no weekly_scoped limit), or any of the
+    three axes None or at/over cap → ineligible."""
     return (
         fable is not None
         and fable < FABLE_CAP_PCT
         and five_hour is not None
         and five_hour < ROUTE_CAP_PCT
+        and seven_day is not None
+        and seven_day < ROUTE_CAP_PCT
     )
 
 
@@ -1253,7 +1260,7 @@ def route_pick_fable(rows: list[dict], excludes: set[str]) -> str | None:
         if not r["active"]
         and not r["expired"]
         and r["label"] not in excludes
-        and fable_eligible(r["five_hour"], r["fable"])
+        and fable_eligible(r["five_hour"], r["seven_day"], r["fable"])
     ]
     if not eligible:
         return None
@@ -1354,14 +1361,14 @@ def route_once(threshold: float) -> str | None:
             if pick is None:
                 # No other Fable account. Stay if live is still Fable-usable; else the
                 # Fable window is spent everywhere → hand to the normal 5h router.
-                if fable_eligible(cur["five_hour"], cur["fable"]):
+                if fable_eligible(cur["five_hour"], cur["seven_day"], cur["fable"]):
                     return None
                 return _auto_switch(rows, by_label, active, blobs, threshold, excludes)
             pick_fable = by_label[pick]["fable"]
             # Live still usable → move only for a MEANINGFULLY fresher account (weekly
             # fable drifts slowly, so this holds most passes). Live NOT usable → switch.
             if (
-                fable_eligible(cur["five_hour"], cur["fable"])
+                fable_eligible(cur["five_hour"], cur["seven_day"], cur["fable"])
                 and pick_fable >= cur["fable"] - FABLE_HYSTERESIS_PCT
             ):
                 return None
@@ -1452,7 +1459,7 @@ def cmd_fable(_args) -> None:
             for r in rows
             if r["label"] not in excludes
             and not r["expired"]
-            and fable_eligible(r["five_hour"], r["fable"])
+            and fable_eligible(r["five_hour"], r["seven_day"], r["fable"])
         ),
         key=lambda r: (r["fable"], r["five_hour"]),
     )

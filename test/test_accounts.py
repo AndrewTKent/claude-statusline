@@ -159,13 +159,13 @@ class TestCredExpiry:
         assert accounts.cred_expired(None) is False
 
 
-def _route_row(label, eff5, active=False, expired=False, fable=0.0):
+def _route_row(label, eff5, active=False, expired=False, fable=0.0, seven_day=0.0):
     return {
         "uuid": label,
         "label": label,
         "active": active,
         "expired": expired,
-        "effs": {"five_hour": eff5, "seven_day": 0.0, "fable": fable},
+        "effs": {"five_hour": eff5, "seven_day": seven_day, "fable": fable},
     }
 
 
@@ -264,9 +264,9 @@ class TestRouterCore:
         assert accounts.route_pick(rows, set()) is None
 
 
-def accounts_row(label, five_hour, expired=False, active=False, fable=0.0):
+def accounts_row(label, five_hour, expired=False, active=False, fable=0.0, seven_day=0.0):
     return {"label": label, "email": f"{label}@x", "five_hour": five_hour,
-            "fable": fable, "expired": expired, "active": active}
+            "seven_day": seven_day, "fable": fable, "expired": expired, "active": active}
 
 
 class TestUsageMapping:
@@ -857,30 +857,41 @@ class TestLoadModeFable:
 
 
 class TestFableEligible:
-    def test_both_under_cap(self):
-        assert accounts.fable_eligible(30.0, 40.0) is True
+    # signature: fable_eligible(five_hour, seven_day, fable)
+    def test_all_under_cap(self):
+        assert accounts.fable_eligible(30.0, 30.0, 40.0) is True
 
     def test_boundary_just_under_cap(self):
-        assert accounts.fable_eligible(94.0, 94.0) is True
+        assert accounts.fable_eligible(94.0, 94.0, 94.0) is True
 
     def test_fable_none_ineligible(self):
-        assert accounts.fable_eligible(10.0, None) is False
+        assert accounts.fable_eligible(10.0, 10.0, None) is False
 
     def test_fable_at_cap_ineligible(self):
-        assert accounts.fable_eligible(10.0, 95.0) is False  # cap is exclusive
+        assert accounts.fable_eligible(10.0, 10.0, 95.0) is False  # cap is exclusive
 
     def test_fable_over_cap_ineligible(self):
-        assert accounts.fable_eligible(10.0, 100.0) is False
+        assert accounts.fable_eligible(10.0, 10.0, 100.0) is False
 
     def test_five_hour_none_ineligible(self):
-        assert accounts.fable_eligible(None, 10.0) is False
+        assert accounts.fable_eligible(None, 10.0, 10.0) is False
 
     def test_five_hour_at_cap_ineligible(self):
-        assert accounts.fable_eligible(95.0, 10.0) is False  # 5h floor
+        assert accounts.fable_eligible(95.0, 10.0, 10.0) is False  # 5h floor
+
+    def test_seven_day_none_ineligible(self):
+        assert accounts.fable_eligible(10.0, None, 10.0) is False
+
+    def test_seven_day_at_cap_ineligible(self):
+        # the trap: fresh fable but the weekly (all-models) window is maxed
+        assert accounts.fable_eligible(10.0, 95.0, 10.0) is False
+
+    def test_fable_headroom_useless_when_weekly_capped(self):
+        # 0% fable used but weekly maxed → can't make requests → not usable
+        assert accounts.fable_eligible(10.0, 100.0, 0.0) is False
 
     def test_fable_headroom_useless_when_5h_capped(self):
-        # 0% fable used but 5h maxed → nothing can run → not usable for fable
-        assert accounts.fable_eligible(100.0, 0.0) is False
+        assert accounts.fable_eligible(100.0, 10.0, 0.0) is False
 
 
 class TestRoutePickFable:
@@ -925,6 +936,14 @@ class TestRoutePickFable:
                 accounts_row("B", 10.0, fable=None)]
         assert accounts.route_pick_fable(rows, set()) is None
 
+    def test_seven_day_floor_excludes_the_weekly_trap(self):
+        # gmail-shaped: freshest fable but weekly (7d) maxed → skip; brown wins.
+        # This is the exact live scenario: a fresh-fable account you can't run on.
+        rows = [accounts_row("A", 10.0, active=True, fable=90.0),
+                accounts_row("gmail", 0.0, fable=8.0, seven_day=100.0),   # trap
+                accounts_row("brown", 34.0, fable=41.0, seven_day=52.0)]
+        assert accounts.route_pick_fable(rows, set()) == "brown"
+
 
 class TestPickEnvFable:
     NOW = 1_784_000_000.0
@@ -959,3 +978,11 @@ class TestPickEnvFable:
         rows = [_route_row("brown", 20.0, fable=10.0), _route_row("ymail", 30.0, fable=40.0)]
         picked = accounts.pick_route(accounts._fable_first(rows), vault, set(), self.NOW, None)
         assert picked == ("ymail", "sk-ymail")
+
+    def test_skips_weekly_maxed_fable_account(self):
+        # gmail: freshest fable but weekly (7d) maxed → _fable_first drops it below
+        # brown (headroom on fable AND weekly), so pick_route lands on brown.
+        rows = [_route_row("gmail", 0.0, fable=8.0, seven_day=100.0),
+                _route_row("brown", 34.0, fable=41.0, seven_day=52.0)]
+        picked = accounts.pick_route(accounts._fable_first(rows), self.VAULT, set(), self.NOW, None)
+        assert picked == ("brown", "sk-brown")
