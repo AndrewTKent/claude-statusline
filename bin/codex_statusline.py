@@ -48,7 +48,7 @@ def resolve_state_db(home: Path) -> Path:
 
 
 STATE_DB = resolve_state_db(CODEX_HOME)
-CONFIG_FILE = CODEX_HOME / "statusline.conf"
+CONFIG_FILE = Path(os.environ.get("CODEX_STATUSLINE_CONFIG") or CODEX_HOME / "statusline.conf")
 DEFAULT_BAR_WIDTH = 15
 MAX_ROLLOUT_CACHE = 64
 MAX_ROLLOUT_CACHE_EVENTS = 20_000

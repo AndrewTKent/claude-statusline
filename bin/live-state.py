@@ -7,7 +7,7 @@ Snapshot only — for historical attribution, see scan_tokens_core.py.
 Reads (in this preference order):
   - ~/.claude/token-scan-summary.json  → engine-derived Codex rate_limit (auth)
   - ~/.claude/account-resets.json      → Claude 5h/7d utilization per account
-  - ~/.codex/state_5.sqlite            → Codex token-count fallback when no engine summary
+  - ~/.codex/state_N.sqlite (highest)  → Codex token-count fallback when no engine summary
   - ~/.agent-runner/sessions.jsonl        → remote-host agent session activity
 
 Modes:
@@ -33,7 +33,22 @@ from pathlib import Path
 HOME = Path(os.environ.get("HOME", os.path.expanduser("~")))
 CLAUDE_RESETS = HOME / ".claude" / "account-resets.json"
 CLAUDE_TOKEN_SUMMARY = HOME / ".claude" / "token-scan-summary.json"
-CODEX_STATE = HOME / ".codex" / "state_5.sqlite"
+
+
+def resolve_state_db(codex_home: Path) -> Path:
+    """Highest-versioned state_N.sqlite; falls back to state_5 if none exist yet."""
+    best_version, best_path = -1, codex_home / "state_5.sqlite"
+    for path in codex_home.glob("state_*.sqlite"):
+        try:
+            version = int(path.stem.split("_", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        if version > best_version:
+            best_version, best_path = version, path
+    return best_path
+
+
+CODEX_STATE = resolve_state_db(HOME / ".codex")
 AGENT_SESSIONS = HOME / ".agent-runner" / "sessions.jsonl"
 
 WINDOW_5H_SECS = 5 * 60 * 60
