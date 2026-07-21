@@ -17,8 +17,8 @@
     <string>com.claude-scan-tokens-watch</string>
     <key>ProgramArguments</key>
     <array>
-        <!-- Edit this path to point at your checkout of claude-statusline/bin/ -->
-        <string>/PATH/TO/claude-statusline/bin/scan-tokens-watch.sh</string>
+        <!-- Edit this path to point at your checkout of statusline/bin/ -->
+        <string>/PATH/TO/statusline/bin/scan-tokens-watch.sh</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
