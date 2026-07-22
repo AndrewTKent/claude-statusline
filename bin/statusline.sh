@@ -1601,7 +1601,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     fi
                 fi
                 tag=$(resolve_account_label "$em" "$uuid")
-                parsed+="${em}|${uuid}|${tag}|${ep}|${pct}|${pct_state}|${seven_day_iso}|${weekly_pct_ledger}|${fbl_iso}|${fable_pct_ledger}"$'\n'
+                parsed+="${em}|${uuid}|${tag}|${ep}|${pct}|${pct_state}|${seven_day_iso}|${weekly_pct_ledger}|${fbl_iso}|${fable_pct_ledger}|${last_seen_ts}"$'\n'
                 if [ -n "$ep" ]; then
                     if [ -z "$soonest_epoch" ] || [ "$ep" -lt "$soonest_epoch" ] 2>/dev/null; then
                         soonest_epoch="$ep"
@@ -1613,7 +1613,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
             # epoch sort to the end. Epoch is field 4; row now has 8 fields.
             parsed=$(printf '%s' "$parsed" | awk -F'|' 'NF>=8 { key=($4==""?"9999999999":$4); print key"\t"$0 }' | sort -n | cut -f2-)
 
-            while IFS='|' read -r em uuid tag ep pct pct_state seven_day_iso weekly_pct_ledger fbl_iso fable_pct_ledger; do
+            while IFS='|' read -r em uuid tag ep pct pct_state seven_day_iso weekly_pct_ledger fbl_iso fable_pct_ledger last_seen_ts; do
                 [ -z "$em" ] && continue
                 # Match the active account on (email, org_uuid). Legacy ledger
                 # entries with empty uuid only match when ACCT_ORG_UUID is also
@@ -1920,7 +1920,16 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     wk_reset_rel="—"
                 fi
                 if [ "${pct_state:-ok}" = "unknown" ]; then
-                    pct_raw="—"
+                    # Window rolled over since the last poll, so this % is last-known,
+                    # not current — show it dimmed rather than blanking to —, so a
+                    # burned account stays visible (the "~ stale" suffix flags it's not live).
+                    _last_int=$(printf "%.0f" "$pct" 2>/dev/null || echo 0)
+                    if [ "$_last_int" -gt 0 ] 2>/dev/null; then
+                        pct_raw="${_last_int}%"
+                        pct_color="$dim"
+                    else
+                        pct_raw="—"
+                    fi
                 else
                     pct_raw="${pct_int}%"
                 fi
