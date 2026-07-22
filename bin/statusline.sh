@@ -753,7 +753,15 @@ if [ -n "$SESSION_ID" ]; then
     [ "$_today_src" -eq 0 ] && _today_src=${DAILY_TOKENS:-0}
     _today_fmt=$(_usage_fmt "$_today_src")
     _session_fmt=$(_usage_fmt "${SESSION_DELTA:-0}")
+    # Lifetime from the durable per-day archive (usage-ledger.json), summing every
+    # bucket incl cache — the authoritative source. The scan's G_TOTAL double-counts
+    # (~2.3x) and drops cache reads, undercounting lifetime by ~60x; keep it as fallback.
     _lifetime_total=$(( ${G_TOTAL:-0} + ${G_RECOVERED:-0} ))
+    _ledger_file="$HOME/.claude/usage-ledger.json"
+    if [ -f "$_ledger_file" ]; then
+        _led=$(jq -r '[.days[] | .[] | (.input + .output + .cache_read + .cache_write + (.cache_write_1h // 0))] | add // 0 | floor' "$_ledger_file" 2>/dev/null)
+        [ -n "$_led" ] && [ "$_led" -gt 0 ] 2>/dev/null && _lifetime_total="$_led"
+    fi
     _lifetime_fmt=$(_usage_fmt "$_lifetime_total")
     USAGE_DISPLAY="${dim}today${reset} ${cyan}${_today_fmt}${reset} ${dim}·${reset} ${dim}session${reset} ${magenta}${_session_fmt}${reset} ${dim}·${reset} ${dim}lifetime${reset} ${green}${_lifetime_fmt}${reset}"
 fi
