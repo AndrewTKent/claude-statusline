@@ -1877,7 +1877,15 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 #   → resets Xh  — a reset lands within 2h (windfall)
                 #   (blank)      — unremarkable
                 note=""
-                headroom=$(( 100 - pct_int ))
+                # Runway is gated by the WORST window a session must clear: 5h +
+                # 7d always, + fable in fable mode (accounts.py binding_pct).
+                binding_int="$pct_int"
+                [ "${weekly_int:-0}" -gt "$binding_int" ] 2>/dev/null && binding_int="$weekly_int"
+                if [ "$_route_mode" = "fable" ] && [ -n "${fable_int:-}" ] && \
+                   [ "$fable_int" -gt "$binding_int" ] 2>/dev/null; then
+                    binding_int="$fable_int"
+                fi
+                headroom=$(( 100 - binding_int ))
                 extra_headroom=$(( 100 - extra_int ))
                 has_wall=0
                 if [ "$pct_int" -ge 90 ] 2>/dev/null && [ "$extra_int" -ge 99 ] 2>/dev/null; then
@@ -1887,11 +1895,10 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     fi
                 fi
 
-                # Compute planning score (for later pick of best non-current).
-                # Matches the python plan model: window_headroom + 0.5×extra
-                # + reset_windfall_if_within_2h − hard_wall_penalty.
+                # Score = binding headroom + 0.5×extra + 5h-reset windfall; the
+                # windfall only when 5h binds (a 5h reset can't restore 7d/fable).
                 windfall=0
-                if [ -n "$_hrs_to_reset" ]; then
+                if [ "$binding_int" -eq "$pct_int" ] 2>/dev/null && [ -n "$_hrs_to_reset" ]; then
                     # Bonus scaled by fraction of a 2h plan horizon that lands
                     # AFTER the reset.
                     windfall=$(awk -v h="$_hrs_to_reset" 'BEGIN {
@@ -1900,13 +1907,12 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 fi
                 score=$(( headroom + extra_headroom / 2 + windfall ))
                 [ "$has_wall" = "1" ] && score=0
-                # Weekly-capped accounts are bricks regardless of 5h headroom.
-                [ "${weekly_int:-0}" -ge 100 ] 2>/dev/null && score=0
+                # 95 mirrors the router's eligibility caps (RATE_CAP_PCT/FABLE_CAP_PCT).
+                [ "$binding_int" -ge 95 ] 2>/dev/null && score=0
                 [ -n "$exp_suffix" ] && score=0
-                # Under fable policy the marker must not point at an account the
-                # fable router would never pick (mirrors fable_eligible's cap).
-                if [ "$_route_mode" = "fable" ]; then
-                    { [ -z "${fable_int:-}" ] || [ "$fable_int" -ge 95 ] 2>/dev/null; } && score=0
+                # Fable mode can't rank an unknown fable axis (mirrors fable_eligible).
+                if [ "$_route_mode" = "fable" ] && [ -z "${fable_int:-}" ]; then
+                    score=0
                 fi
 
                 # Track best non-current account for the "✓ use now" marker.
