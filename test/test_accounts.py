@@ -486,7 +486,7 @@ class TestCmdStatus:
             "capture_live_to_blobs",
             lambda value: captured.append(value) or "gmail",
         )
-        monkeypatch.setattr(accounts, "sync_profile_credentials", lambda value, persist: False)
+        monkeypatch.setattr(accounts, "sync_profile_credentials", lambda value, persist: set())
         monkeypatch.setattr(accounts, "load_mode", lambda: {"mode": "auto", "label": None})
         monkeypatch.setattr(accounts, "route_rows", lambda value, active, now: [])
         monkeypatch.setattr(accounts, "excluded_labels", set)
