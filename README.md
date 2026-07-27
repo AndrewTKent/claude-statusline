@@ -29,7 +29,7 @@ Four tools, one repo, shared data files:
 
 - **Claude Code statusline** (`bin/statusline.sh`) — the multi-line dashboard below
 - **Codex statusline** (`bin/codex-statusline`, `codex-top`) — the same idea for the Codex CLI
-- **`accounts`** (`bin/accounts.py`) — multi-account router: headroom board, auto-switching, pin-follows-login
+- **`accounts`** (`bin/accounts.py`) — native-profile account routing and headroom board
 - **Token scanning & redaction** (`bin/scan-tokens*`) — attribute every token, redact before sharing
 
 ```
@@ -176,7 +176,7 @@ macOS Notification Center alerts fire automatically (once per threshold, deduped
 
 ### Automatic account detection
 
-When you `/login` to switch accounts, the status bar detects the change (OAuth token hash, with a credential-file mtime fallback) and immediately refreshes — rate limits, account label, and profile data update across all open sessions.
+When you `/login` inside a routed profile, the status bar detects the credential change before writing its ledgers, refreshes the profile, and updates the rate limits and account label on the next render. Sessions using that same native profile see the refreshed login.
 
 ---
 
@@ -276,30 +276,29 @@ Create `~/.claude/statusline.conf` (bash, sourced directly). Full annotated vers
 
 ## Accounts: Multi-Account Routing
 
-`accounts` (`bin/accounts.py`) is a router +
-headroom board for accounts logged in via `/login`. Onboarding is automatic: log
-into an account, then run a routing command (`route`, `set`, `auto`, `fable`, `status`) —
-it folds the live credential into `~/.accounts/blobs.json` on its own. No separate
-enrollment step.
+`accounts` (`bin/accounts.py`) is a per-session router and headroom board. Each
+account gets a native Claude config under `~/.accounts/profiles/<label>`.
+Credentials and entitlement caches are isolated; projects, transcripts, settings,
+skills, and plugins are shared. Interactive sessions remain first-party
+`claude.ai` subscription sessions instead of API/setup-token sessions.
 
 | Command | What it does |
 |---------|---------------|
-| `accounts route` | Router daemon: polls all accounts, auto-switches the live one when it runs low (`--interval`, `--at`, `--once`) |
-| `accounts set <label>` | Pin the live account to `<label>` (manual mode) |
-| `accounts auto` | Hand routing back to the daemon |
-| `accounts fable` | Prefer a Fable-capable account; fall back to normal 5h routing when none can |
+| `accounts set <label>` | Pin new and restarted sessions to `<label>` |
+| `accounts auto` | Route each new or restarted session to the freshest account |
+| `accounts fable` | Prefer a Fable-capable account; fall back to normal routing |
 | `accounts status` | Mode + per-account 5h headroom + ⚠login flags |
 | `accounts poll` | Refresh the usage board for all stored accounts now |
 | `accounts refresh [label]` | Re-auth stale blobs via their own refresh token, no browser (default: every stale-but-refreshable account) |
-| `accounts mint <label>` | Mint + vault a 1-year token via `claude setup-token` |
+| `accounts mint <label>` | Mint + vault a 1-year token for headless jobs |
 | `accounts tokens` | List minted tokens and expiry |
 | `accounts sync` | Converge the token vault with a second machine |
-| `accounts pick-env` | Emit env exports for the best routable account (wrapper hook) |
+| `accounts pick-env` | Emit `CLAUDE_CONFIG_DIR` and account metadata for the shell wrapper |
 
-A fresh `/login` always wins: the daemon adopts the account you just logged into
-instead of switching away from it.
-
-Routing never adds to or modifies the Keychain's live `Claude Code-credentials` slot — every switch is a plain file write to `~/.claude/.credentials.json`, followed by a delete of the keychain slot so Claude Code's own ~30s re-read lands on the file. Minted long-lived tokens live outside `~/.claude` (`~/.accounts/vault.json`), since the nightly transcript-archival chain mirrors `~/.claude` in plaintext.
+The wrapper chooses once at launch. Running sessions never have credentials
+changed underneath them; exit and resume to reroute the same conversation.
+Minted long-lived tokens remain outside `~/.claude`
+(`~/.accounts/vault.json`) because transcript archival mirrors `~/.claude`.
 
 ---
 
@@ -356,13 +355,13 @@ Run on a 30s launchd timer for auto-refresh. See [`macos/claude-widget/README.md
 Claude Code pipes a JSON status blob into the script via stdin on every tool call. The script:
 
 1. **Parses** model, cost, context, session metadata (single `jq` call)
-2. **Resolves** account label from the OAuth profile cache (tags all ledger entries) and updates the daily cost/token ledgers in `~/.claude/`
-3. **Scans** subagent JSONL files for the current session (cached 30s) and reads `token-scan-summary.json` (fallback: `token-scan-cache.json`) for the work/personal token split — kicks off a background `scan-tokens.py` rescan when that cache is stale (>180s)
-4. **Builds** the git/PR segment (branch, dirty, ahead/behind, `gh pr view` cached 90s) and the effort/fast-mode/focus badges
-5. **Fetches** rate limits and profile from Anthropic's OAuth API in the background, never blocking render (usage cached 60s, profile cached 5min)
-6. **Interpolates** usage between polls — tracks velocity across consecutive API responses for smooth fractional percentages
-7. **Builds** the budget row (if `DAILY_BUDGET` is set) and the optional multi-account reset board (if `SHOW_ACCOUNT_RESETS=1`)
-8. **Detects** account switches (OAuth token hash change, with a credential-mtime fallback → cache invalidation)
+2. **Detects** credential changes and validates changed profile identity before any account-tagged ledger write
+3. **Resolves** the account label from the OAuth profile cache and updates the daily cost/token ledgers in `~/.claude/`
+4. **Scans** subagent JSONL files for the current session (cached 30s) and reads `token-scan-summary.json` (fallback: `token-scan-cache.json`) for the work/personal token split — kicks off a background `scan-tokens.py` rescan when that cache is stale (>180s)
+5. **Builds** the git/PR segment (branch, dirty, ahead/behind, `gh pr view` cached 90s) and the effort/fast-mode/focus badges
+6. **Refreshes** rate limits and profile from Anthropic's OAuth API in the background (usage cached 60s, profile cached 5min)
+7. **Interpolates** usage between polls — tracks velocity across consecutive API responses for smooth fractional percentages
+8. **Builds** the budget row (if `DAILY_BUDGET` is set) and the optional multi-account reset board (if `SHOW_ACCOUNT_RESETS=1`)
 9. **Sets** terminal tab title to repo + branch
 10. **Checks** notification thresholds (fires once per crossing, deduped)
 11. **Renders** in your chosen format, falling back to `narrow` under `NARROW_THRESHOLD` columns
@@ -374,13 +373,14 @@ Claude Code                    statusline.sh
     │                              │
     ├─ stdin JSON ────────────────►│ parse (jq)
     │                              │
+    │                              ├─► changed credential: fetch profile (≤2s)
     │                              ├─► resolve account label (profile cache)
     │                              ├─► update daily-cost.json    (tagged w/ account)
     │                              ├─► update daily-tokens.json  (tagged w/ account)
     │                              ├─► scan subagent JSONL files (cached 30s)
     │                              ├─► read token-scan-summary.json (fallback: token-scan-cache.json)
     │                              ├─► background: fetch /api/oauth/usage (cached 60s)
-    │                              ├─► background: fetch /api/oauth/profile (cached 5min)
+    │                              ├─► background: refresh /api/oauth/profile (cached 5min)
     │                              ├─► check notification thresholds
     │                              ├─► set terminal tab title (\033]0;repo (branch)\007)
     │                              │
@@ -393,12 +393,12 @@ Claude Code                    statusline.sh
 
 | Concern | How it's handled |
 |---------|-----------------|
-| Network latency | Background subshell, never blocks render (usage poll 60s, profile poll 5min) |
+| Network latency | Background refreshes; a changed credential can block up to 2s for identity validation |
 | Concurrent sessions | Lock file with stale-PID detection (auto-cleanup at 30s) |
 | Git dirty check | `git diff-index --quiet HEAD` (faster than `git status`) |
 | PR status | `gh pr view` cached 90s, background-refreshed |
 | Ledger writes | Atomic (mktemp + mv) |
-| Account switch | OAuth token hash + credential mtime tracking, instant cache invalidation |
+| Account switch | OAuth token hash + credential mtime tracking, synchronous identity validation before ledger writes |
 | Subagent scan | File-based cache with 30s TTL, scoped to current session |
 | Token bar | `jq` read from `token-scan-summary.json` (fallback: `token-scan-cache.json`); the actual JSONL rescan runs in the background via `scan-tokens.py`, never inline |
 
@@ -420,17 +420,18 @@ Claude Code                    statusline.sh
 | `~/.claude/usage-ledger.json` | Durable per-day/per-model token ledger (`bin/usage-ledger.py`) | Permanent |
 | `~/.claude/statusline-tz` | Optional timezone override for reset-time display | Permanent |
 | `~/.claude/.credentials.json` | Claude Code's own OAuth credential — read-only, mtime-tracked | Claude-Code-managed |
-| `/tmp/claude/statusline-usage-cache.json` | Rate-limit API cache | 60s TTL |
-| `/tmp/claude/statusline-profile-cache.json` | Profile API cache | 5min TTL |
-| `/tmp/claude/statusline-usage-prev.json` | Previous poll, for interpolation | Updated each poll |
+| `/tmp/claude/statusline-usage-cache-<profile>.json` | Account-keyed rate-limit API cache | 60s TTL |
+| `/tmp/claude/statusline-profile-cache-<profile>.json` | Account-keyed profile API cache | 5min TTL |
+| `/tmp/claude/statusline-usage-prev-<profile>.json` | Account-keyed previous poll, for interpolation | Updated each poll |
+| `/tmp/claude/statusline-{usage,profile}-cache.json` | Current-profile aliases for companion apps | Updated each render |
 | `/tmp/claude/statusline-subagent-<sid>.txt` | Subagent token cache per session | 30s TTL |
 | `/tmp/claude/ctx-history-<sid>.txt` | Context-fill samples, for the fill-ETA calc | Rolling |
 | `/tmp/claude/statusline-pr-<branch>.json` | PR status cache | 90s TTL |
 | `/tmp/claude/statusline-raw.json` | Raw status blob, for macOS apps | Updated each render |
 | `/tmp/claude/statusline-notif-state.json` | Notification dedup state | Per-threshold |
-| `/tmp/claude/statusline-refresh.lock` | Background refresh lock | Transient |
-| `/tmp/claude/statusline-creds-mtime` | Credential mtime, account-switch fallback detector | Persistent |
-| `/tmp/claude/statusline-token-hash` | OAuth token hash, primary account-switch detector | Persistent |
+| `/tmp/claude/statusline-refresh-<profile>.lock` | Account-keyed background refresh lock | Transient |
+| `/tmp/claude/statusline-creds-mtime-<profile>` | Account-keyed credential mtime detector | Persistent |
+| `/tmp/claude/statusline-token-hash-<profile>` | Account-keyed OAuth token hash detector | Persistent |
 
 ---
 

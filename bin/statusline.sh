@@ -314,6 +314,14 @@ resolve_account_label() {
     echo "$email"
 }
 
+account_label_is_excluded() {
+    local candidate="$1" excluded
+    for excluded in ${ACCOUNTS_EXCLUDE:-}; do
+        [ "$candidate" = "$excluded" ] && return 0
+    done
+    return 1
+}
+
 # ── Reusable ledger writer ───────────────────────────────
 # Usage: update_ledger <mode> <file> <session_id> <value> <today> [acct]
 #
@@ -562,15 +570,121 @@ eval "$(echo "$input" | jq -r '
     "CTX_SIZE=" + (.context_window.context_window_size // 200000 | tostring | @sh)
 ' 2>/dev/null)"
 
+# ── OAuth token resolution ──────────────────────────────
+get_oauth_token() {
+    if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+        echo "$CLAUDE_CODE_OAUTH_TOKEN"
+        return 0
+    fi
+
+    if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+        local profile_creds="${CLAUDE_CONFIG_DIR}/.credentials.json"
+        if [ -f "$profile_creds" ]; then
+            local profile_token
+            profile_token=$(jq -r '.claudeAiOauth.accessToken // empty' "$profile_creds" 2>/dev/null)
+            if [ -n "$profile_token" ] && [ "$profile_token" != "null" ]; then
+                echo "$profile_token"
+                return 0
+            fi
+        fi
+        echo ""
+        return 0
+    fi
+
+    if command -v security >/dev/null 2>&1; then
+        local blob
+        blob=$(timeout 2 security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null || \
+               security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
+        if [ -n "$blob" ]; then
+            local token
+            token=$(echo "$blob" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
+            if [ -n "$token" ] && [ "$token" != "null" ]; then
+                echo "$token"
+                return 0
+            fi
+        fi
+    fi
+
+    local default_creds="${HOME}/.claude/.credentials.json"
+    if [ -f "$default_creds" ]; then
+        local token
+        token=$(jq -r '.claudeAiOauth.accessToken // empty' "$default_creds" 2>/dev/null)
+        if [ -n "$token" ] && [ "$token" != "null" ]; then
+            echo "$token"
+            return 0
+        fi
+    fi
+
+    echo ""
+}
+
 # ── Early account resolution (needed before ledger writes) ──
-ACCT_TAG=""
-ACCT_EMAIL=""
-ACCT_ORG_UUID=""
-profile_cache_file="/tmp/claude/statusline-profile-cache.json"
+ACCOUNT_CACHE_KEY="${ACCOUNTS_ROUTED_LABEL:-default}"
+ACCOUNT_CACHE_KEY="${ACCOUNT_CACHE_KEY//[!A-Za-z0-9._-]/_}"
+cache_file="/tmp/claude/statusline-usage-cache-${ACCOUNT_CACHE_KEY}.json"
+profile_cache_file="/tmp/claude/statusline-profile-cache-${ACCOUNT_CACHE_KEY}.json"
+prev_poll_file="/tmp/claude/statusline-usage-prev-${ACCOUNT_CACHE_KEY}.json"
+lock_file="/tmp/claude/statusline-refresh-${ACCOUNT_CACHE_KEY}.lock"
+token_hash_file="/tmp/claude/statusline-token-hash-${ACCOUNT_CACHE_KEY}"
+creds_file="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
+creds_mtime_file="/tmp/claude/statusline-creds-mtime-${ACCOUNT_CACHE_KEY}"
+cache_max_age=60
+profile_cache_max_age=300
+needs_refresh=false
+needs_profile_refresh=false
+now=$(date +%s)
+mkdir -p /tmp/claude
+ln -sfn "$cache_file" /tmp/claude/statusline-usage-cache.json 2>/dev/null || true
+ln -sfn "$profile_cache_file" /tmp/claude/statusline-profile-cache.json 2>/dev/null || true
+ln -sfn "$prev_poll_file" /tmp/claude/statusline-usage-prev.json 2>/dev/null || true
+
+if [ -f "$creds_file" ]; then
+    creds_mtime=$(stat -f %m "$creds_file" 2>/dev/null || stat -c %Y "$creds_file" 2>/dev/null)
+    old_creds_mtime=$(cat "$creds_mtime_file" 2>/dev/null)
+    if [ "$old_creds_mtime" != "$creds_mtime" ]; then
+        rm -f "$cache_file" "$profile_cache_file" "$lock_file"
+        echo "$creds_mtime" > "$creds_mtime_file"
+        needs_refresh=true
+        needs_profile_refresh=true
+    fi
+fi
+
+profile_identity_unverified=false
+current_token=$(get_oauth_token)
+if [ -n "$current_token" ] && [ "$current_token" != "null" ]; then
+    current_hash=$(printf '%s' "$current_token" | shasum -a 256 2>/dev/null | cut -c1-16)
+    old_hash=$(cat "$token_hash_file" 2>/dev/null)
+    if [ "$old_hash" != "$current_hash" ]; then
+        profile_identity_unverified=true
+        rm -f "$cache_file" "$profile_cache_file" "$lock_file"
+        echo "$current_hash" > "$token_hash_file"
+        needs_refresh=true
+        p_response=$(curl -s --max-time 2 \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $current_token" \
+            -H "anthropic-beta: oauth-2025-04-20" \
+            -H "User-Agent: claude-code/2.1.34" \
+            "https://api.anthropic.com/api/oauth/profile" 2>/dev/null)
+        if [ -n "$p_response" ] && echo "$p_response" | jq -e '.account' >/dev/null 2>&1; then
+            echo "$p_response" > "$profile_cache_file"
+            needs_profile_refresh=false
+            profile_identity_unverified=false
+        fi
+    fi
+fi
+
+ACCT_TAG="${ACCOUNTS_ROUTED_LABEL:-}"
+ACCT_EMAIL="${ACCOUNTS_ROUTED_EMAIL:-}"
+ACCT_ORG_UUID="${ACCOUNTS_ROUTED_ORG_UUID:-}"
 if [ -f "$profile_cache_file" ]; then
     ACCT_EMAIL=$(jq -r '.account.email // empty' "$profile_cache_file" 2>/dev/null)
     ACCT_ORG_UUID=$(jq -r '.organization.uuid // empty' "$profile_cache_file" 2>/dev/null)
     ACCT_TAG=$(resolve_account_label "$ACCT_EMAIL" "$ACCT_ORG_UUID")
+elif $profile_identity_unverified; then
+    ACCT_TAG=""
+    ACCT_EMAIL=""
+    ACCT_ORG_UUID=""
 fi
 
 # ── Daily cost ledger ──────────────────────────────────
@@ -927,95 +1041,7 @@ fi
 DIR_NAME="${CWD##*/}"
 DIR_NAME="${DIR_NAME##*\\}"
 
-# ── OAuth token resolution ──────────────────────────────
-get_oauth_token() {
-    if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
-        echo "$CLAUDE_CODE_OAUTH_TOKEN"
-        return 0
-    fi
-
-    # Keychain first, file fallback — mirrors cc's own credential store
-    # ('keychain-with-plaintext-fallback'): the slot wins whenever it exists;
-    # an accounts route deletes the slot, so both readers fall through to the file
-    # together and the board always shows the account cc is actually using.
-    if command -v security >/dev/null 2>&1; then
-        local blob
-        # Timeout guard: cap keychain call at 2 seconds
-        blob=$(timeout 2 security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null || \
-               security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
-        if [ -n "$blob" ]; then
-            local token
-            token=$(echo "$blob" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
-            if [ -n "$token" ] && [ "$token" != "null" ]; then
-                echo "$token"
-                return 0
-            fi
-        fi
-    fi
-
-    local creds_file="${HOME}/.claude/.credentials.json"
-    if [ -f "$creds_file" ]; then
-        local token
-        token=$(jq -r '.claudeAiOauth.accessToken // empty' "$creds_file" 2>/dev/null)
-        if [ -n "$token" ] && [ "$token" != "null" ]; then
-            echo "$token"
-            return 0
-        fi
-    fi
-
-    echo ""
-}
-
 # ── Fetch rate limits + profile (background, never blocking) ──
-cache_file="/tmp/claude/statusline-usage-cache.json"
-profile_cache_file="/tmp/claude/statusline-profile-cache.json"
-cache_max_age=60
-profile_cache_max_age=300
-lock_file="/tmp/claude/statusline-refresh.lock"
-mkdir -p /tmp/claude
-
-# Check if caches need refresh
-needs_refresh=false
-needs_profile_refresh=false
-now=$(date +%s)
-
-# Detect account switch: compare token hash (works with keychain + file)
-token_hash_file="/tmp/claude/statusline-token-hash"
-current_token=$(get_oauth_token)
-if [ -n "$current_token" ] && [ "$current_token" != "null" ]; then
-    current_hash=$(printf '%s' "$current_token" | shasum -a 256 2>/dev/null | cut -c1-16)
-    old_hash=$(cat "$token_hash_file" 2>/dev/null)
-    if [ "$old_hash" != "$current_hash" ]; then
-        rm -f "$cache_file" "$profile_cache_file" "$lock_file"
-        echo "$current_hash" > "$token_hash_file"
-        needs_refresh=true
-        # Synchronous profile fetch on account switch — avoids stale label
-        p_response=$(curl -s --max-time 2 \
-            -H "Accept: application/json" \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $current_token" \
-            -H "anthropic-beta: oauth-2025-04-20" \
-            -H "User-Agent: claude-code/2.1.34" \
-            "https://api.anthropic.com/api/oauth/profile" 2>/dev/null)
-        if [ -n "$p_response" ] && echo "$p_response" | jq -e '.account' >/dev/null 2>&1; then
-            echo "$p_response" > "$profile_cache_file"
-        fi
-        needs_profile_refresh=false
-    fi
-fi
-# Legacy fallback: also check credentials file mtime
-creds_file="$HOME/.claude/.credentials.json"
-if [ -f "$creds_file" ]; then
-    creds_mtime_file="/tmp/claude/statusline-creds-mtime"
-    creds_mtime=$(stat -f %m "$creds_file" 2>/dev/null || stat -c %Y "$creds_file" 2>/dev/null)
-    old_creds_mtime=$(cat "$creds_mtime_file" 2>/dev/null)
-    if [ "$old_creds_mtime" != "$creds_mtime" ]; then
-        rm -f "$cache_file" "$profile_cache_file" "$lock_file"
-        echo "$creds_mtime" > "$creds_mtime_file"
-        needs_refresh=true
-        needs_profile_refresh=true
-    fi
-fi
 
 if [ -f "$cache_file" ]; then
     cache_mtime=$(stat -f %m "$cache_file" 2>/dev/null || stat -c %Y "$cache_file" 2>/dev/null)
@@ -1079,7 +1105,7 @@ if $needs_refresh || $needs_profile_refresh; then
                             eval "$(jq -r '"prev_5h=" + (.five_hour.utilization // 0 | tostring),
                                            "prev_7d=" + (.seven_day.utilization // 0 | tostring),
                                            "prev_extra=" + (.extra_usage.used_credits // 0 | tostring)' "$cache_file" 2>/dev/null)"
-                            printf '{"ts":%s,"five_hour":%s,"seven_day":%s,"extra_used":%s}' "$prev_ts" "${prev_5h:-0}" "${prev_7d:-0}" "${prev_extra:-0}" > "/tmp/claude/statusline-usage-prev.json"
+                            printf '{"ts":%s,"five_hour":%s,"seven_day":%s,"extra_used":%s}' "$prev_ts" "${prev_5h:-0}" "${prev_7d:-0}" "${prev_extra:-0}" > "/tmp/claude/statusline-usage-prev-${ACCOUNT_CACHE_KEY}.json"
                         fi
                         echo "$response" > "$cache_file"
 
@@ -1349,7 +1375,6 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
     ' 2>/dev/null)"
 
     # Interpolate between polls for fractional precision
-    prev_poll_file="/tmp/claude/statusline-usage-prev.json"
     if [ -f "$prev_poll_file" ] && [ -f "$cache_file" ]; then
         poll_ts=$(stat -f %m "$cache_file" 2>/dev/null || stat -c %Y "$cache_file" 2>/dev/null)
         # One jq pull — saves 2 spawns per render.
@@ -1601,6 +1626,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     fi
                 fi
                 tag=$(resolve_account_label "$em" "$uuid")
+                account_label_is_excluded "$tag" && continue
                 parsed+="${em}|${uuid}|${tag}|${ep}|${pct}|${pct_state}|${seven_day_iso}|${weekly_pct_ledger}|${fbl_iso}|${fable_pct_ledger}|${last_seen_ts}"$'\n'
                 if [ -n "$ep" ]; then
                     if [ -z "$soonest_epoch" ] || [ "$ep" -lt "$soonest_epoch" ] 2>/dev/null; then
@@ -2081,25 +2107,25 @@ fi
 # Write raw JSON sidecar for external consumers (menu bar app, widgets)
 [ -n "$input" ] && echo "$input" > /tmp/claude/statusline-raw.json
 
-# ── Routing-mode badge (accounts router) ─────────────────
-# mode.json is intent; the launchctl probe catches intent-without-engine
-# (mode says fable/auto but the route daemon is not loaded → nothing switches).
+# ── Routed account + launch mode ─────────────────────────
 ROUTE_MODE_SUFFIX=""
 _mode_file="$HOME/.accounts/mode.json"
-if [ -f "$_mode_file" ]; then
-    _rmode=$(jq -r '.mode // ""' "$_mode_file" 2>/dev/null)
-    case "$_rmode" in
-        fable) _rlabel="fable" ;;
-        auto)  _rlabel="auto" ;;
-        set)   _rlabel="pinned" ;;
-        *)     _rlabel="" ;;
-    esac
+_routed_label="${ACCOUNTS_ROUTED_LABEL:-}"
+if [ -n "$_routed_label" ]; then
+    _rlabel=""
+    ROUTE_MODE_SUFFIX=" ${dim}· ${_routed_label}${reset}"
+    if [ -n "${ACCOUNTS_PIN:-}" ]; then
+        _rlabel="pin"
+    elif [ -f "$_mode_file" ]; then
+        _rmode=$(jq -r '.mode // ""' "$_mode_file" 2>/dev/null)
+        case "$_rmode" in
+            fable) _rlabel="fable" ;;
+            auto)  _rlabel="auto" ;;
+            set)   _rlabel="pinned" ;;
+        esac
+    fi
     if [ -n "$_rlabel" ]; then
-        if launchctl list com.claude-accounts-route >/dev/null 2>&1; then
-            ROUTE_MODE_SUFFIX=" ${dim}· ${_rlabel}${reset}"
-        else
-            ROUTE_MODE_SUFFIX=" ${dim}· ${_rlabel}${reset} ${red}(off)${reset}"
-        fi
+        ROUTE_MODE_SUFFIX+=" ${dim}· ${_rlabel}${reset}"
     fi
 fi
 
