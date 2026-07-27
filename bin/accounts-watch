@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Live account-headroom board. Re-renders on its own timer, independent of
-# Claude Code's statusline invocation — the route daemon keeps
-# ~/.claude/account-resets.json fresh (~30s), this just reads it on a loop.
+# Live account-headroom board. Re-renders the cached reset ledger; Claude's
+# statusline and `accounts poll` refresh its data.
 # Usage: accounts-watch [interval_seconds]   (default 5)
 set -euo pipefail
 

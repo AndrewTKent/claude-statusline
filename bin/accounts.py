@@ -1,24 +1,17 @@
 #!/usr/bin/env python3
 """accounts — Claude Code multi-account router and headroom board.
 
-cc's credential store (decompiled 2.1.214) is 'keychain-with-plaintext-fallback',
-re-read on a ~30s TTL: the Keychain item "Claude Code-credentials" wins whenever
-it exists; ~/.claude/.credentials.json is read only when it doesn't. On refresh,
-cc recreates the keychain slot itself and deletes the file. accounts therefore stores
-every account's full OAuth blob in ~/.accounts/blobs.json and switches by writing the
-FILE then DELETING the keychain slot — cc's next ~30s re-read lands on the file,
-mid-session. Accounts are ranked by remaining rate-limit headroom (reset-aware).
+Interactive sessions use one native CLAUDE_CONFIG_DIR profile per account.
+Credentials and entitlement caches stay isolated while projects, skills, settings,
+and transcript state are shared. Claude therefore sees claude.ai subscription auth,
+including Max-only model access, without global credential swaps or setup-token
+injection. Accounts are chosen at session launch by reset-aware headroom.
 
-accounts NEVER adds or modifies the Keychain live slot. macOS pins the slot's
-partition list to whoever writes it, so a programmatic Keychain write makes
-every reader storm password prompts (2026-07-17 incident). Deleting the slot
-re-pins nothing — cc recreates it itself — and is cc's own logout primitive.
+The setup-token vault remains separate for headless hound jobs.
 
 Router commands:
-  route           daemon: poll all accounts, switch the creds file to the
-                  freshest when the live one runs low (AUTO) or hold a pin (SET)
-  set LABEL       pin the live account to LABEL and hold it
-  auto            hand routing back to the daemon
+  set LABEL       pin new sessions to LABEL
+  auto            route new sessions to the freshest account
   fable           prefer a Fable-capable account; fall back to normal routing
   status / ls     mode + per-account 5h/7d/fable headroom, ⚠login flags
   poll / refresh  refresh the usage board / re-auth stale accounts (no browser)
@@ -35,9 +28,11 @@ import fnmatch
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from contextlib import contextmanager
@@ -498,7 +493,10 @@ def merge_reset_rows(rows: dict[str, dict]) -> None:
 
 def cmd_poll(_args) -> None:
     """Query every stored account's remaining limits and repaint the board."""
-    n = poll_blobs_usage(load_blobs())
+    with locked():
+        blobs = load_blobs()
+        sync_profile_credentials(blobs, persist=True)
+    n = poll_blobs_usage(blobs)
     print(f"refreshed usage for {n} account(s)")
 
 
@@ -510,7 +508,10 @@ def cmd_refresh(args) -> None:
     whose access token has expired but whose refresh token is still alive; pass a
     label to force one."""
     now = time.time()
-    accounts = load_blobs().get("accounts") or {}
+    with locked():
+        blobs = load_blobs()
+        sync_profile_credentials(blobs, persist=True)
+    accounts = blobs.get("accounts") or {}
     if args.label:
         if args.label not in accounts:
             raise AccountsError(f"no stored blob for '{args.label}'")
@@ -543,7 +544,9 @@ def cmd_refresh(args) -> None:
         # Persist now: the old refresh token is already dead server-side.
         with locked():
             fresh = load_blobs()
+            sync_profile_credentials(fresh, persist=False)
             fresh.setdefault("accounts", {}).setdefault(label, {})["blob"] = new_blob
+            write_profile_credentials(label, new_blob)
             save_blobs(fresh)
         revived += 1
         print(f"  {label}: refreshed")
@@ -552,31 +555,154 @@ def cmd_refresh(args) -> None:
         print(f"repainted board for {revived} refreshed account(s)")
 
 
-# ── token vault + router (zero keychain) ──────────────────────────────────
+# ── token vault + native profile router ───────────────────────────────────
 # Long-lived per-account tokens minted by `claude setup-token`, stored in a
 # 0600 file OUTSIDE ~/.claude (the nightly archival chain mirrors ~/.claude
 # session data to hound in plaintext — long-lived tokens must never land in an
-# archived path). Routing injects
-# CLAUDE_CODE_OAUTH_TOKEN into the child env, which outranks keychain auth;
-# the live keychain slot stays 100% Claude-Code-owned.
+# archived path). These tokens are for headless jobs, not interactive routing.
 
 TOKEN_VAULT_PATH = HOME / ".accounts" / "vault.json"
 TOKEN_LIFETIME_S = 364 * 24 * 3600
 TOKEN_RE = re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}")
+PROFILES_PATH = HOME / ".accounts" / "profiles"
+CLAUDE_HOME = HOME / ".claude"
+CLAUDE_STATE_PATH = HOME / ".claude.json"
 
-# The switch: cc reads ~/.claude/.credentials.json (verified on macOS). Writing
-# it is a plain FILE write — no keychain, no ACL/partition, so it can never
-# storm. We write the account's static setup-token blob; cc adopts that account.
-# The system, plainly: full OAuth blobs for every account live in a 0600 FILE
-# (~/.accounts/blobs.json). The daemon polls each blob's usage, and when the active
-# account runs low it OVERWRITES the single file cc reads (~/.claude/
-# .credentials.json) with the best account's blob — cc re-reads it and switches.
-# Every write is a plain file write: no keychain, no ACL/partition, cannot storm.
-# Full blobs (not setup-tokens) because only they carry the refresh token cc
-# needs and the scope the usage endpoint needs.
+PROFILE_SHARED_ENTRIES = (
+    "CLAUDE.md",
+    "agents",
+    "certificate",
+    "commands",
+    "file-history",
+    "history.jsonl",
+    "hooks",
+    "ide",
+    "jobs",
+    "parallel-agents.md",
+    "paste-cache",
+    "plans",
+    "plugins",
+    "pr-conventions.md",
+    "projects",
+    "remote-settings.json",
+    "session-env",
+    "session-history.jsonl",
+    "sessions",
+    "settings.json",
+    "settings.local.json",
+    "shell-snapshots",
+    "skills",
+    "slash-commands.json",
+    "statusline.conf",
+    "statusline.sh",
+    "tasks",
+    "workflows",
+)
+
+PROFILE_ACCOUNT_STATE_KEYS = {
+    "additionalModelCostsCache",
+    "additionalModelOptionsCache",
+    "cachedDynamicConfigs",
+    "cachedExperimentData",
+    "cachedExperimentFeatures",
+    "cachedExtraUsageDisabledReason",
+    "cachedGrowthBookFeatures",
+    "cachedGrowthBookFeaturesAt",
+    "cachedStatsigGates",
+    "clientDataCacheSlots",
+    "fableOverageConsentV2",
+    "modelAccessCache",
+    "oauthAccount",
+    "orgModelDefaultCache",
+    "overageCreditGrantCache",
+    "passesEligibilityCache",
+    "penguinModeOrgEnabled",
+    "s1mAccessCache",
+    "userID",
+}
+
+# Legacy global-switch primitives remain for stored-login migration tests only.
+# Interactive routing never calls them.
 CRED_FILE = HOME / ".claude" / ".credentials.json"
 MODE_PATH = HOME / ".accounts" / "mode.json"
 BLOBS_PATH = HOME / ".accounts" / "blobs.json"
+
+
+def native_profile_path(label: str) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", label):
+        raise AccountsError(f"invalid account label: {label!r}")
+    return PROFILES_PATH / label
+
+
+def _seed_profile_state(profile: Path) -> None:
+    state_path = profile / ".claude.json"
+    if state_path.exists():
+        return
+    try:
+        state = json.loads(CLAUDE_STATE_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        state = {"hasCompletedOnboarding": True}
+    for key in PROFILE_ACCOUNT_STATE_KEYS:
+        state.pop(key, None)
+    _write_0600(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+
+def ensure_native_profile(label: str, entry: dict) -> Path:
+    profile = native_profile_path(label)
+    profile.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(PROFILES_PATH, 0o700)
+    os.chmod(profile, 0o700)
+
+    stored_blob = entry.get("blob", "")
+    if not blob_access_token(stored_blob):
+        raise AccountsError(f"'{label}' has no usable OAuth credential")
+    credentials = profile / ".credentials.json"
+    try:
+        profile_blob = credentials.read_text()
+    except OSError:
+        profile_blob = ""
+    if not blob_access_token(profile_blob):
+        _write_0600(credentials, stored_blob)
+    else:
+        os.chmod(credentials, 0o600)
+
+    _seed_profile_state(profile)
+    for name in PROFILE_SHARED_ENTRIES:
+        source = CLAUDE_HOME / name
+        target = profile / name
+        if not source.exists():
+            continue
+        if target.is_symlink():
+            if target.resolve(strict=False) == source.resolve(strict=False):
+                continue
+            target.unlink()
+        elif target.exists():
+            continue
+        target.symlink_to(source, target_is_directory=source.is_dir())
+    return profile
+
+
+def write_profile_credentials(label: str, blob: str) -> None:
+    profile = native_profile_path(label)
+    if profile.exists():
+        _write_0600(profile / ".credentials.json", blob)
+
+
+def sync_profile_credentials(blobs: dict, *, persist: bool) -> bool:
+    changed = False
+    for label, entry in (blobs.get("accounts") or {}).items():
+        credentials = native_profile_path(label) / ".credentials.json"
+        try:
+            profile_blob = credentials.read_text()
+        except OSError:
+            continue
+        if not blob_access_token(profile_blob) or profile_blob == entry.get("blob"):
+            continue
+        entry["blob"] = profile_blob
+        changed = True
+    if changed and persist:
+        save_blobs(blobs)
+    return changed
 
 
 def load_mode() -> dict:
@@ -598,11 +724,20 @@ def save_mode(mode: str, label: str | None) -> None:
 
 def _write_0600(path: Path, text: str) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    tmp = path.with_suffix(".accounts-tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(text)
-    os.replace(tmp, path)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    tmp = Path(tmp_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _preserve_corrupt(path: Path) -> None:
@@ -849,6 +984,21 @@ def pick_route(rows: list[dict], vault: dict, excludes: set[str], now_ts: float,
     return None
 
 
+def pick_profile_route(rows: list[dict], excludes: set[str], pin: str | None) -> str | None:
+    for row in rows:
+        if pin is not None and row["label"] != pin:
+            continue
+        if row["expired"]:
+            continue
+        if pin is None:
+            if row["label"] in excludes:
+                continue
+            if not _rate_eligible(row["five_hour"], row["seven_day"]):
+                continue
+        return row["label"]
+    return None
+
+
 HOUND_HOSTS = ("hound", "hound-ts")
 HOUND_VAULT = "~/.accounts/vault.json"
 
@@ -948,7 +1098,7 @@ def cmd_tokens(_args) -> None:
     vault = load_token_vault()
     tokens = vault.get("tokens") or {}
     if not tokens:
-        print("no minted tokens — run `accounts mint <label>` per account you want routable")
+        print("no minted headless-job tokens")
         return
     now = time.time()
     for label in sorted(tokens):
@@ -973,30 +1123,36 @@ def _fable_first(rows: list[dict]) -> list[dict]:
 
 
 def cmd_pick_env(_args) -> None:
-    """Emit `export` lines for the best routable account (consumed by the
-    `claude` shell wrapper). Prints nothing when there is no routable token —
-    the wrapper then falls back to Claude Code's native keychain auth. Never
-    fails: routing must never block launching claude."""
+    """Emit a native account profile for the `claude` shell wrapper."""
+    print("unset CLAUDE_CODE_OAUTH_TOKEN")
+    print("unset CLAUDE_CONFIG_DIR")
+    print("unset ACCOUNTS_ROUTED_LABEL")
+    print("unset ACCOUNTS_ROUTED_EMAIL")
+    print("unset ACCOUNTS_ROUTED_ORG_UUID")
     try:
-        now = time.time()
-        # active_label=None: a launch hook ranks by headroom+token; pick_route ignores `active`.
-        rows = route_rows(load_blobs(), None, now)
-        if load_mode().get("mode") == "fable":
-            rows = _fable_first(rows)
-        pick = pick_route(
-            rows,
-            load_token_vault(),
-            excluded_labels(),
-            now,
-            os.environ.get("ACCOUNTS_PIN") or None,
-        )
+        with locked():
+            blobs = load_blobs()
+            sync_profile_credentials(blobs, persist=True)
+            mode = load_mode()
+            pin = os.environ.get("ACCOUNTS_PIN") or None
+            if pin is None and mode.get("mode") == "set":
+                pin = mode.get("label")
+            rows = route_rows(blobs, None, time.time())
+            if pin is None and mode.get("mode") == "fable":
+                rows = _fable_first(rows)
+            label = pick_profile_route(rows, excluded_labels(), pin)
+            if label is None:
+                return
+            entry = (blobs.get("accounts") or {}).get(label)
+            if entry is None:
+                return
+            profile = ensure_native_profile(label, entry)
     except Exception:
         return
-    if pick is None:
-        return
-    label, token = pick
-    print(f"export CLAUDE_CODE_OAUTH_TOKEN='{token}'")
-    print(f"export ACCOUNTS_ROUTED_LABEL='{label}'")
+    print(f"export CLAUDE_CONFIG_DIR={shlex.quote(str(profile))}")
+    print(f"export ACCOUNTS_ROUTED_LABEL={shlex.quote(label)}")
+    print(f"export ACCOUNTS_ROUTED_EMAIL={shlex.quote(entry.get('email') or '')}")
+    print(f"export ACCOUNTS_ROUTED_ORG_UUID={shlex.quote(entry.get('org_uuid') or '')}")
 
 
 ROUTE_AT_DEFAULT = 80.0  # switch when the active account's 5h usage crosses this
@@ -1181,75 +1337,45 @@ def route_once(threshold: float) -> str | None:
 
 
 def cmd_route(args) -> None:
-    """The router daemon. Every --interval seconds: capture cc's own refreshes,
-    poll all stored accounts' limits, and (AUTO) switch the live .credentials
-    .json to the freshest account when the current one runs low, or (SET) hold
-    the pinned account. All file writes — cannot storm."""
-    log_line(
-        f"accounts route started (interval {args.interval}s; escape at ≥{args.at:.0f}% 5h "
-        f"or ≥{ROUTE_CAP_PCT:.0f}% weekly; mode={load_mode()['mode']})"
-    )
-    while True:
-        try:
-            line = route_once(args.at)
-            if line:
-                log_line(line)
-                notify(line.split(" (")[0], "accounts")
-        except AccountsError as exc:
-            log_line(f"warn: {exc}")
-        except Exception as exc:  # daemon must survive anything
-            log_line(f"error: {type(exc).__name__}: {exc}")
-        if args.once:
-            return
-        time.sleep(args.interval)
+    del args
+    raise AccountsError("global credential routing is retired; use `accounts auto`")
 
 
 def cmd_set(args) -> None:
-    """Pin the live account to <label> and hold it there (manual mode)."""
+    """Pin new sessions to <label>."""
     with locked():
         blobs = load_blobs()
+        sync_profile_credentials(blobs, persist=True)
         e = (blobs.get("accounts") or {}).get(args.label)
         if not e:
-            die(f"'{args.label}' has no stored blob — /login as it, or `accounts mint {args.label}`, first")
+            die(f"'{args.label}' has no stored OAuth login")
         if blob_expired(e.get("blob", ""), time.time()):
-            die(f"'{args.label}' refresh token is expired — /login it first (won't write a dead cred)")
-        active = capture_live_to_blobs(blobs)  # fold any unsaved rotation of the outgoing account
-        # Mirror route_once's SET guard: live creds present but unattributable
-        # (offline / profile fetch failed) may be a cc-rotated token not yet in the
-        # store — overwriting would lose that account's login.
-        if active is None and live_cred()[0] is not None:
-            die(
-                "live creds present but unattributable (offline, or profile fetch failed) — "
-                "retry online before forcing a switch"
-            )
+            die(f"'{args.label}' refresh token is expired — /login it first")
+        ensure_native_profile(args.label, e)
         save_mode("set", args.label)
-        ok = apply_account(args.label, blobs)
-    print(f"SET → {args.label}" + ("" if ok else " (mode set; blob missing, not applied)"))
-    print("new + restarted sessions use it; a running session picks it up on its next creds re-read")
+    print(f"SET → {args.label}")
+    print("new and restarted sessions use it; running sessions keep their current account")
 
 
 def cmd_auto(_args) -> None:
-    """Hand routing back to the daemon (switch to freshest when the live account runs low)."""
+    """Route new sessions to the freshest account."""
     save_mode("auto", None)
-    with locked():
-        blobs = load_blobs()
-        active = capture_live_to_blobs(blobs)
-        rows = route_rows(blobs, active, time.time())
-    pick = route_pick(rows, excluded_labels())
-    print("AUTO — daemon routes to the freshest account when the live one runs low")
-    print(f"  live: {active or '?'} · would pick now: {pick or '(none free)'}")
+    blobs = load_blobs()
+    sync_profile_credentials(blobs, persist=False)
+    rows = route_rows(blobs, None, time.time())
+    pick = pick_profile_route(rows, excluded_labels(), None)
+    print("AUTO — each new or restarted session uses the freshest account")
+    print(f"  next: {pick or '(none free)'}")
 
 
 def cmd_fable(_args) -> None:
     """Prefer an account with Fable (premium weekly) headroom; degrade to normal
-    5h routing when none can do Fable. The daemon does the live switch."""
+    5h routing when none can do Fable."""
     save_mode("fable", None)
-    with locked():
-        blobs = load_blobs()
-        active = capture_live_to_blobs(blobs)
-        rows = route_rows(blobs, active, time.time())
+    blobs = load_blobs()
+    sync_profile_credentials(blobs, persist=False)
+    rows = route_rows(blobs, None, time.time())
     excludes = excluded_labels()
-    # Display-only: best eligible INCLUDING the active account (route_pick_fable excludes it).
     usable = sorted(
         (
             r
@@ -1260,41 +1386,39 @@ def cmd_fable(_args) -> None:
         ),
         key=lambda r: (r["fable"], r["five_hour"]),
     )
-    print("FABLE — daemon keeps you on a Fable-capable account; normal routing when none is")
+    print("FABLE — new and restarted sessions prefer Fable headroom")
     if not usable:
         print(
-            f"  live: {active or '?'} · no Fable headroom anywhere right now — "
-            f"routing normally (would pick {route_pick(rows, excludes) or '(none free)'})"
+            "  no Fable headroom anywhere right now — "
+            f"routing normally (next {pick_profile_route(rows, excludes, None) or '(none free)'})"
         )
-    elif usable[0]["label"] == active:
-        print(f"  live: {active} · already on the best Fable account (fable {usable[0]['fable']:.0f}%)")
     else:
-        print(
-            f"  live: {active or '?'} · will switch to {usable[0]['label']} "
-            f"(fable {usable[0]['fable']:.0f}%) within ~30s"
-        )
+        print(f"  next: {usable[0]['label']} (fable {usable[0]['fable']:.0f}%)")
 
 
 def cmd_status(_args) -> None:
     mode = load_mode()
     with locked():
         blobs = load_blobs()
-        active = capture_live_to_blobs(blobs)
-        rows = route_rows(blobs, active, time.time())
+        capture_live_to_blobs(blobs)
+        sync_profile_credentials(blobs, persist=True)
+    rows = route_rows(blobs, None, time.time())
     if mode["mode"] == "set":
         tag = f"SET → {mode['label']}"
+        next_label = pick_profile_route(rows, excluded_labels(), mode["label"])
     elif mode["mode"] == "fable":
         tag = "FABLE"
+        next_label = pick_profile_route(_fable_first(rows), excluded_labels(), None)
     else:
         tag = "AUTO"
-    print(f"mode: {tag}   live: {active or '?'}")
+        next_label = pick_profile_route(rows, excluded_labels(), None)
+    print(f"mode: {tag}   next: {next_label or '(none free)'}")
     for r in rows:
-        mark = "*" if r["active"] else " "
         pct = "—" if r["five_hour"] is None else f"{r['five_hour']:.0f}%"
         spct = "—" if r["seven_day"] is None else f"{r['seven_day']:.0f}%"
         fpct = "—" if r["fable"] is None else f"{r['fable']:.0f}%"
         flag = "  ⚠login" if r["expired"] else ""
-        print(f" {mark} {r['label']:<12} 5h {pct:>5}  7d {spct:>5}  fable {fpct:>5}{flag}")
+        print(f"   {r['label']:<12} 5h {pct:>5}  7d {spct:>5}  fable {fpct:>5}{flag}")
 
 
 def _fmt_pct(value: float | None, stale: bool) -> str:
@@ -1304,10 +1428,9 @@ def _fmt_pct(value: float | None, stale: bool) -> str:
 
 
 def cmd_ls(_args) -> None:
-    with locked():
-        blobs = load_blobs()
-        active = capture_live_to_blobs(blobs)
-    rows = route_rows(blobs, active, time.time())
+    blobs = load_blobs()
+    sync_profile_credentials(blobs, persist=False)
+    rows = route_rows(blobs, None, time.time())
     if not rows:
         print("no stored accounts — /login in Claude Code once; the next accounts command captures it")
         return
@@ -1317,7 +1440,6 @@ def cmd_ls(_args) -> None:
     print(f"{'':2}{'label':<12} {'email':<32} {'5h':>6} {'7d':>6} {'fable':>6}")
     any_expired = False
     for r in rows:
-        mark = "* " if r["active"] else "  "
         if r["expired"]:
             suffix = "  EXPIRED — /login to refresh"
             any_expired = True
@@ -1326,12 +1448,12 @@ def cmd_ls(_args) -> None:
         else:
             suffix = ""
         print(
-            f"{mark}{r['label']:<12} {r['email'] or '?':<32} "
+            f"  {r['label']:<12} {r['email'] or '?':<32} "
             f"{_fmt_pct(r['five_hour'], r['stale']):>6} "
             f"{_fmt_pct(r['seven_day'], r['stale']):>6} "
             f"{_fmt_pct(r['fable'], r['stale']):>6}{suffix}"
         )
-    print("\n* = matches live slot   ~ = estimate stale (>3h since that account was live)")
+    print("\n~ = estimate stale (>3h since that account was polled)")
     print("pcts are USED (0% = full headroom), reset-aware; sorted best-first")
     if any_expired:
         print("EXPIRED = stored refresh token dead; switch to it needs a fresh /login")
@@ -1341,17 +1463,17 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="accounts", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_route = sub.add_parser("route", help="router daemon: poll all, auto-switch the live account")
+    p_route = sub.add_parser("route", help="retired global router (use `accounts auto`)")
     p_route.add_argument("--interval", type=float, default=30.0)
     p_route.add_argument("--at", type=float, default=ROUTE_AT_DEFAULT, help="switch at this 5h%%")
     p_route.add_argument("--once", action="store_true")
     p_route.set_defaults(fn=cmd_route)
 
-    p_set = sub.add_parser("set", help="pin the live account to <label> (manual mode)")
+    p_set = sub.add_parser("set", help="pin new sessions to <label>")
     p_set.add_argument("label")
     p_set.set_defaults(fn=cmd_set)
 
-    sub.add_parser("auto", help="hand routing back to the daemon").set_defaults(fn=cmd_auto)
+    sub.add_parser("auto", help="route new sessions to the freshest account").set_defaults(fn=cmd_auto)
     sub.add_parser(
         "fable", help="prefer a Fable-capable account; fall back to normal routing"
     ).set_defaults(fn=cmd_fable)
