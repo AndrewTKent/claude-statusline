@@ -907,13 +907,16 @@ class CodexStatuslineTest(unittest.TestCase):
                 stdout=subprocess.PIPE,
                 text=True,
             )
+            assert child.stdout is not None
+            stdout = child.stdout
             try:
-                assert child.stdout is not None
-                self.assertEqual(child.stdout.readline().strip(), "ready")
+                self.assertEqual(stdout.readline().strip(), "ready")
                 found = codex_statusline.process_rollout_paths(os.getpid())
             finally:
                 child.kill()
                 child.wait()
+                stdout.close()
+            self.assertTrue(stdout.closed)
 
         self.assertIn(
             os.path.realpath(str(rollout)),
