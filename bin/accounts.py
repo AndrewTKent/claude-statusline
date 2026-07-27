@@ -50,6 +50,8 @@ USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"  # public Claude Code OAuth client (PKCE, no secret)
 STALE_AFTER_S = 3 * 3600
+LEGACY_ROUTE_AGENT_LABEL = "com.claude-accounts-route"
+LEGACY_ROUTE_AGENT_PATH = HOME / "Library" / "LaunchAgents" / f"{LEGACY_ROUTE_AGENT_LABEL}.plist"
 
 
 class AccountsError(RuntimeError):
@@ -74,6 +76,40 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def retire_legacy_route_agent() -> None:
+    if sys.platform != "darwin":
+        return
+    try:
+        LEGACY_ROUTE_AGENT_PATH.unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"accounts: could not remove retired route agent plist: {exc}", file=sys.stderr)
+    target = f"gui/{os.getuid()}/{LEGACY_ROUTE_AGENT_LABEL}"
+    try:
+        probe = subprocess.run(
+            ["launchctl", "print", target],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"accounts: could not inspect retired route agent: {exc}", file=sys.stderr)
+        return
+    if probe.returncode != 0:
+        return
+    try:
+        stopped = subprocess.run(
+            ["launchctl", "bootout", target],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"accounts: could not stop retired route agent: {exc}", file=sys.stderr)
+        return
+    if stopped.returncode != 0:
+        print("accounts: could not stop retired route agent; will retry", file=sys.stderr)
+
+
 # ── keychain ──────────────────────────────────────────────────────────────
 
 
@@ -89,37 +125,6 @@ def kc_read(service: str, account: str | None = None) -> str | None:
     if r.returncode != 0:
         return None
     return r.stdout.rstrip("\n")
-
-
-def kc_slot_status(service: str) -> str:
-    """'present' | 'absent' | 'unknown' — metadata-only probe (no secret read, so
-    it works even when the keychain is locked and a -w read would be refused)."""
-    try:
-        r = subprocess.run(
-            ["security", "find-generic-password", "-s", service],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except subprocess.TimeoutExpired:
-        return "unknown"
-    if r.returncode == 0:
-        return "present"
-    if r.returncode == 44:  # errSecItemNotFound
-        return "absent"
-    return "unknown"
-
-
-def kc_delete(service: str, account: str | None = None) -> None:
-    cmd = ["security", "delete-generic-password", "-s", service]
-    if account is not None:
-        cmd += ["-a", account]
-    try:
-        subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-    except subprocess.TimeoutExpired:
-        pass  # caller re-probes the slot; a hang must not wedge the flock holder
-
-
 
 
 # ── identity ──────────────────────────────────────────────────────────────
@@ -434,10 +439,8 @@ _lock_depth = 0  # accounts is single-threaded; nested locked() must not re-floc
 
 @contextmanager
 def locked(blocking: bool = True):
-    # Reentrant within this process. macOS flock ties the lock to the open file
-    # description, so a second open()+flock from the SAME process (route_once
-    # holds it → poll's merge_reset_rows re-takes it) blocks forever. Only the
-    # outermost frame flocks; nested calls are no-ops.
+    # A second open()+flock from the same process blocks on macOS.
+    # Only the outermost frame flocks.
     global _lock_depth
     if _lock_depth > 0:
         _lock_depth += 1
@@ -621,8 +624,7 @@ PROFILE_ACCOUNT_STATE_KEYS = {
     "userID",
 }
 
-# Legacy global-switch primitives remain for stored-login migration tests only.
-# Interactive routing never calls them.
+# Default-profile credential source used to capture login and refresh state.
 CRED_FILE = HOME / ".claude" / ".credentials.json"
 MODE_PATH = HOME / ".accounts" / "mode.json"
 BLOBS_PATH = HOME / ".accounts" / "blobs.json"
@@ -820,13 +822,6 @@ def save_blobs(blobs: dict) -> None:
     _write_0600(BLOBS_PATH, json.dumps(blobs, indent=2, sort_keys=True) + "\n")
 
 
-def write_live_creds(blob: str) -> None:
-    """Atomic 0600 write of ~/.claude/.credentials.json. FILE ONLY; the live
-    keychain slot is never added/modified (that write is what stormed
-    2026-07-17 — deletion is the only sanctioned keychain-slot operation)."""
-    _write_0600(CRED_FILE, blob)
-
-
 def live_cred() -> tuple[str | None, str | None]:
     """The credential cc is actually using, mirroring cc's own read order
     (its store is literally 'keychain-with-plaintext-fallback', re-read on a
@@ -865,26 +860,6 @@ def capture_live_to_blobs(blobs: dict) -> str | None:
     acct.update({"blob": live, "email": ident.get("email"), "org_uuid": ident.get("org_uuid")})
     save_blobs(blobs)
     return label
-
-
-def apply_account(label: str, blobs: dict) -> bool:
-    """Make `label` the live account. cc reads keychain-first with the file as
-    fallback, so the switch is: write the file, then DELETE the keychain slot —
-    cc's next ~30s re-read misses the keychain and picks up the file, mid-
-    session. Deletion never re-pins ACLs (there is nothing left to pin) and cc
-    recreates the slot itself on its next refresh; the slot is never
-    added/modified from here. Returns False if we hold no blob for `label`."""
-    e = (blobs.get("accounts") or {}).get(label)
-    if not e or not e.get("blob"):
-        return False
-    write_live_creds(e["blob"])
-    status = kc_slot_status(LIVE_SERVICE)
-    if status == "present":
-        kc_delete(LIVE_SERVICE)
-        status = kc_slot_status(LIVE_SERVICE)
-    if status != "absent":  # survived delete, or unreadable (locked keychain / wedged securityd)
-        log_line(f"warn: keychain live slot {status} after switch; cc may keep reading it")
-    return True
 
 
 def blob_expired(blob: str, now_ts: float) -> bool:
@@ -962,22 +937,10 @@ def _rate_eligible(five_hour: float | None, seven_day: float | None) -> bool:
     ping-pongs). None on either axis is unknown → ineligible."""
     return (
         five_hour is not None
-        and five_hour < ROUTE_CAP_PCT
+        and five_hour < RATE_CAP_PCT
         and seven_day is not None
-        and seven_day < ROUTE_CAP_PCT
+        and seven_day < RATE_CAP_PCT
     )
-
-
-def route_pick(rows: list[dict], excludes: set[str]) -> str | None:
-    """Best switchable account: freshest 5h among rate-eligible (both windows
-    below cap), not active, not excluded, cred live."""
-    for r in rows:
-        if r["active"] or r["expired"] or r["label"] in excludes:
-            continue
-        if not _rate_eligible(r["five_hour"], r["seven_day"]):
-            continue
-        return r["label"]
-    return None
 
 
 def load_token_vault() -> dict:
@@ -1195,25 +1158,8 @@ def cmd_pick_env(_args) -> None:
     print(f"export ACCOUNTS_ROUTED_ORG_UUID={shlex.quote(entry.get('org_uuid') or '')}")
 
 
-ROUTE_AT_DEFAULT = 80.0  # switch when the active account's 5h usage crosses this
-ROUTE_HYSTERESIS_PCT = 10.0  # below cap: only switch for a headroom gain this large
-ROUTE_CAP_PCT = 95.0  # at/above this the live account is ~capped: escape to a usable account
-ROUTE_MIN_DWELL_S = 300.0  # >= this long between AUTO switches (each cold-starts a prompt cache)
-FABLE_CAP_PCT = 95.0  # fable weekly window ~exhausted; separate axis from ROUTE_CAP_PCT (5h)
-FABLE_HYSTERESIS_PCT = 10.0  # fable mode: only chase a meaningfully fresher account (no near-tie churn)
-
-# Monotonic so an NTP step-back can't wedge routing; None = never switched this
-# process. Daemon is one long-lived process, so no persistence needed.
-_last_switch_ts: float | None = None
-
-
-def notify(text: str, title: str = "accounts") -> None:
-    safe = text.replace('"', "'")
-    subprocess.run(
-        ["osascript", "-e", f'display notification "{safe}" with title "{title}"'],
-        capture_output=True,
-        text=True,
-    )
+RATE_CAP_PCT = 95.0
+FABLE_CAP_PCT = 95.0
 
 
 def fable_eligible(
@@ -1228,157 +1174,10 @@ def fable_eligible(
         fable is not None
         and fable < FABLE_CAP_PCT
         and five_hour is not None
-        and five_hour < ROUTE_CAP_PCT
+        and five_hour < RATE_CAP_PCT
         and seven_day is not None
-        and seven_day < ROUTE_CAP_PCT
+        and seven_day < RATE_CAP_PCT
     )
-
-
-def route_pick_fable(rows: list[dict], excludes: set[str]) -> str | None:
-    """Best OTHER account to switch to for Fable: eligible on both axes, not
-    active/expired/excluded, least fable used first (5h as tiebreak). None when no
-    other account qualifies — the caller then holds or falls back to the 5h router."""
-    eligible = [
-        r
-        for r in rows
-        if not r["active"]
-        and not r["expired"]
-        and r["label"] not in excludes
-        and fable_eligible(r["five_hour"], r["seven_day"], r["fable"])
-    ]
-    if not eligible:
-        return None
-    eligible.sort(key=lambda r: (r["fable"], r["five_hour"]))  # both non-None by eligibility
-    return eligible[0]["label"]
-
-
-def _auto_switch(
-    rows: list[dict],
-    by_label: dict,
-    active: str | None,
-    blobs: dict,
-    threshold: float,
-    excludes: set[str],
-) -> str | None:
-    """AUTO decision: switch to the freshest 5h account when the live one is past
-    `threshold`, with cap/hysteresis/dwell anti-thrash. Shared by AUTO and the
-    fable-mode fallback. Caller holds the lock."""
-    global _last_switch_ts
-    cur = by_label.get(active) if active else None
-    if cur is None:
-        return None
-    cur_5h = cur["five_hour"]
-    cur_7d = cur["seven_day"]
-    # Walled = past the 5h soft threshold OR near the weekly hard cap. Weekly
-    # exhaustion blocks the session as hard as 5h but is a separate axis; the
-    # old trigger watched only 5h, so a maxed weekly stranded the live session
-    # with no rescue.
-    past_5h = cur_5h is not None and cur_5h >= threshold
-    weekly_walled = cur_7d is not None and cur_7d >= ROUTE_CAP_PCT
-    if not (past_5h or weekly_walled):
-        return None
-    pick = route_pick(rows, excludes)
-    if pick is None:
-        # No rate-viable account anywhere (every candidate walled on some axis).
-        # Hold — never thrash between two dead accounts.
-        return None
-    # Soft case: 5h merely past threshold, both windows still usable → only move
-    # for a MEANINGFULLY fresher account (no near-tie churn). A hard wall on
-    # either axis (capped 5h, or weekly walled) skips the hysteresis: the live
-    # account can't serve requests at all, so escape regardless of the margin.
-    cur_capped = (cur_5h is not None and cur_5h >= ROUTE_CAP_PCT) or weekly_walled
-    if not cur_capped:
-        pick_5h = by_label[pick]["five_hour"]
-        if pick_5h is None or cur_5h is None or pick_5h >= cur_5h - ROUTE_HYSTERESIS_PCT:
-            return None
-    # Each switch cold-starts the new account's prompt cache, so cap the rate at
-    # one per dwell regardless of how the board drifts under usage feedback.
-    if _last_switch_ts is not None and time.monotonic() - _last_switch_ts < ROUTE_MIN_DWELL_S:
-        return None
-    if apply_account(pick, blobs):
-        _last_switch_ts = time.monotonic()
-        reason = "weekly" if weekly_walled else "5h"
-        return f"ROUTED {active} → {pick} ({reason} wall)"
-    return None
-
-
-def route_once(threshold: float) -> str | None:
-    """One pass of the whole system: fold in any cc refresh, poll every stored
-    account's limits, then — in AUTO — if the live account is past `threshold`
-    and a better one exists, overwrite .credentials.json with it. In SET, keep
-    the pinned account live. Returns a log line if it switched, else None.
-    Only ever writes files; never the keychain."""
-    global _last_switch_ts
-    with locked():
-        blobs = load_blobs()
-        capture_live_to_blobs(blobs)  # fold any cc refresh from before this pass
-        poll_blobs_usage(blobs)  # seconds of network per account
-        # cc may have refreshed (and rotated) the live token during the poll;
-        # re-capture so we never overwrite an unsaved rotation below.
-        active = capture_live_to_blobs(blobs)
-        now = time.time()
-        rows = route_rows(blobs, active, now)
-        by_label = {r["label"]: r for r in rows}
-        mode = load_mode()
-
-        if mode["mode"] == "set":
-            target = mode.get("label")
-            if not target or target == active:
-                return None
-            # A keychain blob carrying refreshTokenExpiresAt is a fresh /login (cc's
-            # rotations omit it): the user picked an account — move the pin, don't clobber.
-            if active is not None:
-                live, src = live_cred()
-                if src == "keychain" and live and blob_refresh_expiry(live) is not None:
-                    save_mode("set", active)
-                    return f"ADOPT /login {target} → {active} (pin follows the login)"
-            if (by_label.get(target) or {}).get("expired"):
-                return None
-            # active is None both for "no live cred anywhere" (seed it) and
-            # "live cred present but profile fetch failed" (unattributed). Don't
-            # overwrite an unattributed live token — it may be a cc-rotated one
-            # we'd clobber.
-            if active is None and live_cred()[0] is not None:
-                return None
-            if apply_account(target, blobs):
-                return f"SET {active or '?'} → {target}"
-            return None
-
-        excludes = excluded_labels()
-
-        if mode["mode"] == "fable":
-            cur = by_label.get(active) if active else None
-            if cur is None:
-                return None  # unattributed/absent live cred — don't clobber (mirrors AUTO/SET)
-            pick = route_pick_fable(rows, excludes)  # best OTHER eligible account
-            if pick is None:
-                # No other Fable account. Stay if live is still Fable-usable; else the
-                # Fable window is spent everywhere → hand to the normal 5h router.
-                if fable_eligible(cur["five_hour"], cur["seven_day"], cur["fable"]):
-                    return None
-                return _auto_switch(rows, by_label, active, blobs, threshold, excludes)
-            pick_fable = by_label[pick]["fable"]
-            # Live still usable → move only for a MEANINGFULLY fresher account (weekly
-            # fable drifts slowly, so this holds most passes). Live NOT usable → switch.
-            if (
-                fable_eligible(cur["five_hour"], cur["seven_day"], cur["fable"])
-                and pick_fable >= cur["fable"] - FABLE_HYSTERESIS_PCT
-            ):
-                return None
-            if _last_switch_ts is not None and time.monotonic() - _last_switch_ts < ROUTE_MIN_DWELL_S:
-                return None
-            if apply_account(pick, blobs):
-                _last_switch_ts = time.monotonic()
-                cur_f = f"{cur['fable']:.0f}%" if cur["fable"] is not None else "—"
-                return f"FABLE {active} → {pick} (fable {cur_f} → {pick_fable:.0f}%)"
-            return None
-
-        return _auto_switch(rows, by_label, active, blobs, threshold, excludes)
-
-
-def cmd_route(args) -> None:
-    del args
-    raise AccountsError("global credential routing is retired; use `accounts auto`")
 
 
 def cmd_set(args) -> None:
@@ -1516,14 +1315,9 @@ def cmd_ls(_args) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
+    retire_legacy_route_agent()
     parser = argparse.ArgumentParser(prog="accounts", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
-
-    p_route = sub.add_parser("route", help="retired global router (use `accounts auto`)")
-    p_route.add_argument("--interval", type=float, default=30.0)
-    p_route.add_argument("--at", type=float, default=ROUTE_AT_DEFAULT, help="switch at this 5h%%")
-    p_route.add_argument("--once", action="store_true")
-    p_route.set_defaults(fn=cmd_route)
 
     p_set = sub.add_parser("set", help="pin new sessions to <label>")
     p_set.add_argument("label")
