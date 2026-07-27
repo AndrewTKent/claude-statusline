@@ -1451,21 +1451,27 @@ def cmd_status(_args) -> None:
     rows = [
         row for row in route_rows(blobs, None, time.time()) if row["label"] not in blocked_labels
     ]
+    excludes = excluded_labels()
     if mode["mode"] == "set":
         tag = f"SET → {mode['label']}"
-        next_label = pick_profile_route(rows, excluded_labels(), mode["label"])
+        next_label = pick_profile_route(rows, excludes, mode["label"])
     elif mode["mode"] == "fable":
         tag = "FABLE"
-        next_label = pick_profile_route(_fable_first(rows), excluded_labels(), None)
+        next_label = pick_profile_route(_fable_first(rows), excludes, None)
     else:
         tag = "AUTO"
-        next_label = pick_profile_route(rows, excluded_labels(), None)
+        next_label = pick_profile_route(rows, excludes, None)
     print(f"mode: {tag}   next: {next_label or '(none free)'}")
     for r in rows:
         pct = "—" if r["five_hour"] is None else f"{r['five_hour']:.0f}%"
         spct = "—" if r["seven_day"] is None else f"{r['seven_day']:.0f}%"
         fpct = "—" if r["fable"] is None else f"{r['fable']:.0f}%"
-        flag = "  ⚠login" if r["expired"] else ""
+        if r["expired"]:
+            flag = "  ⚠login"
+        elif r["label"] in excludes:
+            flag = "  [excluded]"
+        else:
+            flag = ""
         print(f"   {r['label']:<12} 5h {pct:>5}  7d {spct:>5}  fable {fpct:>5}{flag}")
 
 

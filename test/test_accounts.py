@@ -660,6 +660,25 @@ class TestCmdStatus:
         assert captured == [blobs]
         assert "mode: AUTO" in capsys.readouterr().out
 
+    def test_marks_excluded_accounts(self, monkeypatch, capsys):
+        monkeypatch.setattr(accounts, "locked", lambda blocking=True: nullcontext())
+        monkeypatch.setattr(accounts, "load_blobs", lambda: {"accounts": {}})
+        monkeypatch.setattr(accounts, "capture_live_to_blobs", lambda blobs: None)
+        monkeypatch.setattr(accounts, "sync_profile_credentials", lambda blobs, persist: set())
+        monkeypatch.setattr(accounts, "load_mode", lambda: {"mode": "auto", "label": None})
+        monkeypatch.setattr(
+            accounts,
+            "route_rows",
+            lambda blobs, active, now: [accounts_row("gmail", 10.0, seven_day=20.0)],
+        )
+        monkeypatch.setattr(accounts, "excluded_labels", lambda: {"gmail"})
+
+        accounts.cmd_status(types.SimpleNamespace())
+
+        output = capsys.readouterr().out
+        assert "gmail" in output
+        assert "[excluded]" in output
+
 
 class TestNativeProfiles:
     def _paths(self, tmp_path, monkeypatch):
