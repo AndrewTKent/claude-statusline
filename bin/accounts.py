@@ -894,9 +894,11 @@ def poll_blobs_usage(blobs: dict) -> int:
 
 
 def route_rows(blobs: dict, active_label: str | None, now_ts: float) -> list[dict]:
-    """One row per stored account: label, effective 5h% (reset-aware, from the
+    """One row per stored account: label, effective pcts (reset-aware, from the
     board the poll just refreshed), staleness of that estimate, whether its
-    cred is expired, whether it's the live account. Sorted best-first (lowest 5h)."""
+    cred is expired, whether it's the live account. Sorted best-first: most
+    binding-window runway (lowest worst-of-5h/7d), freshest 5h as tiebreak;
+    rows missing a rate axis are unpickable (_rate_eligible) and sort last."""
     resets = load_resets()
     rows = []
     for label, e in (blobs.get("accounts") or {}).items():
@@ -915,8 +917,19 @@ def route_rows(blobs: dict, active_label: str | None, now_ts: float) -> list[dic
                 "stale": bool(last_seen) and (now_ts - last_seen) > STALE_AFTER_S,
             }
         )
-    rows.sort(key=lambda r: (float("inf") if r["five_hour"] is None else r["five_hour"]))
+    rows.sort(key=lambda r: (
+        r["five_hour"] is None or r["seven_day"] is None,
+        binding_pct(r["five_hour"], r["seven_day"]),
+        float("inf") if r["five_hour"] is None else r["five_hour"],
+    ))
     return rows
+
+
+def binding_pct(*pcts: float | None) -> float:
+    """Worst usage across the windows that gate a session — the account's real
+    runway is 100 minus this. Unknown axes are ignored; all-unknown sorts last."""
+    known = [p for p in pcts if p is not None]
+    return max(known) if known else float("inf")
 
 
 def _rate_eligible(five_hour: float | None, seven_day: float | None) -> bool:
@@ -933,8 +946,8 @@ def _rate_eligible(five_hour: float | None, seven_day: float | None) -> bool:
 
 
 def route_pick(rows: list[dict], excludes: set[str]) -> str | None:
-    """Best switchable account: freshest 5h among rate-eligible (both windows
-    below cap), not active, not excluded, cred live."""
+    """Best switchable account: most binding-window runway among rate-eligible
+    (both windows below cap), not active, not excluded, cred live."""
     for r in rows:
         if r["active"] or r["expired"] or r["label"] in excludes:
             continue
@@ -1109,15 +1122,15 @@ def cmd_tokens(_args) -> None:
 
 
 def _fable_first(rows: list[dict]) -> list[dict]:
-    """Reorder for fable mode: fable-eligible accounts first (least fable used),
-    everything else keeps its existing order. pick_route then takes the first
-    with a live token, so fallback (no eligible or no-token fable account) is
+    """Reorder for fable mode: fable-eligible accounts first (most binding-window
+    runway), everything else keeps its existing order. The profile picker then
+    takes the first usable row, so fallback (no eligible fable account) is
     automatic. Stable sort preserves the incoming (headroom) order inside each group."""
 
     def key(r: dict) -> tuple:
         if fable_eligible(r["five_hour"], r["seven_day"], r["fable"]):
-            return (0, r["fable"])
-        return (1, 0.0)
+            return (0, *_fable_rank(r))
+        return (1,)
 
     return sorted(rows, key=key)
 
@@ -1160,7 +1173,7 @@ ROUTE_HYSTERESIS_PCT = 10.0  # below cap: only switch for a headroom gain this l
 ROUTE_CAP_PCT = 95.0  # at/above this the live account is ~capped: escape to a usable account
 ROUTE_MIN_DWELL_S = 300.0  # >= this long between AUTO switches (each cold-starts a prompt cache)
 FABLE_CAP_PCT = 95.0  # fable weekly window ~exhausted; separate axis from ROUTE_CAP_PCT (5h)
-FABLE_HYSTERESIS_PCT = 10.0  # fable mode: only chase a meaningfully fresher account (no near-tie churn)
+FABLE_HYSTERESIS_PCT = 10.0  # fable mode: only chase meaningfully more binding-window runway (no near-tie churn)
 
 # Monotonic so an NTP step-back can't wedge routing; None = never switched this
 # process. Daemon is one long-lived process, so no persistence needed.
@@ -1194,9 +1207,15 @@ def fable_eligible(
     )
 
 
+def _fable_rank(r: dict) -> tuple:
+    """Most usable Fable runway first: binding window, then fable, then 5h.
+    Only rank eligible rows — eligibility guarantees every axis is non-None."""
+    return (binding_pct(r["five_hour"], r["seven_day"], r["fable"]), r["fable"], r["five_hour"])
+
+
 def route_pick_fable(rows: list[dict], excludes: set[str]) -> str | None:
-    """Best OTHER account to switch to for Fable: eligible on both axes, not
-    active/expired/excluded, least fable used first (5h as tiebreak). None when no
+    """Best OTHER account to switch to for Fable: eligible on every axis, not
+    active/expired/excluded, most binding-window runway first. None when no
     other account qualifies — the caller then holds or falls back to the 5h router."""
     eligible = [
         r
@@ -1208,7 +1227,7 @@ def route_pick_fable(rows: list[dict], excludes: set[str]) -> str | None:
     ]
     if not eligible:
         return None
-    eligible.sort(key=lambda r: (r["fable"], r["five_hour"]))  # both non-None by eligibility
+    eligible.sort(key=_fable_rank)
     return eligible[0]["label"]
 
 
@@ -1220,9 +1239,9 @@ def _auto_switch(
     threshold: float,
     excludes: set[str],
 ) -> str | None:
-    """AUTO decision: switch to the freshest 5h account when the live one is past
-    `threshold`, with cap/hysteresis/dwell anti-thrash. Shared by AUTO and the
-    fable-mode fallback. Caller holds the lock."""
+    """AUTO decision: switch to the most binding-window runway when the live
+    account is past `threshold`, with cap/hysteresis/dwell anti-thrash. Shared
+    by AUTO and the fable-mode fallback. Caller holds the lock."""
     global _last_switch_ts
     cur = by_label.get(active) if active else None
     if cur is None:
@@ -1248,8 +1267,9 @@ def _auto_switch(
     # account can't serve requests at all, so escape regardless of the margin.
     cur_capped = (cur_5h is not None and cur_5h >= ROUTE_CAP_PCT) or weekly_walled
     if not cur_capped:
-        pick_5h = by_label[pick]["five_hour"]
-        if pick_5h is None or cur_5h is None or pick_5h >= cur_5h - ROUTE_HYSTERESIS_PCT:
+        pick_row = by_label[pick]
+        pick_binding = binding_pct(pick_row["five_hour"], pick_row["seven_day"])
+        if pick_binding >= binding_pct(cur_5h, cur_7d) - ROUTE_HYSTERESIS_PCT:
             return None
     # Each switch cold-starts the new account's prompt cache, so cap the rate at
     # one per dwell regardless of how the board drifts under usage feedback.
@@ -1317,20 +1337,22 @@ def route_once(threshold: float) -> str | None:
                 if fable_eligible(cur["five_hour"], cur["seven_day"], cur["fable"]):
                     return None
                 return _auto_switch(rows, by_label, active, blobs, threshold, excludes)
-            pick_fable = by_label[pick]["fable"]
-            # Live still usable → move only for a MEANINGFULLY fresher account (weekly
-            # fable drifts slowly, so this holds most passes). Live NOT usable → switch.
-            if (
-                fable_eligible(cur["five_hour"], cur["seven_day"], cur["fable"])
-                and pick_fable >= cur["fable"] - FABLE_HYSTERESIS_PCT
-            ):
+            pick_row = by_label[pick]
+            pick_binding = binding_pct(pick_row["five_hour"], pick_row["seven_day"], pick_row["fable"])
+            cur_binding = binding_pct(cur["five_hour"], cur["seven_day"], cur["fable"])
+            cur_ok = fable_eligible(cur["five_hour"], cur["seven_day"], cur["fable"])
+            # Live still usable → move only for MEANINGFULLY more runway on the
+            # binding window (whichever axis gates). Live NOT usable → switch.
+            if cur_ok and pick_binding >= cur_binding - FABLE_HYSTERESIS_PCT:
                 return None
             if _last_switch_ts is not None and time.monotonic() - _last_switch_ts < ROUTE_MIN_DWELL_S:
                 return None
             if apply_account(pick, blobs):
                 _last_switch_ts = time.monotonic()
-                cur_f = f"{cur['fable']:.0f}%" if cur["fable"] is not None else "—"
-                return f"FABLE {active} → {pick} (fable {cur_f} → {pick_fable:.0f}%)"
+                # Ineligible live prints "—": its binding number can exceed the
+                # pick's and read as a downgrade when the move is an escape.
+                cur_b = f"{cur_binding:.0f}%" if cur_ok else "—"
+                return f"FABLE {active} → {pick} (binding {cur_b} → {pick_binding:.0f}%)"
             return None
 
         return _auto_switch(rows, by_label, active, blobs, threshold, excludes)
@@ -1384,7 +1406,7 @@ def cmd_fable(_args) -> None:
             and not r["expired"]
             and fable_eligible(r["five_hour"], r["seven_day"], r["fable"])
         ),
-        key=lambda r: (r["fable"], r["five_hour"]),
+        key=_fable_rank,
     )
     print("FABLE — new and restarted sessions prefer Fable headroom")
     if not usable:
@@ -1393,7 +1415,9 @@ def cmd_fable(_args) -> None:
             f"routing normally (next {pick_profile_route(rows, excludes, None) or '(none free)'})"
         )
     else:
-        print(f"  next: {usable[0]['label']} (fable {usable[0]['fable']:.0f}%)")
+        best = usable[0]
+        b = binding_pct(best["five_hour"], best["seven_day"], best["fable"])
+        print(f"  next: {best['label']} (fable {best['fable']:.0f}%, binding {b:.0f}%)")
 
 
 def cmd_status(_args) -> None:
@@ -1434,7 +1458,7 @@ def cmd_ls(_args) -> None:
     if not rows:
         print("no stored accounts — /login in Claude Code once; the next accounts command captures it")
         return
-    # stable sort: pushes dead creds last, keeps route_rows' five_hour order otherwise
+    # stable sort: pushes dead creds last, keeps route_rows' binding order otherwise
     rows = sorted(rows, key=lambda r: r["expired"])
     excludes = excluded_labels()
     print(f"{'':2}{'label':<12} {'email':<32} {'5h':>6} {'7d':>6} {'fable':>6}")
