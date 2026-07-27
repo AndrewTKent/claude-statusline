@@ -57,6 +57,15 @@ brew install fswatch
 "$REPO/macos/launchd/install-daemon.sh"
 ```
 
+## Optional: account-board poller
+
+The multi-account board (`~/.claude/account-resets.json`) goes stale after 3h
+without polls; launch-time routing then decides on old data.
+
+```bash
+"$REPO/macos/launchd/install-accounts-poll.sh"
+```
+
 ## Optional extras
 
 - `macos/ClaudeMenuBar/` — menu-bar app (`build.sh` then `install.sh`)
