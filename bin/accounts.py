@@ -688,21 +688,57 @@ def write_profile_credentials(label: str, blob: str) -> None:
         _write_0600(profile / ".credentials.json", blob)
 
 
-def sync_profile_credentials(blobs: dict, *, persist: bool) -> bool:
+def sync_profile_credentials(blobs: dict, *, persist: bool) -> set[str]:
     changed = False
+    blocked_labels: set[str] = set()
     for label, entry in (blobs.get("accounts") or {}).items():
         credentials = native_profile_path(label) / ".credentials.json"
         try:
             profile_blob = credentials.read_text()
         except OSError:
             continue
-        if not blob_access_token(profile_blob) or profile_blob == entry.get("blob"):
+        stored_blob = entry.get("blob", "")
+        access_token = blob_access_token(profile_blob)
+        if not access_token or profile_blob == stored_blob:
+            continue
+        profile = fetch_profile(access_token)
+        if not profile:
+            blocked_labels.add(label)
+            continue
+        identity = identity_from_profile(profile)
+        expected_email = entry.get("email")
+        expected_org_uuid = entry.get("org_uuid")
+        if not expected_email or not expected_org_uuid:
+            stored_access_token = blob_access_token(stored_blob)
+            stored_profile = fetch_profile(stored_access_token) if stored_access_token else None
+            if not stored_profile:
+                blocked_labels.add(label)
+                continue
+            stored_identity = identity_from_profile(stored_profile)
+            expected_email = expected_email or stored_identity["email"]
+            expected_org_uuid = expected_org_uuid or stored_identity["org_uuid"]
+        email_mismatch = identity["email"] != expected_email
+        org_mismatch = identity["org_uuid"] != expected_org_uuid
+        if email_mismatch or org_mismatch:
+            if blob_access_token(stored_blob):
+                _write_0600(credentials, stored_blob)
+                action = f"restored {label}"
+            else:
+                blocked_labels.add(label)
+                action = "blocked routing"
+            print(
+                f"warning: {label} profile login does not match its stored identity; {action}",
+                file=sys.stderr,
+            )
             continue
         entry["blob"] = profile_blob
+        entry["email"] = identity["email"] or entry.get("email")
+        entry["org_uuid"] = identity["org_uuid"] or entry.get("org_uuid")
+        entry["org_type"] = identity["org_type"] or entry.get("org_type")
         changed = True
     if changed and persist:
         save_blobs(blobs)
-    return changed
+    return blocked_labels
 
 
 def load_mode() -> dict:
@@ -1132,12 +1168,16 @@ def cmd_pick_env(_args) -> None:
     try:
         with locked():
             blobs = load_blobs()
-            sync_profile_credentials(blobs, persist=True)
+            blocked_labels = sync_profile_credentials(blobs, persist=True)
             mode = load_mode()
             pin = os.environ.get("ACCOUNTS_PIN") or None
             if pin is None and mode.get("mode") == "set":
                 pin = mode.get("label")
-            rows = route_rows(blobs, None, time.time())
+            rows = [
+                row
+                for row in route_rows(blobs, None, time.time())
+                if row["label"] not in blocked_labels
+            ]
             if pin is None and mode.get("mode") == "fable":
                 rows = _fable_first(rows)
             label = pick_profile_route(rows, excluded_labels(), pin)
@@ -1345,7 +1385,9 @@ def cmd_set(args) -> None:
     """Pin new sessions to <label>."""
     with locked():
         blobs = load_blobs()
-        sync_profile_credentials(blobs, persist=True)
+        blocked_labels = sync_profile_credentials(blobs, persist=True)
+        if args.label in blocked_labels:
+            die(f"'{args.label}' has an unverified profile login")
         e = (blobs.get("accounts") or {}).get(args.label)
         if not e:
             die(f"'{args.label}' has no stored OAuth login")
@@ -1361,8 +1403,10 @@ def cmd_auto(_args) -> None:
     """Route new sessions to the freshest account."""
     save_mode("auto", None)
     blobs = load_blobs()
-    sync_profile_credentials(blobs, persist=False)
-    rows = route_rows(blobs, None, time.time())
+    blocked_labels = sync_profile_credentials(blobs, persist=False)
+    rows = [
+        row for row in route_rows(blobs, None, time.time()) if row["label"] not in blocked_labels
+    ]
     pick = pick_profile_route(rows, excluded_labels(), None)
     print("AUTO — each new or restarted session uses the freshest account")
     print(f"  next: {pick or '(none free)'}")
@@ -1373,8 +1417,10 @@ def cmd_fable(_args) -> None:
     5h routing when none can do Fable."""
     save_mode("fable", None)
     blobs = load_blobs()
-    sync_profile_credentials(blobs, persist=False)
-    rows = route_rows(blobs, None, time.time())
+    blocked_labels = sync_profile_credentials(blobs, persist=False)
+    rows = [
+        row for row in route_rows(blobs, None, time.time()) if row["label"] not in blocked_labels
+    ]
     excludes = excluded_labels()
     usable = sorted(
         (
@@ -1401,8 +1447,10 @@ def cmd_status(_args) -> None:
     with locked():
         blobs = load_blobs()
         capture_live_to_blobs(blobs)
-        sync_profile_credentials(blobs, persist=True)
-    rows = route_rows(blobs, None, time.time())
+        blocked_labels = sync_profile_credentials(blobs, persist=True)
+    rows = [
+        row for row in route_rows(blobs, None, time.time()) if row["label"] not in blocked_labels
+    ]
     if mode["mode"] == "set":
         tag = f"SET → {mode['label']}"
         next_label = pick_profile_route(rows, excluded_labels(), mode["label"])
@@ -1429,7 +1477,7 @@ def _fmt_pct(value: float | None, stale: bool) -> str:
 
 def cmd_ls(_args) -> None:
     blobs = load_blobs()
-    sync_profile_credentials(blobs, persist=False)
+    blocked_labels = sync_profile_credentials(blobs, persist=False)
     rows = route_rows(blobs, None, time.time())
     if not rows:
         print("no stored accounts — /login in Claude Code once; the next accounts command captures it")
@@ -1443,6 +1491,8 @@ def cmd_ls(_args) -> None:
         if r["expired"]:
             suffix = "  EXPIRED — /login to refresh"
             any_expired = True
+        elif r["label"] in blocked_labels:
+            suffix = "  [unverified]"
         elif r["label"] in excludes:
             suffix = "  [excluded]"
         else:
