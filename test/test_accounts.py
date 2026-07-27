@@ -1,6 +1,9 @@
 """Unit tests for bin/accounts.py — pure logic only (no keychain, no network)."""
 
 import json
+import os
+import re
+import subprocess
 import sys
 import threading
 import time
@@ -153,6 +156,26 @@ class TestPickRoute:
     def test_no_tokens_none(self):
         rows = [accounts_row("alumni", 5.0)]
         assert accounts.pick_route(rows, self.VAULT, set(), self.NOW, None) is None
+
+
+class TestPickProfileRoute:
+    def test_best_eligible_account_wins(self):
+        rows = [accounts_row("gmail", 5.0), accounts_row("work", 20.0)]
+        assert accounts.pick_profile_route(rows, set(), None) == "gmail"
+
+    def test_capped_and_excluded_accounts_are_skipped(self):
+        rows = [
+            accounts_row("weekly-wall", 1.0, seven_day=100.0),
+            accounts_row("excluded", 2.0),
+            accounts_row("work", 20.0),
+        ]
+        assert accounts.pick_profile_route(rows, {"excluded"}, None) == "work"
+
+    def test_pin_overrides_headroom_but_not_expired_login(self):
+        rows = [accounts_row("gmail", 5.0), accounts_row("work", 90.0)]
+        assert accounts.pick_profile_route(rows, set(), "work") == "work"
+        rows[1]["expired"] = True
+        assert accounts.pick_profile_route(rows, set(), "work") is None
 
 
 class TestMergeTokenVaults:
@@ -591,12 +614,12 @@ class TestCmdSet:
         monkeypatch.setattr(accounts, "CRED_FILE", tmp_path / ".credentials.json")
         monkeypatch.setattr(accounts, "MODE_PATH", tmp_path / "mode.json")
         monkeypatch.setattr(accounts, "BLOBS_PATH", tmp_path / "blobs.json")
+        monkeypatch.setattr(accounts, "PROFILES_PATH", tmp_path / "profiles")
+        monkeypatch.setattr(accounts, "CLAUDE_HOME", tmp_path / "claude")
+        monkeypatch.setattr(accounts, "CLAUDE_STATE_PATH", tmp_path / ".claude.json")
         monkeypatch.setattr(accounts, "_lock_depth", 0)
-        # never reach the network / real store / real keychain from tests
-        monkeypatch.setattr(accounts, "fetch_profile", lambda tok: None)
-        monkeypatch.setattr(accounts, "kc_read", lambda service, account=None: None)
-        monkeypatch.setattr(accounts, "kc_slot_status", lambda service: "absent")
-        monkeypatch.setattr(accounts, "kc_delete", lambda service, account=None: None)
+        accounts.CLAUDE_HOME.mkdir()
+        accounts.CLAUDE_STATE_PATH.write_text('{"hasCompletedOnboarding": true}')
 
     def test_refuses_expired_blob(self, tmp_path, monkeypatch):
         self._paths(tmp_path, monkeypatch)
@@ -604,43 +627,100 @@ class TestCmdSet:
         monkeypatch.setattr(accounts, "load_blobs", lambda: {"accounts": {"B": {"blob": expired}}})
         with pytest.raises(SystemExit):
             accounts.cmd_set(types.SimpleNamespace(label="B"))
-        assert not accounts.CRED_FILE.exists()  # dead cred NOT written
+        assert not accounts.MODE_PATH.exists()
 
-    def test_applies_live_blob(self, tmp_path, monkeypatch):
+    def test_pins_native_profile_without_touching_global_credentials(self, tmp_path, monkeypatch):
         self._paths(tmp_path, monkeypatch)
         live = _live_blob("a")
         monkeypatch.setattr(accounts, "load_blobs", lambda: {"accounts": {"B": {"blob": live}}})
         accounts.cmd_set(types.SimpleNamespace(label="B"))
-        assert accounts.CRED_FILE.read_text() == live
+        assert json.loads(accounts.MODE_PATH.read_text()) == {"mode": "set", "label": "B"}
+        assert (accounts.PROFILES_PATH / "B" / ".credentials.json").read_text() == live
+        assert not accounts.CRED_FILE.exists()
 
-    def test_captures_live_before_applying(self, tmp_path, monkeypatch):
-        # regression: cmd_set must fold an outgoing rotation into blobs (capture)
-        # BEFORE overwriting the live file (apply), so a switch never drops the
-        # departing account's freshly-rotated token.
-        self._paths(tmp_path, monkeypatch)
-        live = _live_blob("a")
-        monkeypatch.setattr(accounts, "load_blobs", lambda: {"accounts": {"B": {"blob": live}}})
-        monkeypatch.setattr(accounts, "save_mode", lambda m, label: None)
-        calls = []
-        monkeypatch.setattr(accounts, "capture_live_to_blobs", lambda b: calls.append("capture"))
-        real_apply = accounts.apply_account
-        monkeypatch.setattr(accounts, "apply_account",
-                            lambda label, b: (calls.append("apply"), real_apply(label, b))[1])
-        accounts.cmd_set(types.SimpleNamespace(label="B"))
-        assert calls == ["capture", "apply"]
-        assert accounts.CRED_FILE.read_text() == live
 
-    def test_refuses_when_live_present_but_unattributable(self, tmp_path, monkeypatch):
-        # cc rotated the live token (not yet in the store) and profile fetch fails
-        # (stubbed None in _paths) -> capture can't attribute it. Overwriting would
-        # lose that account's login, so refuse and leave the live cred untouched.
+class TestCmdStatus:
+    def test_captures_default_profile_login_before_rendering(self, monkeypatch, capsys):
+        blobs = {"version": 1, "accounts": {}}
+        captured = []
+        monkeypatch.setattr(accounts, "locked", lambda blocking=True: nullcontext())
+        monkeypatch.setattr(accounts, "load_blobs", lambda: blobs)
+        monkeypatch.setattr(
+            accounts,
+            "capture_live_to_blobs",
+            lambda value: captured.append(value) or "gmail",
+        )
+        monkeypatch.setattr(accounts, "sync_profile_credentials", lambda value, persist: False)
+        monkeypatch.setattr(accounts, "load_mode", lambda: {"mode": "auto", "label": None})
+        monkeypatch.setattr(accounts, "route_rows", lambda value, active, now: [])
+        monkeypatch.setattr(accounts, "excluded_labels", set)
+
+        accounts.cmd_status(types.SimpleNamespace())
+
+        assert captured == [blobs]
+        assert "mode: AUTO" in capsys.readouterr().out
+
+
+class TestNativeProfiles:
+    def _paths(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(accounts, "PROFILES_PATH", tmp_path / "profiles")
+        monkeypatch.setattr(accounts, "CLAUDE_HOME", tmp_path / "claude")
+        monkeypatch.setattr(accounts, "CLAUDE_STATE_PATH", tmp_path / ".claude.json")
+        accounts.CLAUDE_HOME.mkdir()
+        (accounts.CLAUDE_HOME / "projects").mkdir()
+        (accounts.CLAUDE_HOME / "settings.json").write_text("{}")
+        accounts.CLAUDE_STATE_PATH.write_text(json.dumps({
+            "hasCompletedOnboarding": True,
+            "modelAccessCache": ["fable"],
+            "oauthAccount": {"emailAddress": "wrong@example.com"},
+            "projects": {"/repo": {"hasTrustDialogAccepted": True}},
+            "userID": "wrong-user",
+        }))
+
+    def test_creates_isolated_native_profile_with_shared_session_state(self, tmp_path, monkeypatch):
         self._paths(tmp_path, monkeypatch)
-        monkeypatch.setattr(accounts, "load_blobs",
-                            lambda: {"accounts": {"B": {"blob": _live_blob("b")}}})
-        accounts.CRED_FILE.write_text(_live_blob("ROTATED-UNKNOWN"))
-        with pytest.raises(SystemExit):
-            accounts.cmd_set(types.SimpleNamespace(label="B"))
-        assert "ROTATED-UNKNOWN" in accounts.CRED_FILE.read_text()  # not clobbered
+        blob = _live_blob("gmail")
+        profile = accounts.ensure_native_profile("gmail", {"blob": blob})
+
+        assert (profile / ".credentials.json").read_text() == blob
+        assert (profile.stat().st_mode & 0o777) == 0o700
+        assert ((profile / ".credentials.json").stat().st_mode & 0o777) == 0o600
+        assert (profile / "projects").resolve() == (accounts.CLAUDE_HOME / "projects").resolve()
+        state = json.loads((profile / ".claude.json").read_text())
+        assert state["hasCompletedOnboarding"] is True
+        assert state["projects"]["/repo"]["hasTrustDialogAccepted"] is True
+        assert "oauthAccount" not in state
+        assert "modelAccessCache" not in state
+        assert "userID" not in state
+
+    def test_existing_profile_credential_is_authoritative(self, tmp_path, monkeypatch):
+        self._paths(tmp_path, monkeypatch)
+        first = _live_blob("first")
+        second = _live_blob("second")
+        profile = accounts.ensure_native_profile("gmail", {"blob": first})
+        accounts._write_0600(profile / ".credentials.json", second)
+        accounts.ensure_native_profile("gmail", {"blob": first})
+        assert (profile / ".credentials.json").read_text() == second
+
+    def test_invalid_profile_credential_is_restored_from_store(self, tmp_path, monkeypatch):
+        self._paths(tmp_path, monkeypatch)
+        stored = _live_blob("stored")
+        profile = accounts.ensure_native_profile("gmail", {"blob": stored})
+        accounts._write_0600(profile / ".credentials.json", "truncated-json")
+
+        accounts.ensure_native_profile("gmail", {"blob": stored})
+
+        assert (profile / ".credentials.json").read_text() == stored
+
+    def test_syncs_claude_rotated_profile_credential(self, tmp_path, monkeypatch):
+        self._paths(tmp_path, monkeypatch)
+        old = _live_blob("old")
+        new = _live_blob("new")
+        profile = accounts.ensure_native_profile("gmail", {"blob": old})
+        accounts._write_0600(profile / ".credentials.json", new)
+        blobs = {"accounts": {"gmail": {"blob": old}}}
+        assert accounts.sync_profile_credentials(blobs, persist=False) is True
+        assert blobs["accounts"]["gmail"]["blob"] == new
 
 
 class TestLoadBlobs:
@@ -971,87 +1051,151 @@ class TestRouteRowsStale:
 
 
 class TestCmdPickEnv:
-    """The live shell-launch hook: enumerate accounts from the blobs store,
-    match labels against the minted-token vault, emit export lines. Must never
-    raise — routing can't block launching claude."""
+    """The shell hook emits an isolated native subscription profile."""
 
-    def _wire(self, monkeypatch, blobs, tokens, *, resets=None, excludes=frozenset(), mode="auto"):
+    RESET_ENV = (
+        "unset CLAUDE_CODE_OAUTH_TOKEN\n"
+        "unset CLAUDE_CONFIG_DIR\n"
+        "unset ACCOUNTS_ROUTED_LABEL\n"
+        "unset ACCOUNTS_ROUTED_EMAIL\n"
+        "unset ACCOUNTS_ROUTED_ORG_UUID\n"
+    )
+
+    def _wire(
+        self,
+        tmp_path,
+        monkeypatch,
+        blobs,
+        *,
+        resets=None,
+        excludes=frozenset(),
+        mode="auto",
+        mode_label=None,
+    ):
         monkeypatch.setattr(accounts, "load_blobs", lambda: {"accounts": blobs})
-        monkeypatch.setattr(accounts, "load_token_vault", lambda: {"tokens": tokens})
         monkeypatch.setattr(accounts, "load_resets", lambda: resets or {})
         monkeypatch.setattr(accounts, "excluded_labels", lambda: set(excludes))
-        monkeypatch.setattr(accounts, "load_mode", lambda: {"mode": mode, "label": None})
+        monkeypatch.setattr(accounts, "load_mode", lambda: {"mode": mode, "label": mode_label})
+        monkeypatch.setattr(accounts, "PROFILES_PATH", tmp_path / "profiles")
+        monkeypatch.setattr(accounts, "CLAUDE_HOME", tmp_path / "claude")
+        monkeypatch.setattr(accounts, "CLAUDE_STATE_PATH", tmp_path / ".claude.json")
+        monkeypatch.setattr(accounts, "LOCK_PATH", tmp_path / "accounts.lock")
+        monkeypatch.setattr(accounts, "_lock_depth", 0)
+        accounts.CLAUDE_HOME.mkdir()
+        accounts.CLAUDE_STATE_PATH.write_text('{"hasCompletedOnboarding": true}')
         monkeypatch.delenv("ACCOUNTS_PIN", raising=False)
 
-    def _tok(self, name):
-        return {"token": f"sk-ant-{name}", "expires_at": 9_999_999_999}  # year 2286
-
-    def test_roster_from_blobs_store(self, monkeypatch, capsys):
-        # freshest-with-token wins. raising=False: this assertion must keep working
-        # once load_meta no longer exists post-legacy-delete.
-        monkeypatch.setattr(
-            accounts, "load_meta",
-            lambda: (_ for _ in ()).throw(AssertionError("meta store touched")),
-            raising=False,
-        )
+    def test_roster_from_blobs_store(self, tmp_path, monkeypatch, capsys):
         blobs = {
             "gmail": {"blob": _live_blob("g"), "email": "g@x", "org_uuid": "o1"},
             "work": {"blob": _live_blob("w"), "email": "w@x", "org_uuid": "o2"},
         }
-        resets = {"g@x|o1": {"five_hour_pct": 60.0}, "w@x|o2": {"five_hour_pct": 10.0}}
-        self._wire(monkeypatch, blobs, {"gmail": self._tok("gmail"), "work": self._tok("work")},
-                   resets=resets)
+        resets = {
+            "g@x|o1": {"five_hour_pct": 60.0, "seven_day_pct": 20.0},
+            "w@x|o2": {"five_hour_pct": 10.0, "seven_day_pct": 20.0},
+        }
+        self._wire(tmp_path, monkeypatch, blobs, resets=resets)
         accounts.cmd_pick_env(types.SimpleNamespace())
         out = capsys.readouterr().out
-        assert "export CLAUDE_CODE_OAUTH_TOKEN='sk-ant-work'" in out
-        assert "export ACCOUNTS_ROUTED_LABEL='work'" in out  # 10% < 60% -> best-first
+        assert "export CLAUDE_CODE_OAUTH_TOKEN" not in out
+        assert f"export CLAUDE_CONFIG_DIR={tmp_path / 'profiles' / 'work'}" in out
+        assert "export ACCOUNTS_ROUTED_LABEL=work" in out
+        assert "export ACCOUNTS_ROUTED_EMAIL=w@x" in out
 
-    def test_excluded_label_respected(self, monkeypatch, capsys):
+    def test_excluded_label_respected(self, tmp_path, monkeypatch, capsys):
         blobs = {"gmail": {"blob": _live_blob("g"), "email": "g@x", "org_uuid": "o1"}}
-        self._wire(monkeypatch, blobs, {"gmail": self._tok("gmail")}, excludes={"gmail"})
+        resets = {"g@x|o1": {"five_hour_pct": 1.0, "seven_day_pct": 1.0}}
+        self._wire(tmp_path, monkeypatch, blobs, resets=resets, excludes={"gmail"})
         accounts.cmd_pick_env(types.SimpleNamespace())
-        assert capsys.readouterr().out == ""
+        assert capsys.readouterr().out == self.RESET_ENV
 
-    def test_pin_overrides_headroom(self, monkeypatch, capsys):
-        # pinned account wins even with worse headroom than the free pick
+    def test_pin_overrides_headroom(self, tmp_path, monkeypatch, capsys):
         blobs = {
             "gmail": {"blob": _live_blob("g"), "email": "g@x", "org_uuid": "o1"},
             "work": {"blob": _live_blob("w"), "email": "w@x", "org_uuid": "o2"},
         }
-        resets = {"g@x|o1": {"five_hour_pct": 5.0}, "w@x|o2": {"five_hour_pct": 90.0}}
-        self._wire(monkeypatch, blobs, {"gmail": self._tok("gmail"), "work": self._tok("work")},
-                   resets=resets)
+        resets = {
+            "g@x|o1": {"five_hour_pct": 5.0, "seven_day_pct": 5.0},
+            "w@x|o2": {"five_hour_pct": 90.0, "seven_day_pct": 90.0},
+        }
+        self._wire(tmp_path, monkeypatch, blobs, resets=resets)
         monkeypatch.setenv("ACCOUNTS_PIN", "work")
         accounts.cmd_pick_env(types.SimpleNamespace())
         out = capsys.readouterr().out
-        assert "export CLAUDE_CODE_OAUTH_TOKEN='sk-ant-work'" in out
-        assert "export ACCOUNTS_ROUTED_LABEL='work'" in out
+        assert "export ACCOUNTS_ROUTED_LABEL=work" in out
 
-    def test_expired_blob_filtered(self, monkeypatch, capsys):
-        # refresh-expired blob is skipped despite a live minted token
+    def test_set_mode_is_a_persistent_pin(self, tmp_path, monkeypatch, capsys):
+        blobs = {
+            "gmail": {"blob": _live_blob("g"), "email": "g@x", "org_uuid": "o1"},
+            "work": {"blob": _live_blob("w"), "email": "w@x", "org_uuid": "o2"},
+        }
+        resets = {
+            "g@x|o1": {"five_hour_pct": 5.0, "seven_day_pct": 5.0},
+            "w@x|o2": {"five_hour_pct": 90.0, "seven_day_pct": 90.0},
+        }
+        self._wire(
+            tmp_path,
+            monkeypatch,
+            blobs,
+            resets=resets,
+            mode="set",
+            mode_label="work",
+        )
+        accounts.cmd_pick_env(types.SimpleNamespace())
+        assert "export ACCOUNTS_ROUTED_LABEL=work" in capsys.readouterr().out
+
+    def test_expired_blob_filtered(self, tmp_path, monkeypatch, capsys):
         blobs = {"gmail": {"blob": _live_blob("g", future_ms=1_000_000_000_000),  # 2001, past
                            "email": "g@x", "org_uuid": "o1"}}
-        self._wire(monkeypatch, blobs, {"gmail": self._tok("gmail")})
+        self._wire(tmp_path, monkeypatch, blobs)
         accounts.cmd_pick_env(types.SimpleNamespace())
-        assert capsys.readouterr().out == ""
+        assert capsys.readouterr().out == self.RESET_ENV
 
-    def test_no_minted_token_prints_nothing(self, monkeypatch, capsys):
+    def test_no_minted_setup_token_is_required(self, tmp_path, monkeypatch, capsys):
         blobs = {"gmail": {"blob": _live_blob("g"), "email": "g@x", "org_uuid": "o1"}}
-        self._wire(monkeypatch, blobs, {})  # empty token vault
+        resets = {"g@x|o1": {"five_hour_pct": 1.0, "seven_day_pct": 1.0}}
+        self._wire(tmp_path, monkeypatch, blobs, resets=resets)
         accounts.cmd_pick_env(types.SimpleNamespace())
-        assert capsys.readouterr().out == ""
+        assert "export ACCOUNTS_ROUTED_LABEL=gmail" in capsys.readouterr().out
 
-    def test_internal_exception_prints_nothing(self, monkeypatch, capsys):
-        # never-raise contract: any internal failure yields no output, no traceback
+    def test_profile_creation_holds_accounts_lock(self, tmp_path, monkeypatch, capsys):
+        blobs = {"gmail": {"blob": _live_blob("g"), "email": "g@x", "org_uuid": "o1"}}
+        resets = {"g@x|o1": {"five_hour_pct": 1.0, "seven_day_pct": 1.0}}
+        self._wire(tmp_path, monkeypatch, blobs, resets=resets)
+        original = accounts.ensure_native_profile
+
+        def checked_ensure(label, entry):
+            assert accounts._lock_depth == 1
+            return original(label, entry)
+
+        monkeypatch.setattr(accounts, "ensure_native_profile", checked_ensure)
+        accounts.cmd_pick_env(types.SimpleNamespace())
+
+        assert "export ACCOUNTS_ROUTED_LABEL=gmail" in capsys.readouterr().out
+
+    def test_persists_claude_rotated_profile_credential(self, tmp_path, monkeypatch, capsys):
+        old = _live_blob("old")
+        new = _live_blob("new")
+        blobs = {"gmail": {"blob": old, "email": "g@x", "org_uuid": "o1"}}
+        resets = {"g@x|o1": {"five_hour_pct": 1.0, "seven_day_pct": 1.0}}
+        self._wire(tmp_path, monkeypatch, blobs, resets=resets)
+        profile = accounts.ensure_native_profile("gmail", blobs["gmail"])
+        accounts._write_0600(profile / ".credentials.json", new)
+        saved = []
+        monkeypatch.setattr(accounts, "save_blobs", lambda value: saved.append(value))
+
+        accounts.cmd_pick_env(types.SimpleNamespace())
+
+        assert saved[-1]["accounts"]["gmail"]["blob"] == new
+        assert "export ACCOUNTS_ROUTED_LABEL=gmail" in capsys.readouterr().out
+
+    def test_internal_exception_clears_inherited_routing(self, monkeypatch, capsys):
         monkeypatch.setattr(accounts, "load_blobs",
                             lambda: (_ for _ in ()).throw(RuntimeError("boom")))
         accounts.cmd_pick_env(types.SimpleNamespace())
-        assert capsys.readouterr().out == ""
+        assert capsys.readouterr().out == self.RESET_ENV
 
-    def test_fable_mode_uses_flat_row_shape(self, monkeypatch, capsys):
-        # regression: _fable_first must read route_rows' flat five_hour/seven_day/fable
-        # fields; a legacy-shape mismatch here raises inside the try/except and
-        # pick-env silently emits nothing.
+    def test_fable_mode_uses_flat_row_shape(self, tmp_path, monkeypatch, capsys):
         blobs = {
             "gmail": {"blob": _live_blob("g"), "email": "g@x", "org_uuid": "o1"},
             "brown": {"blob": _live_blob("b"), "email": "b@x", "org_uuid": "o2"},
@@ -1060,13 +1204,10 @@ class TestCmdPickEnv:
             "g@x|o1": {"five_hour_pct": 5.0, "seven_day_pct": 5.0, "fable_pct": 90.0},
             "b@x|o2": {"five_hour_pct": 50.0, "seven_day_pct": 50.0, "fable_pct": 10.0},
         }
-        self._wire(monkeypatch, blobs, {"gmail": self._tok("gmail"), "brown": self._tok("brown")},
-                   resets=resets, mode="fable")
+        self._wire(tmp_path, monkeypatch, blobs, resets=resets, mode="fable")
         accounts.cmd_pick_env(types.SimpleNamespace())
         out = capsys.readouterr().out
-        # gmail is best 5h but fable-heavy; brown has real fable headroom -> wins
-        assert "export CLAUDE_CODE_OAUTH_TOKEN='sk-ant-brown'" in out
-        assert "export ACCOUNTS_ROUTED_LABEL='brown'" in out
+        assert "export ACCOUNTS_ROUTED_LABEL=brown" in out
 
 
 class TestCmdLs:
@@ -1077,6 +1218,7 @@ class TestCmdLs:
         monkeypatch.setattr(accounts, "locked", lambda blocking=True: nullcontext())
         monkeypatch.setattr(accounts, "load_blobs", lambda: {"accounts": blobs})
         monkeypatch.setattr(accounts, "capture_live_to_blobs", lambda b: active)
+        monkeypatch.setattr(accounts, "sync_profile_credentials", lambda b, persist: False)
         monkeypatch.setattr(accounts, "load_resets", lambda: resets or {})
         monkeypatch.setattr(accounts, "excluded_labels", lambda: set(excludes))
 
@@ -1088,14 +1230,15 @@ class TestCmdLs:
         assert "vault" not in out.lower()
         assert "/login" in out
 
-    def test_renders_header_and_active_marker(self, monkeypatch, capsys):
+    def test_renders_header_and_account(self, monkeypatch, capsys):
         blobs = {"gmail": {"blob": _live_blob("g"), "email": "g@x", "org_uuid": "o1"}}
         resets = {"g@x|o1": {"five_hour_pct": 12.0, "seven_day_pct": 3.0, "fable_pct": 7.0}}
         self._wire(monkeypatch, blobs, resets=resets, active="gmail")
         accounts.cmd_ls(types.SimpleNamespace())
         out = capsys.readouterr().out
         assert "label" in out and "email" in out and "5h" in out and "7d" in out and "fable" in out
-        assert "* gmail" in out
+        assert "gmail" in out
+        assert "* gmail" not in out
         assert "g@x" in out
         assert "12%" in out and "3%" in out and "7%" in out
 
@@ -1125,13 +1268,12 @@ class TestCmdLs:
         self._wire(monkeypatch, blobs, resets=resets)
         accounts.cmd_ls(types.SimpleNamespace())
         assert "20%~" in capsys.readouterr().out
-
     def test_footnotes_present(self, monkeypatch, capsys):
         blobs = {"gmail": {"blob": _live_blob("g"), "email": "g@x", "org_uuid": "o1"}}
         self._wire(monkeypatch, blobs, resets={"g@x|o1": {"five_hour_pct": 1.0}})
         accounts.cmd_ls(types.SimpleNamespace())
         out = capsys.readouterr().out
-        assert "matches live slot" in out
+        assert "since that account was polled" in out
         assert "reset-aware; sorted best-first" in out
 
     def test_expired_footnote_wording_is_not_legacy_vault(self, monkeypatch, capsys):
@@ -1142,3 +1284,195 @@ class TestCmdLs:
         out = capsys.readouterr().out
         assert "EXPIRED = stored refresh token dead" in out
         assert "vaulted" not in out
+
+
+class TestStatuslineAccountBoard:
+    def test_excluded_account_is_not_rendered(self, tmp_path):
+        repo = Path(__file__).resolve().parent.parent
+        home = tmp_path / "home"
+        claude_dir = home / ".claude"
+        claude_dir.mkdir(parents=True)
+        (claude_dir / "statusline.conf").write_text(
+            'SHOW_ACCOUNT_RESETS=1\n'
+            'MAX_COLS=200\n'
+            'ACCOUNT_LABELS="coram-max:andrew.kent@coram.ai|coram-org '
+            'brown:*@alumni.brown.edu"\n'
+            'ACCOUNTS_EXCLUDE="brown"\n'
+        )
+        resets = {
+            "andrew.kent@coram.ai|coram-org": {
+                "email": "andrew.kent@coram.ai",
+                "org_uuid": "coram-org",
+                "five_hour_pct": 18,
+                "seven_day_pct": 20,
+                "fable_pct": 24,
+                "last_seen": time.time(),
+            },
+            "andrew@alumni.brown.edu|brown-org": {
+                "email": "andrew@alumni.brown.edu",
+                "org_uuid": "brown-org",
+                "five_hour_pct": 0,
+                "seven_day_pct": 0,
+                "fable_pct": 0,
+                "last_seen": time.time(),
+            },
+        }
+        (claude_dir / "account-resets.json").write_text(json.dumps(resets))
+        project = tmp_path / "project"
+        project.mkdir()
+        fixture = json.loads((repo / "test/fixtures/input.json").read_text())
+        fixture["workspace"]["current_dir"] = str(project)
+        script = tmp_path / "statusline.sh"
+        script.write_text(
+            (repo / "bin/statusline.sh")
+            .read_text()
+            .replace("/tmp/claude", str(tmp_path / "cache"))
+        )
+        env = os.environ.copy()
+        env.update(
+            {
+                "HOME": str(home),
+                "TZ": "UTC",
+                "ACCOUNTS_ROUTED_LABEL": "coram-max",
+                "ACCOUNTS_ROUTED_EMAIL": "andrew.kent@coram.ai",
+                "ACCOUNTS_ROUTED_ORG_UUID": "coram-org",
+            }
+        )
+
+        result = subprocess.run(
+            ["bash", str(script)],
+            input=json.dumps(fixture),
+            text=True,
+            capture_output=True,
+            env=env,
+            check=True,
+        )
+        rendered = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+
+        assert "Coram-max" in rendered
+        assert "Brown" not in rendered
+        assert (tmp_path / "cache/statusline-usage-cache.json").is_symlink()
+        assert (tmp_path / "cache/statusline-profile-cache.json").is_symlink()
+
+    def test_in_profile_login_replaces_launch_identity_before_ledger_write(self, tmp_path):
+        repo = Path(__file__).resolve().parent.parent
+        home = tmp_path / "home"
+        claude_dir = home / ".claude"
+        claude_dir.mkdir(parents=True)
+        (claude_dir / "statusline.conf").write_text(
+            'MAX_COLS=200\n'
+            'ACCOUNT_LABELS="old:old@example.com|old-org new:new@example.com|new-org"\n'
+        )
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        (profile / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "new-token"}})
+        )
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        fake_curl = fake_bin / "curl"
+        fake_curl.write_text(
+            "#!/usr/bin/env bash\n"
+            "case \"$*\" in\n"
+            "  *oauth/profile*) printf '%s' "
+            "'{\"account\":{\"email\":\"new@example.com\"},"
+            "\"organization\":{\"uuid\":\"new-org\"}}' ;;\n"
+            "  *oauth/usage*) printf '%s' "
+            "'{\"five_hour\":{\"utilization\":1},\"seven_day\":{\"utilization\":2}}' ;;\n"
+            "esac\n"
+        )
+        fake_curl.chmod(0o755)
+        project = tmp_path / "project"
+        project.mkdir()
+        fixture = json.loads((repo / "test/fixtures/input.json").read_text())
+        fixture["workspace"]["current_dir"] = str(project)
+        script = tmp_path / "statusline.sh"
+        script.write_text(
+            (repo / "bin/statusline.sh")
+            .read_text()
+            .replace("/tmp/claude", str(tmp_path / "cache"))
+        )
+        env = os.environ.copy()
+        env.update(
+            {
+                "HOME": str(home),
+                "PATH": f"{fake_bin}:{env['PATH']}",
+                "TZ": "UTC",
+                "CLAUDE_CONFIG_DIR": str(profile),
+                "ACCOUNTS_ROUTED_LABEL": "old",
+                "ACCOUNTS_ROUTED_EMAIL": "old@example.com",
+                "ACCOUNTS_ROUTED_ORG_UUID": "old-org",
+            }
+        )
+
+        result = subprocess.run(
+            ["bash", str(script)],
+            input=json.dumps(fixture),
+            text=True,
+            capture_output=True,
+            env=env,
+            check=True,
+        )
+        rendered = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+        ledger = json.loads((claude_dir / "daily-cost.json").read_text())
+        session = ledger["sessions"][fixture["session_id"]]
+
+        assert "new@example.com" in rendered
+        assert "old@example.com" not in rendered
+        assert session["acct"] == "new"
+
+    def test_failed_first_profile_fetch_does_not_use_launch_identity(self, tmp_path):
+        repo = Path(__file__).resolve().parent.parent
+        home = tmp_path / "home"
+        claude_dir = home / ".claude"
+        claude_dir.mkdir(parents=True)
+        (claude_dir / "statusline.conf").write_text(
+            'MAX_COLS=200\nACCOUNT_LABELS="old:old@example.com|old-org"\n'
+        )
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        (profile / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "new-token"}})
+        )
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        fake_curl = fake_bin / "curl"
+        fake_curl.write_text("#!/usr/bin/env bash\nexit 1\n")
+        fake_curl.chmod(0o755)
+        project = tmp_path / "project"
+        project.mkdir()
+        fixture = json.loads((repo / "test/fixtures/input.json").read_text())
+        fixture["workspace"]["current_dir"] = str(project)
+        script = tmp_path / "statusline.sh"
+        script.write_text(
+            (repo / "bin/statusline.sh")
+            .read_text()
+            .replace("/tmp/claude", str(tmp_path / "cache"))
+        )
+        env = os.environ.copy()
+        env.update(
+            {
+                "HOME": str(home),
+                "PATH": f"{fake_bin}:{env['PATH']}",
+                "TZ": "UTC",
+                "CLAUDE_CONFIG_DIR": str(profile),
+                "ACCOUNTS_ROUTED_LABEL": "old",
+                "ACCOUNTS_ROUTED_EMAIL": "old@example.com",
+                "ACCOUNTS_ROUTED_ORG_UUID": "old-org",
+            }
+        )
+
+        result = subprocess.run(
+            ["bash", str(script)],
+            input=json.dumps(fixture),
+            text=True,
+            capture_output=True,
+            env=env,
+            check=True,
+        )
+        rendered = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+        ledger = json.loads((claude_dir / "daily-cost.json").read_text())
+        session = ledger["sessions"][fixture["session_id"]]
+
+        assert "old@example.com" not in rendered
+        assert "acct" not in session
