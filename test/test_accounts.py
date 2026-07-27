@@ -1,5 +1,6 @@
 """Unit tests for bin/accounts.py — pure logic only (no keychain, no network)."""
 
+import hashlib
 import json
 import os
 import re
@@ -1473,3 +1474,108 @@ class TestStatuslineAccountBoard:
 
         assert "old@example.com" not in rendered
         assert "acct" not in session
+
+    def test_weekly_walled_account_does_not_win_best_next_marker(self, tmp_path):
+        repo = Path(__file__).resolve().parent.parent
+        home = tmp_path / "home"
+        claude_dir = home / ".claude"
+        claude_dir.mkdir(parents=True)
+        (claude_dir / "statusline.conf").write_text(
+            'SHOW_ACCOUNT_RESETS=1\n'
+            'MAX_COLS=200\n'
+            'ACCOUNT_LABELS="current:current@example.com|cur-org '
+            'walled:walled@example.com|walled-org '
+            'fresh:fresh@example.com|fresh-org"\n'
+        )
+        resets = {
+            "current@example.com|cur-org": {
+                "email": "current@example.com",
+                "org_uuid": "cur-org",
+                "five_hour_pct": 75,
+                "seven_day_pct": 30,
+                "last_seen": time.time(),
+            },
+            # Fresh 5h window but weekly-walled — the router would never pick it.
+            "walled@example.com|walled-org": {
+                "email": "walled@example.com",
+                "org_uuid": "walled-org",
+                "five_hour_pct": 5,
+                "seven_day_pct": 97,
+                "last_seen": time.time(),
+            },
+            "fresh@example.com|fresh-org": {
+                "email": "fresh@example.com",
+                "org_uuid": "fresh-org",
+                "five_hour_pct": 20,
+                "seven_day_pct": 20,
+                "last_seen": time.time(),
+            },
+        }
+        (claude_dir / "account-resets.json").write_text(json.dumps(resets))
+        profile_payload = json.dumps(
+            {"account": {"email": "current@example.com"}, "organization": {"uuid": "cur-org"}}
+        )
+        usage_payload = json.dumps(
+            {"five_hour": {"utilization": 75}, "seven_day": {"utilization": 30}}
+        )
+        # Pre-seeded fresh caches + matching token hash: no refresh, no network —
+        # the render reads exactly this identity/usage (marker needs current 5h ≥ 70).
+        token = "statusline-test-token"
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        (cache / "statusline-token-hash-current").write_text(
+            hashlib.sha256(token.encode()).hexdigest()[:16] + "\n"
+        )
+        (cache / "statusline-profile-cache-current.json").write_text(profile_payload)
+        (cache / "statusline-usage-cache-current.json").write_text(usage_payload)
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        fake_curl = fake_bin / "curl"
+        fake_curl.write_text(
+            "#!/usr/bin/env bash\n"
+            'case "$*" in\n'
+            f"  *oauth/profile*) printf '%s' '{profile_payload}' ;;\n"
+            f"  *oauth/usage*) printf '%s' '{usage_payload}' ;;\n"
+            "esac\n"
+        )
+        fake_curl.chmod(0o755)
+        project = tmp_path / "project"
+        project.mkdir()
+        fixture = json.loads((repo / "test/fixtures/input.json").read_text())
+        fixture["workspace"]["current_dir"] = str(project)
+        script = tmp_path / "statusline.sh"
+        script.write_text(
+            (repo / "bin/statusline.sh")
+            .read_text()
+            .replace("/tmp/claude", str(cache))
+        )
+        env = os.environ.copy()
+        env.update(
+            {
+                "HOME": str(home),
+                "PATH": f"{fake_bin}:{env['PATH']}",
+                "TZ": "UTC",
+                "CLAUDE_CODE_OAUTH_TOKEN": token,
+                "ACCOUNTS_ROUTED_LABEL": "current",
+                "ACCOUNTS_ROUTED_EMAIL": "current@example.com",
+                "ACCOUNTS_ROUTED_ORG_UUID": "cur-org",
+            }
+        )
+        # Hermetic: a real session exports its own profile dir, which would
+        # replace the fixture launch identity and blank the board.
+        env.pop("CLAUDE_CONFIG_DIR", None)
+
+        result = subprocess.run(
+            ["bash", str(script)],
+            input=json.dumps(fixture),
+            text=True,
+            capture_output=True,
+            env=env,
+            check=True,
+        )
+        rendered = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+        marked = [line for line in rendered.splitlines() if "✓ best next" in line]
+
+        assert marked, rendered
+        assert all("Fresh" in line for line in marked), rendered
+        assert not any("Walled" in line for line in marked), rendered
