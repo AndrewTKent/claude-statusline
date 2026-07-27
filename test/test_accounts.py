@@ -718,9 +718,147 @@ class TestNativeProfiles:
         new = _live_blob("new")
         profile = accounts.ensure_native_profile("gmail", {"blob": old})
         accounts._write_0600(profile / ".credentials.json", new)
-        blobs = {"accounts": {"gmail": {"blob": old}}}
-        assert accounts.sync_profile_credentials(blobs, persist=False) is True
+        blobs = {
+            "accounts": {
+                "gmail": {
+                    "blob": old,
+                    "email": "same@example.com",
+                    "org_uuid": "same-org",
+                }
+            }
+        }
+        monkeypatch.setattr(
+            accounts,
+            "fetch_profile",
+            lambda token: {
+                "account": {"email": "same@example.com"},
+                "organization": {"uuid": "same-org"},
+            },
+        )
+
+        assert accounts.sync_profile_credentials(blobs, persist=False) == set()
         assert blobs["accounts"]["gmail"]["blob"] == new
+
+    @pytest.mark.parametrize(
+        ("actual_email", "actual_org"),
+        [
+            ("other@example.com", "same-org"),
+            ("same@example.com", "other-org"),
+        ],
+    )
+    def test_rejects_rotated_credential_from_a_different_identity(
+        self,
+        tmp_path,
+        monkeypatch,
+        capsys,
+        actual_email,
+        actual_org,
+    ):
+        self._paths(tmp_path, monkeypatch)
+        old = _live_blob("old")
+        new = _live_blob("new")
+        profile = accounts.ensure_native_profile("gmail", {"blob": old})
+        accounts._write_0600(profile / ".credentials.json", new)
+        blobs = {
+            "accounts": {
+                "gmail": {
+                    "blob": old,
+                    "email": "same@example.com",
+                    "org_uuid": "same-org",
+                }
+            }
+        }
+        monkeypatch.setattr(
+            accounts,
+            "fetch_profile",
+            lambda token: {
+                "account": {"email": actual_email},
+                "organization": {"uuid": actual_org},
+            },
+        )
+
+        assert accounts.sync_profile_credentials(blobs, persist=False) == set()
+        assert blobs["accounts"]["gmail"]["blob"] == old
+        assert (profile / ".credentials.json").read_text() == old
+        assert "gmail profile login does not match its stored identity" in capsys.readouterr().err
+
+    def test_does_not_persist_an_unverified_rotation(self, tmp_path, monkeypatch):
+        self._paths(tmp_path, monkeypatch)
+        old = _live_blob("old")
+        new = _live_blob("new")
+        profile = accounts.ensure_native_profile("gmail", {"blob": old})
+        accounts._write_0600(profile / ".credentials.json", new)
+        blobs = {
+            "accounts": {
+                "gmail": {
+                    "blob": old,
+                    "email": "same@example.com",
+                    "org_uuid": "same-org",
+                }
+            }
+        }
+        monkeypatch.setattr(accounts, "fetch_profile", lambda token: None)
+
+        assert accounts.sync_profile_credentials(blobs, persist=False) == {"gmail"}
+        assert blobs["accounts"]["gmail"]["blob"] == old
+        assert (profile / ".credentials.json").read_text() == new
+
+    def test_establishes_missing_stored_identity_before_accepting_rotation(
+        self, tmp_path, monkeypatch
+    ):
+        self._paths(tmp_path, monkeypatch)
+        old = _live_blob("old")
+        new = _live_blob("new")
+        profile = accounts.ensure_native_profile("gmail", {"blob": old})
+        accounts._write_0600(profile / ".credentials.json", new)
+        blobs = {"accounts": {"gmail": {"blob": old}}}
+
+        def profile_for(token):
+            if token == "old":
+                return {
+                    "account": {"email": "old@example.com"},
+                    "organization": {"uuid": "old-org"},
+                }
+            return {
+                "account": {"email": "other@example.com"},
+                "organization": {"uuid": "other-org"},
+            }
+
+        monkeypatch.setattr(accounts, "fetch_profile", profile_for)
+
+        assert accounts.sync_profile_credentials(blobs, persist=False) == set()
+        assert blobs["accounts"]["gmail"] == {"blob": old}
+        assert (profile / ".credentials.json").read_text() == old
+
+    @pytest.mark.parametrize("stored_blob", ["", "truncated-json"])
+    def test_does_not_restore_an_unusable_stored_credential(
+        self, tmp_path, monkeypatch, stored_blob
+    ):
+        self._paths(tmp_path, monkeypatch)
+        new = _live_blob("new")
+        profile = accounts.native_profile_path("gmail")
+        profile.mkdir(parents=True)
+        accounts._write_0600(profile / ".credentials.json", new)
+        blobs = {
+            "accounts": {
+                "gmail": {
+                    "blob": stored_blob,
+                    "email": "old@example.com",
+                    "org_uuid": "old-org",
+                }
+            }
+        }
+        monkeypatch.setattr(
+            accounts,
+            "fetch_profile",
+            lambda token: {
+                "account": {"email": "other@example.com"},
+                "organization": {"uuid": "other-org"},
+            },
+        )
+
+        assert accounts.sync_profile_credentials(blobs, persist=False) == {"gmail"}
+        assert (profile / ".credentials.json").read_text() == new
 
 
 class TestLoadBlobs:
@@ -1183,11 +1321,72 @@ class TestCmdPickEnv:
         accounts._write_0600(profile / ".credentials.json", new)
         saved = []
         monkeypatch.setattr(accounts, "save_blobs", lambda value: saved.append(value))
+        monkeypatch.setattr(
+            accounts,
+            "fetch_profile",
+            lambda token: {
+                "account": {"email": "g@x"},
+                "organization": {"uuid": "o1"},
+            },
+        )
 
         accounts.cmd_pick_env(types.SimpleNamespace())
 
         assert saved[-1]["accounts"]["gmail"]["blob"] == new
         assert "export ACCOUNTS_ROUTED_LABEL=gmail" in capsys.readouterr().out
+
+    def test_unverified_profile_is_not_exported(self, tmp_path, monkeypatch, capsys):
+        old = _live_blob("old")
+        new = _live_blob("new")
+        blobs = {
+            "gmail": {
+                "blob": old,
+                "email": "g@x",
+                "org_uuid": "o1",
+            }
+        }
+        resets = {"g@x|o1": {"five_hour_pct": 1.0, "seven_day_pct": 1.0}}
+        self._wire(tmp_path, monkeypatch, blobs, resets=resets)
+        profile = accounts.ensure_native_profile("gmail", blobs["gmail"])
+        accounts._write_0600(profile / ".credentials.json", new)
+        monkeypatch.setattr(accounts, "fetch_profile", lambda token: None)
+
+        accounts.cmd_pick_env(types.SimpleNamespace())
+
+        assert capsys.readouterr().out == self.RESET_ENV
+        assert (profile / ".credentials.json").read_text() == new
+
+    def test_save_failure_fails_closed(self, tmp_path, monkeypatch, capsys):
+        old = _live_blob("old")
+        new = _live_blob("new")
+        blobs = {
+            "gmail": {
+                "blob": old,
+                "email": "g@x",
+                "org_uuid": "o1",
+            }
+        }
+        resets = {"g@x|o1": {"five_hour_pct": 1.0, "seven_day_pct": 1.0}}
+        self._wire(tmp_path, monkeypatch, blobs, resets=resets)
+        profile = accounts.ensure_native_profile("gmail", blobs["gmail"])
+        accounts._write_0600(profile / ".credentials.json", new)
+        monkeypatch.setattr(
+            accounts,
+            "fetch_profile",
+            lambda token: {
+                "account": {"email": "g@x"},
+                "organization": {"uuid": "o1"},
+            },
+        )
+        monkeypatch.setattr(
+            accounts,
+            "save_blobs",
+            lambda value: (_ for _ in ()).throw(OSError("disk full")),
+        )
+
+        accounts.cmd_pick_env(types.SimpleNamespace())
+
+        assert capsys.readouterr().out == self.RESET_ENV
 
     def test_internal_exception_clears_inherited_routing(self, monkeypatch, capsys):
         monkeypatch.setattr(accounts, "load_blobs",
@@ -1214,11 +1413,20 @@ class TestCmdLs:
     """The blobs-based board: same visual contract as the old vault board
     (marker, staleness, EXPIRED flag, footnotes), rebuilt from route_rows."""
 
-    def _wire(self, monkeypatch, blobs, *, resets=None, active=None, excludes=frozenset()):
+    def _wire(
+        self,
+        monkeypatch,
+        blobs,
+        *,
+        resets=None,
+        active=None,
+        excludes=frozenset(),
+        blocked=frozenset(),
+    ):
         monkeypatch.setattr(accounts, "locked", lambda blocking=True: nullcontext())
         monkeypatch.setattr(accounts, "load_blobs", lambda: {"accounts": blobs})
         monkeypatch.setattr(accounts, "capture_live_to_blobs", lambda b: active)
-        monkeypatch.setattr(accounts, "sync_profile_credentials", lambda b, persist: False)
+        monkeypatch.setattr(accounts, "sync_profile_credentials", lambda b, persist: set(blocked))
         monkeypatch.setattr(accounts, "load_resets", lambda: resets or {})
         monkeypatch.setattr(accounts, "excluded_labels", lambda: set(excludes))
 
@@ -1260,6 +1468,17 @@ class TestCmdLs:
         self._wire(monkeypatch, blobs, resets={"g@x|o1": {"five_hour_pct": 1.0}}, excludes={"gmail"})
         accounts.cmd_ls(types.SimpleNamespace())
         assert "[excluded]" in capsys.readouterr().out
+
+    def test_unverified_label_flagged(self, monkeypatch, capsys):
+        blobs = {"gmail": {"blob": _live_blob("g"), "email": "g@x", "org_uuid": "o1"}}
+        self._wire(
+            monkeypatch,
+            blobs,
+            resets={"g@x|o1": {"five_hour_pct": 1.0}},
+            blocked={"gmail"},
+        )
+        accounts.cmd_ls(types.SimpleNamespace())
+        assert "[unverified]" in capsys.readouterr().out
 
     def test_stale_row_marked(self, monkeypatch, capsys):
         stale_seen = time.time() - accounts.STALE_AFTER_S - 60
