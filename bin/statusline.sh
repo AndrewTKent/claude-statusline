@@ -1769,7 +1769,10 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 # accounts: flag a dead vaulted refresh token (needs /login to use).
                 exp_suffix=""
                 stale_suffix=""
-                if [ -n "$last_seen_ts" ] && [ "$last_seen_ts" -gt 0 ] 2>/dev/null && \
+                # The current account's row renders live payload values (5h /
+                # weekly / fable overlays above), so the ledger's age is
+                # irrelevant for it — never tag the row you're sitting on.
+                if [ "$is_current" != "1" ] && [ -n "$last_seen_ts" ] && [ "$last_seen_ts" -gt 0 ] 2>/dev/null && \
                    [ $(( now_ar - last_seen_ts )) -gt 10800 ]; then
                     stale_suffix=" ${dim}~ stale${reset}"
                 fi
