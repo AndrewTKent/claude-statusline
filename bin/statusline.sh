@@ -2121,7 +2121,17 @@ if [ -n "$_routed_label" ]; then
         case "$_rmode" in
             fable) _rlabel="fable" ;;
             auto)  _rlabel="auto" ;;
-            set)   _rlabel="pinned" ;;
+            set)
+                # Name the pin target when it isn't the live account: bare
+                # "pinned" next to the live label reads as "this account is
+                # pinned" while the session may be stranded elsewhere.
+                _pin_target=$(jq -r '.label // ""' "$_mode_file" 2>/dev/null)
+                if [ -n "$_pin_target" ] && [ "$_pin_target" != "$_routed_label" ]; then
+                    _rlabel="pinned→${_pin_target}"
+                else
+                    _rlabel="pinned"
+                fi
+                ;;
         esac
     fi
     if [ -n "$_rlabel" ]; then
