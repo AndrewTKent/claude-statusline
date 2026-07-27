@@ -231,6 +231,46 @@ class TestAccountEligibility:
         assert accounts._rate_eligible(None, 50.0) is False   # unknown 5h
         assert accounts._rate_eligible(50.0, None) is False   # unknown weekly
 
+    def test_route_rows_sorts_by_binding_window(self, monkeypatch):
+        # A is freshest on 5h but nearly weekly-walled — its real runway is 6%.
+        # Best-first must mean the binding window (worst axis), not the 5h axis.
+        monkeypatch.setattr(accounts, "load_resets", lambda: {
+            "a@x|o1": {"five_hour_pct": 9.0, "seven_day_pct": 94.0},
+            "b@x|o2": {"five_hour_pct": 13.0, "seven_day_pct": 20.0},
+        })
+        blobs = {"accounts": {
+            "A": {"blob": _live_blob("a"), "email": "a@x", "org_uuid": "o1"},
+            "B": {"blob": _live_blob("b"), "email": "b@x", "org_uuid": "o2"},
+        }}
+        rows = accounts.route_rows(blobs, None, 2_000_000_000.0)
+        assert [r["label"] for r in rows] == ["B", "A"]
+
+    def test_route_rows_unknown_axis_sorts_last(self, monkeypatch):
+        # C's weekly was never polled → _rate_eligible can't pick it; the board
+        # must not show it above fully-known rows ("sorted best-first").
+        monkeypatch.setattr(accounts, "load_resets", lambda: {
+            "a@x|o1": {"five_hour_pct": 80.0, "seven_day_pct": 80.0},
+            "c@x|o3": {"seven_day_pct": 50.0},
+        })
+        blobs = {"accounts": {
+            "A": {"blob": _live_blob("a"), "email": "a@x", "org_uuid": "o1"},
+            "C": {"blob": _live_blob("c"), "email": "c@x", "org_uuid": "o3"},
+        }}
+        rows = accounts.route_rows(blobs, None, 2_000_000_000.0)
+        assert [r["label"] for r in rows] == ["A", "C"]
+
+    def test_route_rows_equal_binding_breaks_on_5h(self, monkeypatch):
+        monkeypatch.setattr(accounts, "load_resets", lambda: {
+            "a@x|o1": {"five_hour_pct": 50.0, "seven_day_pct": 50.0},
+            "b@x|o2": {"five_hour_pct": 30.0, "seven_day_pct": 50.0},
+        })
+        blobs = {"accounts": {
+            "A": {"blob": _live_blob("a"), "email": "a@x", "org_uuid": "o1"},
+            "B": {"blob": _live_blob("b"), "email": "b@x", "org_uuid": "o2"},
+        }}
+        rows = accounts.route_rows(blobs, None, 2_000_000_000.0)
+        assert [r["label"] for r in rows] == ["B", "A"]
+
 
 def accounts_row(label, five_hour, expired=False, active=False, fable=0.0, seven_day=0.0):
     return {"label": label, "email": f"{label}@x", "five_hour": five_hour,
@@ -442,7 +482,6 @@ class TestLegacyRouteCleanup:
             accounts.main(["route"])
 
         assert calls == [True]
-
 
 class TestCmdSet:
     def _paths(self, tmp_path, monkeypatch):
@@ -834,6 +873,16 @@ class TestFableEligible:
         assert accounts.fable_eligible(100.0, 10.0, 0.0) is False
 
 
+class TestBindingPct:
+    def test_worst_axis_wins(self):
+        assert accounts.binding_pct(21.0, 92.0, 12.0) == 92.0
+
+    def test_none_axes_ignored(self):
+        assert accounts.binding_pct(30.0, None) == 30.0
+
+    def test_all_none_sorts_last(self):
+        assert accounts.binding_pct(None, None) == float("inf")
+
 
 class TestPickEnvFable:
     NOW = 1_784_000_000.0
@@ -843,11 +892,24 @@ class TestPickEnvFable:
         "ymail": {"token": "sk-ymail", "expires_at": NOW + 1000},
     }}
 
-    def test_fable_first_orders_eligible_by_fable(self):
+    def test_fable_first_orders_eligible_by_binding(self):
+        # binding: ymail 40 (fable), alumni 50 (5h), gmail 80 (fable)
         rows = [accounts_row("gmail", 10.0, fable=80.0),
                 accounts_row("alumni", 50.0, fable=10.0),
                 accounts_row("ymail", 20.0, fable=40.0)]
-        assert [r["label"] for r in accounts._fable_first(rows)] == ["alumni", "ymail", "gmail"]
+        assert [r["label"] for r in accounts._fable_first(rows)] == ["ymail", "alumni", "gmail"]
+
+    def test_equal_binding_breaks_on_fable(self):
+        # Both bind at 50 (their 5h); the fresher fable axis wins the tie.
+        rows = [accounts_row("A", 50.0, fable=40.0, seven_day=10.0),
+                accounts_row("B", 50.0, fable=20.0, seven_day=10.0)]
+        assert [r["label"] for r in accounts._fable_first(rows)] == ["B", "A"]
+
+    def test_binding_window_outranks_fable_axis_at_launch(self):
+        # The pick-env path of the same live miss: 8%-runway ymail must not win.
+        rows = [accounts_row("ymail", 21.0, fable=12.0, seven_day=92.0),
+                accounts_row("acme-work", 30.0, fable=19.0, seven_day=19.0)]
+        assert accounts.pick_profile_route(accounts._fable_first(rows), set(), None) == "acme-work"
 
     def test_prefers_fable_over_headroom(self):
         # gmail is best 5h (5) but fable-capped; alumni worse 5h (50) but fable @10.
@@ -1270,6 +1332,9 @@ class TestStatuslineAccountBoard:
                 "ACCOUNTS_ROUTED_ORG_UUID": "acme-org",
             }
         )
+        # Hermetic: a real session exports its own profile dir, which would
+        # replace the fixture launch identity and blank the board.
+        env.pop("CLAUDE_CONFIG_DIR", None)
 
         result = subprocess.run(
             ["bash", str(script)],

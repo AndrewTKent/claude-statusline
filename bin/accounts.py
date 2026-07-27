@@ -905,9 +905,11 @@ def poll_blobs_usage(blobs: dict) -> int:
 
 
 def route_rows(blobs: dict, active_label: str | None, now_ts: float) -> list[dict]:
-    """One row per stored account: label, effective 5h% (reset-aware, from the
+    """One row per stored account: label, effective pcts (reset-aware, from the
     board the poll just refreshed), staleness of that estimate, whether its
-    cred is expired, whether it's the live account. Sorted best-first (lowest 5h)."""
+    cred is expired, whether it's the live account. Sorted best-first: most
+    binding-window runway (lowest worst-of-5h/7d), freshest 5h as tiebreak;
+    rows missing a rate axis are unpickable (_rate_eligible) and sort last."""
     resets = load_resets()
     rows = []
     for label, e in (blobs.get("accounts") or {}).items():
@@ -926,8 +928,19 @@ def route_rows(blobs: dict, active_label: str | None, now_ts: float) -> list[dic
                 "stale": bool(last_seen) and (now_ts - last_seen) > STALE_AFTER_S,
             }
         )
-    rows.sort(key=lambda r: (float("inf") if r["five_hour"] is None else r["five_hour"]))
+    rows.sort(key=lambda r: (
+        r["five_hour"] is None or r["seven_day"] is None,
+        binding_pct(r["five_hour"], r["seven_day"]),
+        float("inf") if r["five_hour"] is None else r["five_hour"],
+    ))
     return rows
+
+
+def binding_pct(*pcts: float | None) -> float:
+    """Worst usage across the windows that gate a session — the account's real
+    runway is 100 minus this. Unknown axes are ignored; all-unknown sorts last."""
+    known = [p for p in pcts if p is not None]
+    return max(known) if known else float("inf")
 
 
 def _rate_eligible(five_hour: float | None, seven_day: float | None) -> bool:
@@ -1108,15 +1121,15 @@ def cmd_tokens(_args) -> None:
 
 
 def _fable_first(rows: list[dict]) -> list[dict]:
-    """Reorder for fable mode: fable-eligible accounts first (least fable used),
-    everything else keeps its existing order. pick_route then takes the first
-    with a live token, so fallback (no eligible or no-token fable account) is
+    """Reorder for fable mode: fable-eligible accounts first (most binding-window
+    runway), everything else keeps its existing order. The profile picker then
+    takes the first usable row, so fallback (no eligible fable account) is
     automatic. Stable sort preserves the incoming (headroom) order inside each group."""
 
     def key(r: dict) -> tuple:
         if fable_eligible(r["five_hour"], r["seven_day"], r["fable"]):
-            return (0, r["fable"])
-        return (1, 0.0)
+            return (0, *_fable_rank(r))
+        return (1,)
 
     return sorted(rows, key=key)
 
@@ -1180,6 +1193,10 @@ def fable_eligible(
     )
 
 
+def _fable_rank(r: dict) -> tuple:
+    """Most usable Fable runway first: binding window, then fable, then 5h.
+    Only rank eligible rows — eligibility guarantees every axis is non-None."""
+    return (binding_pct(r["five_hour"], r["seven_day"], r["fable"]), r["fable"], r["five_hour"])
 def cmd_set(args) -> None:
     """Pin new sessions to <label>."""
     with locked():
@@ -1229,7 +1246,7 @@ def cmd_fable(_args) -> None:
             and not r["expired"]
             and fable_eligible(r["five_hour"], r["seven_day"], r["fable"])
         ),
-        key=lambda r: (r["fable"], r["five_hour"]),
+        key=_fable_rank,
     )
     print("FABLE — new and restarted sessions prefer Fable headroom")
     if not usable:
@@ -1238,7 +1255,9 @@ def cmd_fable(_args) -> None:
             f"routing normally (next {pick_profile_route(rows, excludes, None) or '(none free)'})"
         )
     else:
-        print(f"  next: {usable[0]['label']} (fable {usable[0]['fable']:.0f}%)")
+        best = usable[0]
+        b = binding_pct(best["five_hour"], best["seven_day"], best["fable"])
+        print(f"  next: {best['label']} (fable {best['fable']:.0f}%, binding {b:.0f}%)")
 
 
 def cmd_status(_args) -> None:
@@ -1287,7 +1306,7 @@ def cmd_ls(_args) -> None:
     if not rows:
         print("no stored accounts — /login in Claude Code once; the next accounts command captures it")
         return
-    # stable sort: pushes dead creds last, keeps route_rows' five_hour order otherwise
+    # stable sort: pushes dead creds last, keeps route_rows' binding order otherwise
     rows = sorted(rows, key=lambda r: r["expired"])
     excludes = excluded_labels()
     print(f"{'':2}{'label':<12} {'email':<32} {'5h':>6} {'7d':>6} {'fable':>6}")
