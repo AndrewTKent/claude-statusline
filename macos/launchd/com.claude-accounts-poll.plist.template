@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template for the accounts usage-poll launchd agent. install-accounts-poll.sh
+  populates REPO_ROOT and HOME, then copies this file to ~/Library/LaunchAgents/.
+
+  Runs `accounts poll` every 30 minutes so launch-time routing never decides on a
+  stale board. StartInterval, not KeepAlive: the job exits after each poll, and
+  KeepAlive would relaunch it immediately in a loop.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.claude-accounts-poll</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__REPO_ROOT__/bin/accounts.py</string>
+        <string>poll</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StartInterval</key>
+    <integer>1800</integer>
+
+    <!-- If a poll fails instantly, wait at least 10s before the next launch.
+         Protects against crash loops if config is broken. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.claude/accounts-poll-stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.claude/accounts-poll-stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>
