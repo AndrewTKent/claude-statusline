@@ -298,7 +298,8 @@ skills, and plugins are shared. Interactive sessions remain first-party
 The wrapper chooses once at launch. Running sessions never have credentials
 changed underneath them; exit and resume to reroute the same conversation.
 Minted long-lived tokens remain outside `~/.claude`
-(`~/.accounts/vault.json`) because transcript archival mirrors `~/.claude`.
+(`~/.accounts/vault.json`); archival copies only session JSONLs from
+`~/.claude/projects`.
 
 ---
 
@@ -308,7 +309,7 @@ Two independent tools, both built on the same session JSONLs.
 
 **Token scanning** (`bin/scan_tokens_core.py` + the `bin/scan-tokens*.py`/`.sh` CLIs) attributes every request to work/personal and to a payer, incrementally, and feeds the `tokens`/`usage`/goal/`bounty` rows above plus the work-unit cap columns on the account board. `bin/derive-cap.py` fits those per-account caps from utilization history — it's a manual, unscheduled tool you re-run occasionally, not something cron or launchd calls. Full design, cache schema, and failure modes: [`bin/ARCHITECTURE.md`](bin/ARCHITECTURE.md).
 
-**Durable ledger & archival** (`bin/usage-ledger.py`, `bin/archive-transcripts.sh`, `bin/vault-snapshot.sh`) keep a permanent per-day/per-model token ledger at `~/.claude/usage-ledger.json` and mirror transcripts nightly — rows never pruned, survives transcript cleanup.
+**Durable ledger & archival** (`bin/usage-ledger.py`, `bin/archive-transcripts.sh`, `bin/vault-snapshot.sh`) keep a permanent per-day/per-model token ledger at `~/.claude/usage-ledger.json` and mirror Claude Code session JSONLs nightly — rows never pruned, survives transcript cleanup.
 
 **Redaction** (`bin/scan-tokens-export.py`, `-autoflag.py`, `-coworker-scrub.py`, `-merge.py`) strips sensitive content from a session JSONL into a separate export copy before you hand it to a third party — source files are never modified. Pipeline, re-run steps, and file layout: [`bin/REDACTION.md`](bin/REDACTION.md).
 

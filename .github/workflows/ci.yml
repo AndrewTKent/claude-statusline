@@ -60,6 +60,8 @@ jobs:
           echo "PASS: install script works"
       - name: Test ledger functions
         run: bash test/test_ledger.sh
+      - name: Test transcript backups
+        run: bash test/test_backup_scripts.sh
       - name: Test Codex monitor
         run: python3 test/test_codex_statusline.py
       - name: Set up Python 3.9
