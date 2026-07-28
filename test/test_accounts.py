@@ -1579,3 +1579,121 @@ class TestStatuslineAccountBoard:
         assert marked, rendered
         assert all("Fresh" in line for line in marked), rendered
         assert not any("Walled" in line for line in marked), rendered
+
+
+# ---- Verified auth state (auth_dead_at) ----
+
+
+def _blob(access_exp_ms: int | None = None, refresh: str | None = "rt") -> str:
+    oauth: dict = {"accessToken": "at"}
+    if access_exp_ms is not None:
+        oauth["expiresAt"] = access_exp_ms
+    if refresh is not None:
+        oauth["refreshToken"] = refresh
+    return json.dumps({"claudeAiOauth": oauth})
+
+
+NOW_TS = 1_800_000_000.0
+LIVE_MS = int((NOW_TS + 3600) * 1000)
+PAST_MS = int((NOW_TS - 3600) * 1000)
+
+
+class TestEntryNeedsLogin:
+    def test_alive_blob_no_flag(self):
+        assert accounts.entry_needs_login({"blob": _blob(LIVE_MS)}, NOW_TS) is False
+
+    def test_auth_dead_flag_wins_over_alive_metadata(self):
+        entry = {"blob": _blob(LIVE_MS), "auth_dead_at": int(NOW_TS) - 5}
+        assert accounts.entry_needs_login(entry, NOW_TS) is True
+
+    def test_metadata_dead_blob(self):
+        assert accounts.entry_needs_login({"blob": _blob(LIVE_MS, refresh=None)}, NOW_TS) is True
+
+    def test_set_entry_blob_clears_flag(self):
+        entry = {"blob": _blob(PAST_MS), "auth_dead_at": 123}
+        accounts.set_entry_blob(entry, _blob(LIVE_MS))
+        assert "auth_dead_at" not in entry
+        assert accounts.entry_needs_login(entry, NOW_TS) is False
+
+
+class TestMarkAuthDead:
+    def test_notifies_only_on_transition(self, monkeypatch):
+        calls: list[str] = []
+        monkeypatch.setattr(accounts, "_notify_needs_login", calls.append)
+        entry: dict = {}
+        accounts.mark_auth_dead("gmail", entry, NOW_TS)
+        accounts.mark_auth_dead("gmail", entry, NOW_TS + 60)
+        assert calls == ["gmail"]
+        assert entry["auth_dead_at"] == int(NOW_TS + 60)
+
+
+class TestVerifyEntryAuth:
+    def test_live_access_token_short_circuits(self, monkeypatch):
+        def boom(_blob):
+            raise AssertionError("refresh must not run for a live access token")
+
+        monkeypatch.setattr(accounts, "refresh_blob_access", boom)
+        entry = {"blob": _blob(LIVE_MS)}
+        assert accounts.verify_entry_auth("gmail", entry, NOW_TS) == "ok"
+
+    def test_rejected_refresh_marks_dead(self, monkeypatch):
+        monkeypatch.setattr(accounts, "_notify_needs_login", lambda _l: None)
+
+        def rejected(_blob):
+            raise accounts.TokenRefreshError("401")
+
+        monkeypatch.setattr(accounts, "refresh_blob_access", rejected)
+        entry = {"blob": _blob(PAST_MS)}
+        assert accounts.verify_entry_auth("gmail", entry, NOW_TS) == "dead"
+        assert entry["auth_dead_at"] == int(NOW_TS)
+
+    def test_throttle_is_unavailable_not_dead(self, monkeypatch):
+        def throttled(_blob):
+            raise accounts.TokenRefreshError("429")
+
+        monkeypatch.setattr(accounts, "refresh_blob_access", throttled)
+        entry = {"blob": _blob(PAST_MS)}
+        assert accounts.verify_entry_auth("gmail", entry, NOW_TS) == "unavailable"
+        assert "auth_dead_at" not in entry
+
+    def test_no_usable_refresh_token_marks_dead(self, monkeypatch):
+        monkeypatch.setattr(accounts, "_notify_needs_login", lambda _l: None)
+        monkeypatch.setattr(accounts, "refresh_blob_access", lambda _b: None)
+        entry = {"blob": _blob(PAST_MS)}
+        assert accounts.verify_entry_auth("gmail", entry, NOW_TS) == "dead"
+
+    def test_successful_rotation_persists_and_clears(self, monkeypatch):
+        written: list[tuple[str, str]] = []
+        rotated = _blob(LIVE_MS)
+        monkeypatch.setattr(accounts, "refresh_blob_access", lambda _b: rotated)
+        monkeypatch.setattr(
+            accounts, "write_profile_credentials", lambda label, blob: written.append((label, blob))
+        )
+        entry = {"blob": _blob(PAST_MS), "auth_dead_at": 123}
+        assert accounts.verify_entry_auth("gmail", entry, NOW_TS) == "ok_rotated"
+        assert entry["blob"] == rotated
+        assert "auth_dead_at" not in entry
+        assert written == [("gmail", rotated)]
+
+
+class TestAuthDeadRouting:
+    def test_route_rows_marks_flagged_entry_expired_and_pick_skips(self, monkeypatch):
+        monkeypatch.setattr(accounts, "load_resets", lambda: {})
+        blobs = {
+            "accounts": {
+                "dead": {
+                    "blob": _blob(LIVE_MS),
+                    "email": "a@x",
+                    "org_uuid": "1",
+                    "auth_dead_at": 5,
+                },
+                "alive": {"blob": _blob(LIVE_MS), "email": "b@x", "org_uuid": "2"},
+            }
+        }
+        rows = accounts.route_rows(blobs, None, NOW_TS)
+        by_label = {r["label"]: r for r in rows}
+        assert by_label["dead"]["expired"] is True
+        assert by_label["alive"]["expired"] is False
+        for row in rows:
+            row["five_hour"], row["seven_day"] = 10.0, 10.0
+        assert accounts.pick_profile_route(rows, set(), None) == "alive"

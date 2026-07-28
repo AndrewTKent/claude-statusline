@@ -1578,7 +1578,8 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 (.accounts // {}) | to_entries[] | .value |
                 (try ((.blob | fromjson).claudeAiOauth) catch null) as $oauth |
                 (($oauth.refreshTokenExpiresAt) // null) as $exp |
-                select($oauth == null or ($oauth.refreshToken // null) == null
+                select(((.auth_dead_at // null) != null)
+                       or $oauth == null or ($oauth.refreshToken // null) == null
                        or ($exp != null and ($exp / 1000) <= $now)) |
                 "\(.email)|\(.org_uuid)"' "$accounts_blobs" 2>/dev/null)
         fi
