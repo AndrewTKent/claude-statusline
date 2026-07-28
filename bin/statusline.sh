@@ -686,6 +686,19 @@ elif $profile_identity_unverified; then
     ACCT_EMAIL=""
     ACCT_ORG_UUID=""
 fi
+if [[ "${ACCOUNTS_ROUTER_STATE:-}" == /tmp/claude/account-router-*.json ]] &&
+    [ -n "$SESSION_ID" ]; then
+    _router_state_tmp="${ACCOUNTS_ROUTER_STATE}.tmp.$$"
+    jq -cn \
+        --arg session_id "$SESSION_ID" \
+        --arg model "$MODEL" \
+        --arg label "$ACCT_TAG" \
+        --arg cwd "$CWD" \
+        '{session_id:$session_id,model:$model,label:$label,cwd:$cwd}' \
+        > "$_router_state_tmp" 2>/dev/null &&
+        chmod 600 "$_router_state_tmp" 2>/dev/null &&
+        mv "$_router_state_tmp" "$ACCOUNTS_ROUTER_STATE" 2>/dev/null
+fi
 
 # ── Daily cost ledger ──────────────────────────────────
 DAILY_LEDGER="$HOME/.claude/daily-cost.json"
@@ -2120,24 +2133,25 @@ fi
 # ── Routed account + launch mode ─────────────────────────
 ROUTE_MODE_SUFFIX=""
 _mode_file="$HOME/.accounts/mode.json"
-_routed_label="${ACCOUNTS_ROUTED_LABEL:-}"
+_routed_label="${ACCT_TAG:-${ACCOUNTS_ROUTED_LABEL:-}}"
 if [ -n "$_routed_label" ]; then
     _rlabel=""
     ROUTE_MODE_SUFFIX=" ${dim}· ${_routed_label}${reset}"
     if [ -n "${ACCOUNTS_PIN:-}" ]; then
-        _rlabel="pin"
+        if [ "$ACCOUNTS_PIN" != "$_routed_label" ]; then
+            _rlabel="pin ${ACCOUNTS_PIN} bypassed"
+        else
+            _rlabel="pinned"
+        fi
     elif [ -f "$_mode_file" ]; then
         _rmode=$(jq -r '.mode // ""' "$_mode_file" 2>/dev/null)
         case "$_rmode" in
             fable) _rlabel="fable" ;;
             auto)  _rlabel="auto" ;;
             set)
-                # Name the pin target when it isn't the live account: bare
-                # "pinned" next to the live label reads as "this account is
-                # pinned" while the session may be stranded elsewhere.
                 _pin_target=$(jq -r '.label // ""' "$_mode_file" 2>/dev/null)
                 if [ -n "$_pin_target" ] && [ "$_pin_target" != "$_routed_label" ]; then
-                    _rlabel="pinned→${_pin_target}"
+                    _rlabel="pin ${_pin_target} bypassed"
                 else
                     _rlabel="pinned"
                 fi
