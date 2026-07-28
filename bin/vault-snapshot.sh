@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # vault-snapshot.sh — encrypted snapshot of the transcript archive into the
-# local restic vault, plus a best-effort replica of the (already encrypted)
-# repo to hound.
+# local restic vault, plus an optional best-effort remote replica of the
+# already encrypted repository.
 #
 # Quantum-safety: restic is symmetric-only — AES-256 under a scrypt-derived
 # key from the keychain passphrase. No RSA/ECC anywhere at rest, so
@@ -14,7 +14,8 @@ set -euo pipefail
 export RESTIC_REPOSITORY="${RESTIC_REPOSITORY:-$HOME/claude-vault/restic}"
 export RESTIC_PASSWORD_COMMAND="security find-generic-password -s restic-claude-vault -w"
 RESTIC="$(command -v restic || echo /opt/homebrew/bin/restic)"
-REPLICA_HOST="${VAULT_REPLICA_HOST:-hound-ts}"
+REPLICA_HOST="${VAULT_REPLICA_HOST-}"
+SSH_KEY="${VAULT_REPLICA_SSH_KEY:-$HOME/.ssh/id_ed25519}"
 LOG="$HOME/claude-vault/vault.log"
 
 log() { printf '[%s] %s\n' "$(date +'%F %T')" "$*" >> "$LOG"; }
@@ -26,9 +27,14 @@ log() { printf '[%s] %s\n' "$(date +'%F %T')" "$*" >> "$LOG"; }
     --tag transcripts --quiet
 log "snapshot ok ($("$RESTIC" snapshots --tag transcripts | tail -1))"
 
-if rsync -a -e "ssh -o BatchMode=yes -o ConnectTimeout=8" --timeout=30 \
-    "$RESTIC_REPOSITORY/" "$REPLICA_HOST:claude-vault-replica/restic/" 2>>"$LOG"; then
-    log "replica to $REPLICA_HOST ok"
-else
-    log "replica to $REPLICA_HOST FAILED — local vault only this run"
+if [ -n "$REPLICA_HOST" ]; then
+    printf -v RSYNC_SSH "ssh -i '%s' -o BatchMode=yes -o ConnectTimeout=8" "$SSH_KEY"
+    if ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=8 "$REPLICA_HOST" \
+            'mkdir -p ~/claude-vault-replica/restic && chmod 700 ~/claude-vault-replica' 2>>"$LOG" \
+       && rsync -a -e "$RSYNC_SSH" --timeout=30 \
+            "$RESTIC_REPOSITORY/" "$REPLICA_HOST:claude-vault-replica/restic/" 2>>"$LOG"; then
+        log "replica to $REPLICA_HOST ok"
+    else
+        log "replica to $REPLICA_HOST FAILED — local vault only this run"
+    fi
 fi
