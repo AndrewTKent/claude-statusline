@@ -744,6 +744,10 @@ def sync_profile_credentials(blobs: dict, *, persist: bool) -> set[str]:
             else:
                 blocked_labels.add(label)
                 action = "blocked routing"
+            # Same remedy as a dead credential — a correct /login — so it gets
+            # the same flag; the fix clears it through set_entry_blob.
+            mark_auth_dead(label, entry, time.time())
+            changed = True
             print(
                 f"warning: {label} profile login does not match its stored identity; {action}",
                 file=sys.stderr,

@@ -720,9 +720,13 @@ class TestNativeProfiles:
             }
 
         monkeypatch.setattr(accounts, "fetch_profile", profile_for)
+        monkeypatch.setattr(accounts, "_notify_needs_login", lambda _l: None)
 
         assert accounts.sync_profile_credentials(blobs, persist=False) == set()
-        assert blobs["accounts"]["gmail"] == {"blob": old}
+        entry = blobs["accounts"]["gmail"]
+        # The rotation is refused AND the mismatch is now surfaced as needs-login.
+        assert entry["blob"] == old
+        assert entry["auth_dead_at"]
         assert (profile / ".credentials.json").read_text() == old
 
     @pytest.mark.parametrize("stored_blob", ["", "truncated-json"])
@@ -1812,3 +1816,27 @@ class TestSyncReadsLiveLineage:
         assert blocked == set()
         # stored blob untouched
         assert accounts.blob_access_expiry(blobs["accounts"]["gmail"]["blob"]) is not None
+
+
+class TestMismatchIsVisible:
+    def test_identity_mismatch_stamps_needs_login(self, monkeypatch):
+        fresh = _blob(LIVE_MS)
+        monkeypatch.setattr(accounts, "profile_live_blob", lambda _l: fresh)
+        monkeypatch.setattr(accounts, "fetch_profile", lambda _t: {"i": 1})
+        monkeypatch.setattr(
+            accounts,
+            "identity_from_profile",
+            lambda _p: {"email": "WRONG@x", "org_uuid": "9", "org_type": "t"},
+        )
+        notified: list[str] = []
+        monkeypatch.setattr(accounts, "_notify_needs_login", notified.append)
+        monkeypatch.setattr(accounts, "_write_0600", lambda _p, _b: None)
+        monkeypatch.setattr(accounts, "save_blobs", lambda _b: None)
+        blobs = {
+            "accounts": {
+                "gmail": {"blob": _blob(LIVE_MS, refresh="older"), "email": "a@x", "org_uuid": "1"}
+            }
+        }
+        accounts.sync_profile_credentials(blobs, persist=True)
+        assert blobs["accounts"]["gmail"]["auth_dead_at"]
+        assert notified == ["gmail"]
