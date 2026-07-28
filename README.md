@@ -284,19 +284,22 @@ skills, and plugins are shared. Interactive sessions remain first-party
 
 | Command | What it does |
 |---------|---------------|
-| `accounts set <label>` | Pin new and restarted sessions to `<label>` |
-| `accounts auto` | Route each new or restarted session to the freshest account |
-| `accounts fable` | Prefer a Fable-capable account; fall back to normal routing |
+| `accounts set <label>` | Prefer `<label>` while it has safe quota headroom |
+| `accounts auto` | Route sessions to the freshest account |
+| `accounts fable` | Prefer a Fable-capable account |
 | `accounts status` | Mode + per-account 5h headroom + ⚠login flags |
-| `accounts poll` | Refresh the usage board for all stored accounts now |
-| `accounts refresh [label]` | Re-auth stale blobs via their own refresh token, no browser (default: every stale-but-refreshable account) |
+| `accounts poll` | Refresh dormant file-backed profiles, then poll every routable account |
+| `accounts refresh [label]` | Refresh stale file-backed credentials without a browser |
 | `accounts mint <label>` | Mint + vault a 1-year token for headless jobs |
 | `accounts tokens` | List minted tokens and expiry |
 | `accounts sync` | Converge the token vault with a second machine |
-| `accounts pick-env` | Emit `CLAUDE_CONFIG_DIR` and account metadata for the shell wrapper |
+| `accounts pick-env` | Emit `CLAUDE_CONFIG_DIR` and account metadata |
 
-The wrapper chooses once at launch. Running sessions never have credentials
-changed underneath them; exit and resume to reroute the same conversation.
+`claude-router.py` supervises interactive sessions. It reserves the selected
+account, watches the active model's quota windows, and resumes the exact session
+under another isolated profile before a window is exhausted. The shell never
+regains control during a handoff. If every Fable-capable account is gated, the
+same session resumes on Opus using the safest general-model account.
 Minted long-lived tokens remain outside `~/.claude`
 (`~/.accounts/vault.json`); archival copies only session JSONLs from
 `~/.claude/projects`.

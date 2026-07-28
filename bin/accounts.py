@@ -3,9 +3,8 @@
 
 Interactive sessions use one native CLAUDE_CONFIG_DIR profile per account.
 Credentials and entitlement caches stay isolated while projects, skills, settings,
-and transcript state are shared. Claude therefore sees claude.ai subscription auth,
-including Max-only model access, without global credential swaps or setup-token
-injection. Accounts are chosen at session launch by reset-aware headroom.
+and transcript state are shared. A supervisor routes each exact session by
+reset-aware headroom and resumes it under another profile before quota exhaustion.
 
 The setup-token vault remains separate for headless hound jobs.
 
@@ -17,7 +16,7 @@ Router commands:
   poll / refresh  refresh the usage board / re-auth stale accounts (no browser)
   mint / tokens   mint a long-lived token for an account / list minted tokens
   sync            converge the minted-token vault with hound
-  pick-env        emit env exports for the best routable account (shell hook)
+  pick-env        emit env exports for the best routable account
 """
 
 from __future__ import annotations
@@ -121,11 +120,24 @@ def kc_read(service: str, account: str | None = None) -> str | None:
     cmd.append("-w")
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-    except subprocess.TimeoutExpired:
-        return None  # wedged securityd must not hang the caller (it may hold the flock)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
     if r.returncode != 0:
         return None
     return r.stdout.rstrip("\n")
+
+
+def kc_delete(service: str) -> bool:
+    try:
+        r = subprocess.run(
+            ["security", "delete-generic-password", "-s", service],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0
 
 
 # ── identity ──────────────────────────────────────────────────────────────
@@ -500,17 +512,13 @@ def cmd_poll(_args) -> None:
     with locked():
         blobs = load_blobs()
         sync_profile_credentials(blobs, persist=True)
+        refresh_dormant_profiles(blobs)
     n = poll_blobs_usage(blobs)
     print(f"refreshed usage for {n} account(s)")
 
 
 def cmd_refresh(args) -> None:
-    """Re-auth stale accounts without a browser: swap each expired access token
-    for a fresh one via its own refresh token, in place. On-demand and explicit —
-    `poll` never does this, since it runs on the statusline's timer and would
-    rotate a credential on every repaint. Default target set is every account
-    whose access token has expired but whose refresh token is still alive; pass a
-    label to force one."""
+    """Refresh stale file-backed credentials without a browser."""
     now = time.time()
     with locked():
         blobs = load_blobs()
@@ -533,6 +541,9 @@ def cmd_refresh(args) -> None:
         return
     revived = 0
     for label in targets:
+        if kc_read(profile_keychain_service(label)):
+            print(f"  {label}: active profile credential refreshes inside Claude")
+            continue
         try:
             new_blob = refresh_blob_access(accounts[label].get("blob", ""))
         except TokenRefreshError as e:
@@ -578,8 +589,11 @@ TOKEN_VAULT_PATH = HOME / ".accounts" / "vault.json"
 TOKEN_LIFETIME_S = 364 * 24 * 3600
 TOKEN_RE = re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}")
 PROFILES_PATH = HOME / ".accounts" / "profiles"
+LEASES_PATH = HOME / ".accounts" / "leases.json"
 CLAUDE_HOME = HOME / ".claude"
 CLAUDE_STATE_PATH = HOME / ".claude.json"
+LEASE_STALE_S = 30.0
+LEASE_WEIGHT_PCT = 20.0
 
 PROFILE_SHARED_ENTRIES = (
     "CLAUDE.md",
@@ -659,6 +673,19 @@ def _seed_profile_state(profile: Path) -> None:
     _write_0600(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
 
 
+def clear_profile_account_state(label: str) -> None:
+    state_path = native_profile_path(label) / ".claude.json"
+    try:
+        state = json.loads(state_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        state = {"hasCompletedOnboarding": True}
+    if not isinstance(state, dict):
+        state = {"hasCompletedOnboarding": True}
+    for key in PROFILE_ACCOUNT_STATE_KEYS:
+        state.pop(key, None)
+    _write_0600(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+
 def ensure_native_profile(label: str, entry: dict) -> Path:
     profile = native_profile_path(label)
     profile.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -710,7 +737,28 @@ def sync_profile_credentials(blobs: dict, *, persist: bool) -> set[str]:
             continue
         stored_blob = entry.get("blob", "")
         access_token = blob_access_token(profile_blob)
-        if not access_token or profile_blob == stored_blob:
+        if not access_token:
+            if not blob_access_token(stored_blob):
+                blocked_labels.add(label)
+                mark_auth_dead(label, entry, time.time())
+                changed = True
+                continue
+            keychain_service = profile_keychain_service(label)
+            if kc_read(keychain_service) and not kc_delete(keychain_service):
+                blocked_labels.add(label)
+                mark_auth_dead(label, entry, time.time())
+                changed = True
+                continue
+            _write_0600(credentials, stored_blob)
+            clear_profile_account_state(label)
+            set_entry_blob(entry, stored_blob)
+            changed = True
+            print(
+                f"warning: repaired {label} unusable profile credential",
+                file=sys.stderr,
+            )
+            continue
+        if profile_blob == stored_blob:
             continue
         profile = fetch_profile(access_token)
         if not profile:
@@ -738,18 +786,35 @@ def sync_profile_credentials(blobs: dict, *, persist: bool) -> set[str]:
         email_mismatch = identity["email"] != expected_email
         org_mismatch = identity["org_uuid"] != expected_org_uuid
         if email_mismatch or org_mismatch:
-            if blob_access_token(stored_blob):
-                _write_0600(credentials, stored_blob)
-                action = f"restored {label}"
-            else:
+            if not blob_access_token(stored_blob):
                 blocked_labels.add(label)
-                action = "blocked routing"
-            # Same remedy as a dead credential — a correct /login — so it gets
-            # the same flag; the fix clears it through set_entry_blob.
-            mark_auth_dead(label, entry, time.time())
+                mark_auth_dead(label, entry, time.time())
+                print(
+                    f"warning: {label} profile login does not match its stored identity; "
+                    "blocked routing",
+                    file=sys.stderr,
+                )
+                changed = True
+                continue
+            keychain_service = profile_keychain_service(label)
+            if kc_read(keychain_service) and not kc_delete(keychain_service):
+                blocked_labels.add(label)
+                mark_auth_dead(label, entry, time.time())
+                print(
+                    f"warning: {label} profile login does not match its stored identity; "
+                    "could not remove the mismatched profile credential",
+                    file=sys.stderr,
+                )
+                changed = True
+                continue
+            _write_0600(credentials, stored_blob)
+            clear_profile_account_state(label)
+            set_entry_blob(entry, stored_blob)
+            entry["email"] = expected_email
+            entry["org_uuid"] = expected_org_uuid
             changed = True
             print(
-                f"warning: {label} profile login does not match its stored identity; {action}",
+                f"warning: repaired {label} profile login from its stored identity",
                 file=sys.stderr,
             )
             continue
@@ -1016,6 +1081,48 @@ def profile_live_blob(label: str) -> str | None:
         return None
 
 
+def refresh_dormant_profiles(blobs: dict) -> int:
+    now = time.time()
+    refreshed = 0
+    changed = False
+    with locked():
+        active_labels = {
+            lease.get("label") for lease in load_session_leases()
+        }
+        excluded = excluded_labels()
+        for label, entry in (blobs.get("accounts") or {}).items():
+            if label in active_labels or label in excluded:
+                continue
+            blob = profile_live_blob(label) or entry.get("blob", "")
+            access_expiry = blob_access_expiry(blob)
+            if access_expiry is not None and access_expiry > now:
+                continue
+            if blob_expired(blob, now):
+                continue
+            keychain_service = profile_keychain_service(label)
+            keychain_blob = kc_read(keychain_service)
+            if keychain_blob:
+                continue
+            try:
+                new_blob = refresh_blob_access(blob)
+            except TokenRefreshError as exc:
+                if exc.code in ("400", "401", "403"):
+                    mark_auth_dead(label, entry, now)
+                    changed = True
+                continue
+            except Exception:
+                continue
+            if not new_blob:
+                continue
+            set_entry_blob(entry, new_blob)
+            write_profile_credentials(label, new_blob)
+            refreshed += 1
+            changed = True
+        if changed:
+            save_blobs(blobs)
+    return refreshed
+
+
 def poll_blobs_usage(blobs: dict) -> int:
     """Query each stored account's remaining limits with its OWN access token
     and write them to the board (account-resets.json). Pure reads. Skips blobs
@@ -1024,7 +1131,7 @@ def poll_blobs_usage(blobs: dict) -> int:
     now = int(time.time())
     fresh: dict[str, dict] = {}
     for label, e in (blobs.get("accounts") or {}).items():
-        blob = e.get("blob", "")
+        blob = profile_live_blob(label) or e.get("blob", "")
         exp = blob_access_expiry(blob)
         if exp is not None and now >= exp:
             continue
@@ -1133,19 +1240,133 @@ def pick_route(rows: list[dict], vault: dict, excludes: set[str], now_ts: float,
     return None
 
 
-def pick_profile_route(rows: list[dict], excludes: set[str], pin: str | None) -> str | None:
-    for row in rows:
-        if pin is not None and row["label"] != pin:
-            continue
+def pick_profile_route(
+    rows: list[dict],
+    excludes: set[str],
+    pin: str | None,
+    *,
+    require_fable: bool = False,
+) -> str | None:
+    ordered = rows
+    if pin is not None:
+        ordered = sorted(rows, key=lambda row: row["label"] != pin)
+    for row in ordered:
         if row["expired"]:
             continue
-        if pin is None:
-            if row["label"] in excludes:
-                continue
-            if not _rate_eligible(row["five_hour"], row["seven_day"]):
-                continue
+        if row["label"] in excludes:
+            continue
+        if not _rate_eligible(row["five_hour"], row["seven_day"]):
+            continue
+        if require_fable and not fable_eligible(
+            row["five_hour"],
+            row["seven_day"],
+            row["fable"],
+        ):
+            continue
         return row["label"]
     return None
+
+
+def rank_profile_rows(
+    rows: list[dict],
+    leases: list[dict],
+    *,
+    skip_pid: int | None,
+    require_fable: bool = False,
+) -> list[dict]:
+    counts: dict[str, int] = {}
+    for lease in leases:
+        if skip_pid is not None and lease.get("pid") == skip_pid:
+            continue
+        label = lease.get("label")
+        if label:
+            counts[label] = counts.get(label, 0) + 1
+
+    def score(row: dict) -> tuple:
+        axes = [row["five_hour"], row["seven_day"]]
+        if require_fable:
+            axes.append(row["fable"])
+        pressure = counts.get(row["label"], 0) * LEASE_WEIGHT_PCT
+        return (
+            binding_pct(*axes) + pressure,
+            binding_pct(*axes),
+            float("inf") if row["five_hour"] is None else row["five_hour"],
+        )
+
+    return sorted(rows, key=score)
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def load_session_leases(now_ts: float | None = None) -> list[dict]:
+    now_ts = time.time() if now_ts is None else now_ts
+    try:
+        payload = json.loads(LEASES_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    leases = payload.get("leases") if isinstance(payload, dict) else None
+    if not isinstance(leases, list):
+        return []
+    return [
+        lease
+        for lease in leases
+        if isinstance(lease, dict)
+        and isinstance(lease.get("pid"), int)
+        and _pid_is_alive(lease["pid"])
+        and now_ts - float(lease.get("updated_at", 0)) <= LEASE_STALE_S
+    ]
+
+
+def save_session_leases(leases: list[dict]) -> None:
+    _write_0600(
+        LEASES_PATH,
+        json.dumps({"version": 1, "leases": leases}, indent=2, sort_keys=True) + "\n",
+    )
+
+
+def upsert_session_lease(
+    pid: int,
+    session_id: str | None,
+    label: str,
+    model_family: str,
+) -> None:
+    with locked():
+        now_ts = time.time()
+        leases = [
+            lease
+            for lease in load_session_leases(now_ts)
+            if lease.get("pid") != pid
+        ]
+        leases.append(
+            {
+                "pid": pid,
+                "session_id": session_id,
+                "label": label,
+                "model_family": model_family,
+                "updated_at": now_ts,
+            }
+        )
+        save_session_leases(leases)
+
+
+def remove_session_lease(pid: int) -> None:
+    with locked():
+        leases = [
+            lease
+            for lease in load_session_leases()
+            if lease.get("pid") != pid
+        ]
+        save_session_leases(leases)
 
 
 HOUND_HOSTS = ("hound", "hound-ts")
@@ -1271,68 +1492,202 @@ def _fable_first(rows: list[dict]) -> list[dict]:
     return sorted(rows, key=key)
 
 
-def cmd_pick_env(_args) -> None:
-    """Emit a native account profile for the `claude` shell wrapper."""
-    print("unset CLAUDE_CODE_OAUTH_TOKEN")
-    print("unset CLAUDE_CONFIG_DIR")
-    print("unset ACCOUNTS_ROUTED_LABEL")
-    print("unset ACCOUNTS_ROUTED_EMAIL")
-    print("unset ACCOUNTS_ROUTED_ORG_UUID")
-    try:
-        with locked():
-            blobs = load_blobs()
-            blocked_labels = sync_profile_credentials(blobs, persist=True)
-            mode = load_mode()
-            pin = os.environ.get("ACCOUNTS_PIN") or None
-            if pin is None and mode.get("mode") == "set":
-                pin = mode.get("label")
-            rows = [
-                row
-                for row in route_rows(blobs, None, time.time())
-                if row["label"] not in blocked_labels
-            ]
-            if pin is None and mode.get("mode") == "fable":
-                rows = _fable_first(rows)
-            # Verified pick: the picked row's credential must actually work,
-            # not just look alive in metadata. A rejected refresh stamps the
-            # account and routing falls through to the next row.
-            accounts_map = blobs.get("accounts") or {}
-            label = None
-            entry = None
-            dirty = False
-            while True:
-                picked = pick_profile_route(rows, excluded_labels(), pin)
-                if picked is None:
-                    break
-                candidate = accounts_map.get(picked)
-                if candidate is None:
-                    break
-                verdict = verify_entry_auth(picked, candidate, time.time())
-                if verdict in ("ok", "ok_rotated"):
-                    if verdict == "ok_rotated":
-                        dirty = True
-                    label, entry = picked, candidate
-                    break
-                if verdict == "dead":
+def _route_preferences() -> tuple[dict, str | None]:
+    mode = load_mode()
+    pin = os.environ.get("ACCOUNTS_PIN") or None
+    if pin is None and mode.get("mode") == "set":
+        pin = mode.get("label")
+    return mode, pin
+
+
+def select_profile(
+    *,
+    avoid_labels: set[str] | None = None,
+    require_fable: bool = False,
+    lease_pid: int | None = None,
+) -> dict | None:
+    avoid_labels = avoid_labels or set()
+    with locked():
+        blobs = load_blobs()
+        blocked_labels = sync_profile_credentials(blobs, persist=True)
+        mode, pin = _route_preferences()
+        rows = [
+            row
+            for row in route_rows(blobs, None, time.time())
+            if row["label"] not in blocked_labels
+        ]
+        prefer_fable = require_fable or mode.get("mode") == "fable"
+        leases = load_session_leases()
+        rows = rank_profile_rows(
+            rows,
+            leases,
+            skip_pid=lease_pid,
+            require_fable=prefer_fable,
+        )
+        if mode.get("mode") == "fable" and not require_fable:
+            rows = _fable_first(rows)
+        excludes = excluded_labels() | avoid_labels
+        accounts_map = blobs.get("accounts") or {}
+        dirty = False
+        while True:
+            picked = pick_profile_route(
+                rows,
+                excludes,
+                pin,
+                require_fable=require_fable,
+            )
+            if picked is None:
+                break
+            candidate = accounts_map.get(picked)
+            if candidate is None:
+                break
+            verdict = verify_entry_auth(picked, candidate, time.time())
+            if verdict in ("ok", "ok_rotated"):
+                if verdict == "ok_rotated":
                     dirty = True
-                if pin is not None:
-                    break
-                rows = [r for r in rows if r["label"] != picked]
-            if dirty:
-                save_blobs(blobs)
-            if label is None or entry is None:
-                return
-            profile = ensure_native_profile(label, entry)
+                if dirty:
+                    save_blobs(blobs)
+                profile = ensure_native_profile(picked, candidate)
+                if lease_pid is not None:
+                    existing = next(
+                        (
+                            lease
+                            for lease in leases
+                            if lease.get("pid") == lease_pid
+                        ),
+                        {},
+                    )
+                    upsert_session_lease(
+                        lease_pid,
+                        existing.get("session_id"),
+                        picked,
+                        existing.get("model_family")
+                        or ("fable" if require_fable else "general"),
+                    )
+                return {
+                    "profile": str(profile),
+                    "label": picked,
+                    "email": candidate.get("email") or "",
+                    "org_uuid": candidate.get("org_uuid") or "",
+                }
+            if verdict == "dead":
+                dirty = True
+            rows = [row for row in rows if row["label"] != picked]
+        if dirty:
+            save_blobs(blobs)
+    return None
+
+
+def _profile_row_eligible(
+    row: dict | None,
+    label: str,
+    excludes: set[str],
+    *,
+    require_fable: bool,
+) -> bool:
+    return bool(
+        row
+        and not row["expired"]
+        and label not in excludes
+        and _rate_eligible(row["five_hour"], row["seven_day"])
+        and (
+            not require_fable
+            or fable_eligible(
+                row["five_hour"],
+                row["seven_day"],
+                row["fable"],
+            )
+        )
+    )
+
+
+def profile_has_headroom(label: str, *, require_fable: bool) -> bool:
+    try:
+        rows = route_rows(load_blobs(), label, time.time())
+        row = next((candidate for candidate in rows if candidate["label"] == label), None)
+        return _profile_row_eligible(
+            row,
+            label,
+            excluded_labels(),
+            require_fable=require_fable,
+        )
     except Exception:
+        return False
+
+
+def handoff_target(
+    current_label: str,
+    *,
+    require_fable: bool,
+    lease_pid: int,
+) -> str | None:
+    try:
+        blobs = load_blobs()
+        mode, pin = _route_preferences()
+        rows = route_rows(blobs, current_label, time.time())
+        rows = rank_profile_rows(
+            rows,
+            load_session_leases(),
+            skip_pid=lease_pid,
+            require_fable=require_fable or mode.get("mode") == "fable",
+        )
+        excludes = excluded_labels()
+        current = next((row for row in rows if row["label"] == current_label), None)
+        current_eligible = _profile_row_eligible(
+            current,
+            current_label,
+            excludes,
+            require_fable=require_fable,
+        )
+        pin_target = pick_profile_route(
+            rows,
+            excludes,
+            pin,
+            require_fable=require_fable,
+        )
+        if pin and pin_target == pin and pin != current_label:
+            return pin
+        if current_eligible:
+            return None
+        return pick_profile_route(
+            rows,
+            excludes | {current_label},
+            pin,
+            require_fable=require_fable,
+        )
+    except Exception:
+        return None
+
+
+def cmd_pick_env(args) -> None:
+    as_json = bool(getattr(args, "json", False))
+    if not as_json:
+        print("unset CLAUDE_CODE_OAUTH_TOKEN")
+        print("unset CLAUDE_CONFIG_DIR")
+        print("unset ACCOUNTS_ROUTED_LABEL")
+        print("unset ACCOUNTS_ROUTED_EMAIL")
+        print("unset ACCOUNTS_ROUTED_ORG_UUID")
+    try:
+        selected = select_profile(
+            avoid_labels=set(getattr(args, "avoid", None) or []),
+            require_fable=bool(getattr(args, "require_fable", False)),
+            lease_pid=getattr(args, "lease_pid", None),
+        )
+    except Exception:
+        selected = None
+    if as_json:
+        print(json.dumps(selected or {}, sort_keys=True))
         return
-    print(f"export CLAUDE_CONFIG_DIR={shlex.quote(str(profile))}")
-    print(f"export ACCOUNTS_ROUTED_LABEL={shlex.quote(label)}")
-    print(f"export ACCOUNTS_ROUTED_EMAIL={shlex.quote(entry.get('email') or '')}")
-    print(f"export ACCOUNTS_ROUTED_ORG_UUID={shlex.quote(entry.get('org_uuid') or '')}")
+    if selected is None:
+        return
+    print(f"export CLAUDE_CONFIG_DIR={shlex.quote(selected['profile'])}")
+    print(f"export ACCOUNTS_ROUTED_LABEL={shlex.quote(selected['label'])}")
+    print(f"export ACCOUNTS_ROUTED_EMAIL={shlex.quote(selected['email'])}")
+    print(f"export ACCOUNTS_ROUTED_ORG_UUID={shlex.quote(selected['org_uuid'])}")
 
 
-RATE_CAP_PCT = 95.0
-FABLE_CAP_PCT = 95.0
+RATE_CAP_PCT = 80.0
+FABLE_CAP_PCT = 80.0
 
 
 def fable_eligible(
@@ -1358,7 +1713,7 @@ def _fable_rank(r: dict) -> tuple:
     Only rank eligible rows — eligibility guarantees every axis is non-None."""
     return (binding_pct(r["five_hour"], r["seven_day"], r["fable"]), r["fable"], r["five_hour"])
 def cmd_set(args) -> None:
-    """Pin new sessions to <label>."""
+    """Prefer <label> while it has safe quota headroom."""
     with locked():
         blobs = load_blobs()
         blocked_labels = sync_profile_credentials(blobs, persist=True)
@@ -1372,7 +1727,7 @@ def cmd_set(args) -> None:
         ensure_native_profile(args.label, e)
         save_mode("set", args.label)
     print(f"SET → {args.label}")
-    print("new and restarted sessions use it; running sessions keep their current account")
+    print("supervised sessions follow it while the account has safe quota headroom")
 
 
 def cmd_auto(_args) -> None:
@@ -1384,7 +1739,7 @@ def cmd_auto(_args) -> None:
         row for row in route_rows(blobs, None, time.time()) if row["label"] not in blocked_labels
     ]
     pick = pick_profile_route(rows, excluded_labels(), None)
-    print("AUTO — each new or restarted session uses the freshest account")
+    print("AUTO — supervised sessions use the freshest safe account")
     print(f"  next: {pick or '(none free)'}")
 
 
@@ -1408,7 +1763,7 @@ def cmd_fable(_args) -> None:
         ),
         key=_fable_rank,
     )
-    print("FABLE — new and restarted sessions prefer Fable headroom")
+    print("FABLE — supervised sessions prefer Fable headroom")
     if not usable:
         print(
             "  no Fable headroom anywhere right now — "
@@ -1432,14 +1787,27 @@ def cmd_status(_args) -> None:
     excludes = excluded_labels()
     if mode["mode"] == "set":
         tag = f"SET → {mode['label']}"
-        next_label = pick_profile_route(rows, excludes, mode["label"])
+        ordered = rows
+        pin = mode["label"]
     elif mode["mode"] == "fable":
         tag = "FABLE"
-        next_label = pick_profile_route(_fable_first(rows), excludes, None)
+        ordered = _fable_first(rows)
+        pin = None
     else:
         tag = "AUTO"
-        next_label = pick_profile_route(rows, excludes, None)
-    print(f"mode: {tag}   next: {next_label or '(none free)'}")
+        ordered = rows
+        pin = None
+    next_general = pick_profile_route(ordered, excludes, pin)
+    next_fable = pick_profile_route(
+        ordered,
+        excludes,
+        pin,
+        require_fable=True,
+    )
+    print(
+        f"mode: {tag}   general: {next_general or '(none free)'}"
+        f"   fable: {next_fable or '(none free)'}"
+    )
     for r in rows:
         pct = "—" if r["five_hour"] is None else f"{r['five_hour']:.0f}%"
         spct = "—" if r["seven_day"] is None else f"{r['seven_day']:.0f}%"
@@ -1498,7 +1866,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="accounts", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_set = sub.add_parser("set", help="pin new sessions to <label>")
+    p_set = sub.add_parser("set", help="prefer <label> while quota is safe")
     p_set.add_argument("label")
     p_set.set_defaults(fn=cmd_set)
 
@@ -1528,9 +1896,14 @@ def main(argv: list[str] | None = None) -> None:
 
     sub.add_parser("sync", help="converge the token vault with hound").set_defaults(fn=cmd_sync)
 
-    sub.add_parser(
-        "pick-env", help="emit env exports for the best routable account (wrapper hook)"
-    ).set_defaults(fn=cmd_pick_env)
+    p_pick_env = sub.add_parser(
+        "pick-env", help="emit env exports for the best routable account"
+    )
+    p_pick_env.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+    p_pick_env.add_argument("--avoid", action="append", default=[], help=argparse.SUPPRESS)
+    p_pick_env.add_argument("--require-fable", action="store_true", help=argparse.SUPPRESS)
+    p_pick_env.add_argument("--lease-pid", type=int, help=argparse.SUPPRESS)
+    p_pick_env.set_defaults(fn=cmd_pick_env)
 
     sub.add_parser("ls", help="list stored accounts with headroom").set_defaults(fn=cmd_ls)
 
