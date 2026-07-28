@@ -535,20 +535,29 @@ def cmd_refresh(args) -> None:
         try:
             new_blob = refresh_blob_access(accounts[label].get("blob", ""))
         except TokenRefreshError as e:
-            hint = "token endpoint throttled, retry in a minute" if e.code == "429" else "not refreshed"
-            print(f"  {label}: HTTP {e.code} — {hint}")
+            if e.code in ("400", "401", "403"):
+                print(f"  {label}: HTTP {e.code} — refresh rejected, needs a browser /login")
+                _persist_auth_dead(label)
+            else:
+                hint = (
+                    "token endpoint throttled, retry in a minute"
+                    if e.code == "429"
+                    else "not refreshed"
+                )
+                print(f"  {label}: HTTP {e.code} — {hint}")
             continue
         except Exception as e:  # noqa: BLE001 - report and move on, never brick a blob
             print(f"  {label}: {type(e).__name__} — not refreshed")
             continue
         if not new_blob:
             print(f"  {label}: no usable refresh token — needs a browser /login")
+            _persist_auth_dead(label)
             continue
         # Persist now: the old refresh token is already dead server-side.
         with locked():
             fresh = load_blobs()
             sync_profile_credentials(fresh, persist=False)
-            fresh.setdefault("accounts", {}).setdefault(label, {})["blob"] = new_blob
+            set_entry_blob(fresh.setdefault("accounts", {}).setdefault(label, {}), new_blob)
             write_profile_credentials(label, new_blob)
             save_blobs(fresh)
         revived += 1
@@ -733,7 +742,7 @@ def sync_profile_credentials(blobs: dict, *, persist: bool) -> set[str]:
                 file=sys.stderr,
             )
             continue
-        entry["blob"] = profile_blob
+        set_entry_blob(entry, profile_blob)
         entry["email"] = identity["email"] or entry.get("email")
         entry["org_uuid"] = identity["org_uuid"] or entry.get("org_uuid")
         entry["org_type"] = identity["org_type"] or entry.get("org_type")
@@ -857,7 +866,8 @@ def capture_live_to_blobs(blobs: dict) -> str | None:
     ident = identity_from_profile(prof)
     label = resolve_label(ident.get("email"), ident.get("org_uuid"), load_label_pairs())
     acct = blobs.setdefault("accounts", {}).setdefault(label, {})
-    acct.update({"blob": live, "email": ident.get("email"), "org_uuid": ident.get("org_uuid")})
+    set_entry_blob(acct, live)
+    acct.update({"email": ident.get("email"), "org_uuid": ident.get("org_uuid")})
     save_blobs(blobs)
     return label
 
@@ -877,6 +887,82 @@ def blob_expired(blob: str, now_ts: float) -> bool:
         return True
     exp = blob_refresh_expiry(blob)
     return exp is not None and now_ts >= exp
+
+
+def entry_needs_login(entry: dict, now_ts: float) -> bool:
+    """Routing/board verdict for one stored account: the blob's own metadata
+    says it is unusable, or a live refresh attempt was rejected server-side
+    (`auth_dead_at` — metadata can look alive while the server says no)."""
+    return bool(entry.get("auth_dead_at")) or blob_expired(entry.get("blob", ""), now_ts)
+
+
+def set_entry_blob(entry: dict, blob: str) -> None:
+    """Every blob write comes through here so a fresh credential — a /login,
+    a profile sync, a successful refresh — always clears the rejected flag."""
+    entry["blob"] = blob
+    entry.pop("auth_dead_at", None)
+
+
+def mark_auth_dead(label: str, entry: dict, now_ts: float) -> None:
+    """Record a server-rejected refresh; notify only on the transition."""
+    first_time = not entry.get("auth_dead_at")
+    entry["auth_dead_at"] = int(now_ts)
+    if first_time:
+        _notify_needs_login(label)
+
+
+def _notify_needs_login(label: str) -> None:
+    try:
+        subprocess.run(
+            [
+                "osascript",
+                "-e",
+                f'display notification "{label} needs /login — routing around it" '
+                'with title "accounts"',
+            ],
+            check=False,
+            capture_output=True,
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
+def _persist_auth_dead(label: str) -> None:
+    """Stamp + save outside any existing lock (cmd_refresh's failure paths)."""
+    with locked():
+        fresh = load_blobs()
+        entry = (fresh.get("accounts") or {}).get(label)
+        if entry is not None:
+            mark_auth_dead(label, entry, time.time())
+            save_blobs(fresh)
+
+
+def verify_entry_auth(label: str, entry: dict, now_ts: float) -> str:
+    """'ok' | 'ok_rotated' | 'dead' | 'unavailable'. Exercises the refresh only
+    when the access token is already expired — the one moment metadata can lie
+    (a rotated blob carries a refreshToken the server may still reject). poll
+    never does this; a session launch is rare enough to spend a rotation on."""
+    blob = entry.get("blob", "")
+    exp = blob_access_expiry(blob)
+    if exp is not None and now_ts < exp:
+        return "ok"
+    try:
+        new_blob = refresh_blob_access(blob)
+    except TokenRefreshError as e:
+        if e.code in ("400", "401", "403"):
+            mark_auth_dead(label, entry, now_ts)
+            return "dead"
+        # Throttled or server-side trouble is not proof of death — just not now.
+        return "unavailable"
+    except Exception:
+        return "unavailable"
+    if not new_blob:
+        mark_auth_dead(label, entry, now_ts)
+        return "dead"
+    set_entry_blob(entry, new_blob)
+    write_profile_credentials(label, new_blob)
+    return "ok_rotated"
 
 
 def poll_blobs_usage(blobs: dict) -> int:
@@ -923,7 +1009,7 @@ def route_rows(blobs: dict, active_label: str | None, now_ts: float) -> list[dic
                 "five_hour": effs["five_hour"],
                 "seven_day": effs["seven_day"],
                 "fable": effs["fable"],
-                "expired": blob_expired(e.get("blob", ""), now_ts),
+                "expired": entry_needs_login(e, now_ts),
                 "active": label == active_label,
                 "stale": bool(last_seen) and (now_ts - last_seen) > STALE_AFTER_S,
             }
@@ -1156,11 +1242,34 @@ def cmd_pick_env(_args) -> None:
             ]
             if pin is None and mode.get("mode") == "fable":
                 rows = _fable_first(rows)
-            label = pick_profile_route(rows, excluded_labels(), pin)
-            if label is None:
-                return
-            entry = (blobs.get("accounts") or {}).get(label)
-            if entry is None:
+            # Verified pick: the picked row's credential must actually work,
+            # not just look alive in metadata. A rejected refresh stamps the
+            # account and routing falls through to the next row.
+            accounts_map = blobs.get("accounts") or {}
+            label = None
+            entry = None
+            dirty = False
+            while True:
+                picked = pick_profile_route(rows, excluded_labels(), pin)
+                if picked is None:
+                    break
+                candidate = accounts_map.get(picked)
+                if candidate is None:
+                    break
+                verdict = verify_entry_auth(picked, candidate, time.time())
+                if verdict in ("ok", "ok_rotated"):
+                    if verdict == "ok_rotated":
+                        dirty = True
+                    label, entry = picked, candidate
+                    break
+                if verdict == "dead":
+                    dirty = True
+                if pin is not None:
+                    break
+                rows = [r for r in rows if r["label"] != picked]
+            if dirty:
+                save_blobs(blobs)
+            if label is None or entry is None:
                 return
             profile = ensure_native_profile(label, entry)
     except Exception:
