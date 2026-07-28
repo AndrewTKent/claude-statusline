@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -704,9 +705,8 @@ def sync_profile_credentials(blobs: dict, *, persist: bool) -> set[str]:
     blocked_labels: set[str] = set()
     for label, entry in (blobs.get("accounts") or {}).items():
         credentials = native_profile_path(label) / ".credentials.json"
-        try:
-            profile_blob = credentials.read_text()
-        except OSError:
+        profile_blob = profile_live_blob(label)
+        if profile_blob is None:
             continue
         stored_blob = entry.get("blob", "")
         access_token = blob_access_token(profile_blob)
@@ -714,6 +714,13 @@ def sync_profile_credentials(blobs: dict, *, persist: bool) -> set[str]:
             continue
         profile = fetch_profile(access_token)
         if not profile:
+            # An expired candidate can't prove identity — that is staleness,
+            # not a hijack. Leave the stored blob and keep the row routable;
+            # verify-at-pick refreshes the live lineage when it's chosen.
+            if blob_access_expiry(profile_blob) is not None and blob_access_expiry(
+                profile_blob
+            ) <= time.time():
+                continue
             blocked_labels.add(label)
             continue
         identity = identity_from_profile(profile)
@@ -948,7 +955,20 @@ def verify_entry_auth(label: str, entry: dict, now_ts: float) -> str:
     """'ok' | 'ok_rotated' | 'dead' | 'unavailable'. Exercises the refresh only
     when the access token is already expired — the one moment metadata can lie
     (a rotated blob carries a refreshToken the server may still reject). poll
-    never does this; a session launch is rare enough to spend a rotation on."""
+    never does this; a session launch is rare enough to spend a rotation on.
+
+    A profile-scoped keychain item is cc's own lineage and is cc-write-only
+    here (rotating it from outside would strand the item above any fresher
+    file in cc's read order). Item present → route and let cc prove it at
+    launch, where a failure is visible immediately rather than mid-session."""
+    item = kc_read(profile_keychain_service(label))
+    if item:
+        if blob_expired(item, now_ts):
+            # cc will keep choosing this item by existence, not validity —
+            # a lapsed refresh there is a real needs-/login, today.
+            mark_auth_dead(label, entry, now_ts)
+            return "dead"
+        return "ok"
     blob = entry.get("blob", "")
     exp = blob_access_expiry(blob)
     if exp is not None and now_ts < exp:
@@ -969,6 +989,27 @@ def verify_entry_auth(label: str, entry: dict, now_ts: float) -> str:
     set_entry_blob(entry, new_blob)
     write_profile_credentials(label, new_blob)
     return "ok_rotated"
+
+
+def profile_keychain_service(label: str) -> str:
+    """cc scopes its keychain item per config dir: the service name carries the
+    first 8 hex of sha256 over the CLAUDE_CONFIG_DIR path."""
+    digest = hashlib.sha256(str(native_profile_path(label)).encode()).hexdigest()[:8]
+    return f"{LIVE_SERVICE}-{digest}"
+
+
+def profile_live_blob(label: str) -> str | None:
+    """The credential cc is actually using for this profile, mirroring cc's
+    read order: the profile-scoped keychain item when it exists, else the
+    profile's .credentials.json. The file is a one-shot seed — cc's first
+    rotation moves the lineage into the keychain item, so the item is truth."""
+    kc = kc_read(profile_keychain_service(label))
+    if kc:
+        return kc
+    try:
+        return (native_profile_path(label) / ".credentials.json").read_text()
+    except OSError:
+        return None
 
 
 def poll_blobs_usage(blobs: dict) -> int:
