@@ -1628,6 +1628,12 @@ class TestMarkAuthDead:
 
 
 class TestVerifyEntryAuth:
+    @pytest.fixture(autouse=True)
+    def _no_keychain(self, monkeypatch):
+        # Hermetic: never read the real keychain; item-backed behavior has
+        # its own tests below.
+        monkeypatch.setattr(accounts, "kc_read", lambda *a, **k: None)
+
     def test_live_access_token_short_circuits(self, monkeypatch):
         def boom(_blob):
             raise AssertionError("refresh must not run for a live access token")
@@ -1718,3 +1724,91 @@ class TestCaptureLiveClearsFlag:
         )
         blobs = {"accounts": {"acme-max": {"blob": live}}}
         assert accounts.capture_live_to_blobs(blobs) == "acme-max"
+
+
+class TestProfileKeychain:
+    def test_service_name_is_sha256_prefix_of_config_dir(self):
+        import hashlib as _h
+
+        svc = accounts.profile_keychain_service("gmail")
+        digest = _h.sha256(str(accounts.native_profile_path("gmail")).encode()).hexdigest()[:8]
+        assert svc == f"Claude Code-credentials-{digest}"
+
+    def test_live_blob_prefers_item_over_file(self, monkeypatch):
+        monkeypatch.setattr(accounts, "kc_read", lambda _svc: "ITEM")
+        assert accounts.profile_live_blob("gmail") == "ITEM"
+
+    def test_live_blob_falls_back_to_file_then_none(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(accounts, "kc_read", lambda _svc: None)
+        monkeypatch.setattr(accounts, "PROFILES_PATH", tmp_path)
+        assert accounts.profile_live_blob("gmail") is None
+        prof = tmp_path / "gmail"
+        prof.mkdir()
+        (prof / ".credentials.json").write_text("FILE")
+        assert accounts.profile_live_blob("gmail") == "FILE"
+
+    def test_item_backed_profile_routes_without_refresh(self, monkeypatch):
+        monkeypatch.setattr(accounts, "kc_read", lambda _svc: _blob(LIVE_MS))
+
+        def boom(_blob):
+            raise AssertionError("must not exercise cc-owned lineage")
+
+        monkeypatch.setattr(accounts, "refresh_blob_access", boom)
+        entry = {"blob": _blob(PAST_MS)}
+        assert accounts.verify_entry_auth("gmail", entry, NOW_TS) == "ok"
+
+    def test_metadata_dead_item_marks_needs_login(self, monkeypatch):
+        # An item whose refresh expiry lapsed: cc keeps choosing it by
+        # existence, so this is a true needs-/login, not a routable row.
+        dead_item = json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "at",
+                    "refreshToken": "rt",
+                    "refreshTokenExpiresAt": int((NOW_TS - 60) * 1000),
+                }
+            }
+        )
+        monkeypatch.setattr(accounts, "kc_read", lambda _svc: dead_item)
+        monkeypatch.setattr(accounts, "_notify_needs_login", lambda _l: None)
+        entry = {"blob": _blob(PAST_MS)}
+        assert accounts.verify_entry_auth("gmail", entry, NOW_TS) == "dead"
+        assert entry["auth_dead_at"] == int(NOW_TS)
+
+
+class TestSyncReadsLiveLineage:
+    def test_imports_rotation_from_item_and_clears_flag(self, monkeypatch):
+        fresh = _blob(LIVE_MS)
+        monkeypatch.setattr(accounts, "profile_live_blob", lambda _l: fresh)
+        monkeypatch.setattr(accounts, "fetch_profile", lambda _t: {"ident": 1})
+        monkeypatch.setattr(
+            accounts,
+            "identity_from_profile",
+            lambda _p: {"email": "a@x", "org_uuid": "1", "org_type": "t"},
+        )
+        blobs = {
+            "accounts": {
+                "gmail": {
+                    "blob": _blob(PAST_MS),
+                    "email": "a@x",
+                    "org_uuid": "1",
+                    "auth_dead_at": 9,
+                }
+            }
+        }
+        blocked = accounts.sync_profile_credentials(blobs, persist=False)
+        assert blocked == set()
+        entry = blobs["accounts"]["gmail"]
+        assert entry["blob"] == fresh
+        assert "auth_dead_at" not in entry
+
+    def test_expired_candidate_is_stale_not_blocked(self, monkeypatch):
+        # sync compares against the real clock, so build a really-expired blob.
+        really_past = int((time.time() - 3600) * 1000)
+        monkeypatch.setattr(accounts, "profile_live_blob", lambda _l: _blob(really_past))
+        monkeypatch.setattr(accounts, "fetch_profile", lambda _t: None)
+        blobs = {"accounts": {"gmail": {"blob": _blob(LIVE_MS), "email": "a@x", "org_uuid": "1"}}}
+        blocked = accounts.sync_profile_credentials(blobs, persist=False)
+        assert blocked == set()
+        # stored blob untouched
+        assert accounts.blob_access_expiry(blobs["accounts"]["gmail"]["blob"]) is not None
