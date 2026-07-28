@@ -858,6 +858,12 @@ def capture_live_to_blobs(blobs: dict) -> str | None:
         return None
     for label, e in (blobs.get("accounts") or {}).items():
         if blob_access_token(e.get("blob", "")) == tok:
+            # cc is actively holding this credential — proof of life beats any
+            # earlier rejected-refresh stamp (a lagged stored blob can 400 on
+            # a refresh token cc has already rotated past).
+            if e.get("auth_dead_at"):
+                e.pop("auth_dead_at", None)
+                save_blobs(blobs)
             return label  # unchanged
     # token changed (cc refreshed) — attribute via profile and update its entry
     prof = fetch_profile(tok)

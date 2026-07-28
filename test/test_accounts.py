@@ -1697,3 +1697,24 @@ class TestAuthDeadRouting:
         for row in rows:
             row["five_hour"], row["seven_day"] = 10.0, 10.0
         assert accounts.pick_profile_route(rows, set(), None) == "alive"
+
+
+class TestCaptureLiveClearsFlag:
+    def test_matching_live_token_clears_auth_dead(self, monkeypatch, tmp_path):
+        live = _blob(LIVE_MS)
+        monkeypatch.setattr(accounts, "live_cred", lambda: (live, "keychain"))
+        saved: list[dict] = []
+        monkeypatch.setattr(accounts, "save_blobs", saved.append)
+        blobs = {"accounts": {"acme-max": {"blob": live, "auth_dead_at": 99}}}
+        assert accounts.capture_live_to_blobs(blobs) == "acme-max"
+        assert "auth_dead_at" not in blobs["accounts"]["acme-max"]
+        assert saved, "clear must persist"
+
+    def test_matching_live_token_without_flag_saves_nothing(self, monkeypatch):
+        live = _blob(LIVE_MS)
+        monkeypatch.setattr(accounts, "live_cred", lambda: (live, "keychain"))
+        monkeypatch.setattr(
+            accounts, "save_blobs", lambda _b: (_ for _ in ()).throw(AssertionError("no write"))
+        )
+        blobs = {"accounts": {"acme-max": {"blob": live}}}
+        assert accounts.capture_live_to_blobs(blobs) == "acme-max"
