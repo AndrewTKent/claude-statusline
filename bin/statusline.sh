@@ -1120,7 +1120,11 @@ if $needs_refresh || $needs_profile_refresh; then
                                            "prev_extra=" + (.extra_usage.used_credits // 0 | tostring)' "$cache_file" 2>/dev/null)"
                             printf '{"ts":%s,"five_hour":%s,"seven_day":%s,"extra_used":%s}' "$prev_ts" "${prev_5h:-0}" "${prev_7d:-0}" "${prev_extra:-0}" > "/tmp/claude/statusline-usage-prev-${ACCOUNT_CACHE_KEY}.json"
                         fi
-                        echo "$response" > "$cache_file"
+                        usage_cache_tmp=$(mktemp "${cache_file}.tmp.XXXXXX")
+                        if [ -n "$usage_cache_tmp" ]; then
+                            printf '%s\n' "$response" > "$usage_cache_tmp"
+                            mv "$usage_cache_tmp" "$cache_file"
+                        fi
 
                         # Cross-account reset ledger: record the active account's
                         # 5h/7d reset times + utilization so other sessions can
@@ -1191,18 +1195,36 @@ if $needs_refresh || $needs_profile_refresh; then
     fi
 fi
 
-# Always read from cache (may be stale by one cycle — imperceptible)
+# Prefer the freshest exact-account snapshot. A stale cache can belong to a
+# completed quota window when a newer cross-account poll already has the truth.
 usage_data=""
-[ -f "$cache_file" ] && usage_data=$(cat "$cache_file" 2>/dev/null)
-
-# Fallback when the live usage poll is rate-limited (429 → no cache, common on
-# multi-session hosts): rebuild the 5h/7d bars from the current account's ledger row.
-if [ -z "$usage_data" ] && [ -n "$ACCT_EMAIL" ]; then
+_usage_cache_seen=0
+_usage_data_source=""
+if [ -f "$cache_file" ]; then
+    _usage_cache_id_before=$(stat -f '%i:%m' "$cache_file" 2>/dev/null || stat -c '%i:%Y' "$cache_file" 2>/dev/null || echo "")
+    usage_data=$(cat "$cache_file" 2>/dev/null)
+    _usage_cache_id_after=$(stat -f '%i:%m' "$cache_file" 2>/dev/null || stat -c '%i:%Y' "$cache_file" 2>/dev/null || echo "")
+    if [ -n "$_usage_cache_id_before" ] && [ "$_usage_cache_id_before" = "$_usage_cache_id_after" ]; then
+        _usage_cache_seen="${_usage_cache_id_after##*:}"
+        _usage_data_source="cache"
+    else
+        usage_data=""
+    fi
+fi
+if [ -n "$ACCT_EMAIL" ]; then
     _ledger_file="$HOME/.claude/account-resets.json"
     if [ -f "$_ledger_file" ]; then
-        usage_data=$(jq -c --arg key "${ACCT_EMAIL}|${ACCT_ORG_UUID}" --arg email "$ACCT_EMAIL" '
-            (.[$key] // (to_entries | map(.value) | map(select(.email == $email)) | .[0])) as $e
-            | if $e == null then empty
+        _ledger_usage=$(jq -c \
+            --arg key "${ACCT_EMAIL}|${ACCT_ORG_UUID}" \
+            --arg email "$ACCT_EMAIL" \
+            --arg uuid "$ACCT_ORG_UUID" \
+            --argjson cache_seen "$_usage_cache_seen" '
+            (.[$key] // (
+                if $uuid == "" then
+                    (to_entries | map(.value) | map(select(.email == $email)) | .[0])
+                else null end
+            )) as $e
+            | if $e == null or (($e.last_seen // 0) <= $cache_seen) then empty
               else {
                   five_hour: { utilization: ($e.five_hour_pct // 0), resets_at: ($e.five_hour_reset // null) },
                   seven_day: { utilization: ($e.seven_day_pct // 0), resets_at: ($e.seven_day_reset // null) },
@@ -1213,6 +1235,10 @@ if [ -z "$usage_data" ] && [ -n "$ACCT_EMAIL" ]; then
                     else [] end
                   )
                 } end' "$_ledger_file" 2>/dev/null)
+        if [ -n "$_ledger_usage" ]; then
+            usage_data="$_ledger_usage"
+            _usage_data_source="ledger"
+        fi
     fi
 fi
 
@@ -1388,7 +1414,7 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
     ' 2>/dev/null)"
 
     # Interpolate between polls for fractional precision
-    if [ -f "$prev_poll_file" ] && [ -f "$cache_file" ]; then
+    if [ "$_usage_data_source" = "cache" ] && [ -f "$prev_poll_file" ] && [ -f "$cache_file" ]; then
         poll_ts=$(stat -f %m "$cache_file" 2>/dev/null || stat -c %Y "$cache_file" 2>/dev/null)
         # One jq pull — saves 2 spawns per render.
         eval "$(jq -r '"prev_ts=" + (.ts // 0 | tostring),
@@ -1615,23 +1641,16 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
             while IFS=$'\x1f' read -r em uuid iso pct seven_day_iso weekly_pct_ledger fbl_iso fable_pct_ledger last_seen_ts; do
                 [ -z "$em" ] && continue
                 ep=""
-                # pct_state: ok = use stored pct; reset = fresh window, show 0%;
-                # unknown = stale account, show —. Decided after rollover.
+                # A reset is empty only after a poll confirms it.
                 pct_state="ok"
                 if [ -n "$iso" ] && [ "$iso" != "null" ]; then
                     ep=$(iso_to_epoch "$iso")
                     if [ -n "$ep" ]; then
                         if [ "$ep" -le "$now_ar" ]; then
-                            # Reset elapsed. The new window started at 0% — but
-                            # only if the elapsed reset is the MOST RECENT one
-                            # (within ~5h of now). If it's older than that, the
-                            # account has been idle for many windows and we
-                            # have no signal for the current one — unknown.
-                            since_reset=$(( now_ar - ep ))
-                            if [ "$since_reset" -le 18000 ]; then
+                            if [ -n "$last_seen_ts" ] && [ "$last_seen_ts" -ge "$ep" ] 2>/dev/null; then
                                 pct_state="reset"
                             else
-                                pct_state="unknown"
+                                pct_state="pending"
                             fi
                         fi
                         while [ "$ep" -le "$((now_ar + 30))" ]; do
@@ -1712,8 +1731,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 else
                     pct_disp="$pct"
                 fi
-                # Reset state overrides cached values: a freshly-rolled window
-                # starts at 0%, an account with no recent samples is unknown.
+                # A post-reset poll confirms the new window started empty.
                 if [ "${pct_state:-ok}" = "reset" ]; then
                     pct_int=0
                     pct_disp="0"
@@ -1722,11 +1740,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 pct_color=$(color_for_pct "$pct_int")
                 # Display fractional util for the current account (matches the
                 # "current" row); other accounts only have integer ledger data.
-                if [ "${pct_state:-ok}" = "unknown" ]; then
-                    pct_show="$(_pad_to_cols '—' 4)"
-                    pct_color="$dim"
-                    pct_int=0
-                elif [ "$is_current" = "1" ]; then
+                if [ "$is_current" = "1" ]; then
                     pct_show=$(fmt_pct "$pct_disp")
                 else
                     pct_show=$(printf "%d%%" "$pct_int")
@@ -1783,12 +1797,15 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 # accounts: flag a dead vaulted refresh token (needs /login to use).
                 exp_suffix=""
                 stale_suffix=""
+                if [ "${pct_state:-ok}" = "pending" ]; then
+                    stale_suffix=" ${dim}~ reset pending${reset}"
+                fi
                 # The current account's row renders live payload values (5h /
                 # weekly / fable overlays above), so the ledger's age is
                 # irrelevant for it — never tag the row you're sitting on.
                 if [ "$is_current" != "1" ] && [ -n "$last_seen_ts" ] && [ "$last_seen_ts" -gt 0 ] 2>/dev/null && \
                    [ $(( now_ar - last_seen_ts )) -gt 10800 ]; then
-                    stale_suffix=" ${dim}~ stale${reset}"
+                    stale_suffix+=" ${dim}~ stale${reset}"
                 fi
                 if [ -n "$ACCOUNTS_EXPIRED_LOOKUP" ] && \
                    printf '%s\n' "$ACCOUNTS_EXPIRED_LOOKUP" | grep -qxF "${em}|${uuid}"; then
@@ -1968,20 +1985,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 else
                     wk_reset_rel="—"
                 fi
-                if [ "${pct_state:-ok}" = "unknown" ]; then
-                    # Window rolled over since the last poll, so this % is last-known,
-                    # not current — show it dimmed rather than blanking to —, so a
-                    # burned account stays visible (the "~ stale" suffix flags it's not live).
-                    _last_int=$(printf "%.0f" "$pct" 2>/dev/null || echo 0)
-                    if [ "$_last_int" -gt 0 ] 2>/dev/null; then
-                        pct_raw="${_last_int}%"
-                        pct_color="$dim"
-                    else
-                        pct_raw="—"
-                    fi
-                else
-                    pct_raw="${pct_int}%"
-                fi
+                pct_raw="${pct_int}%"
                 # Weekly-capped accounts are unusable regardless of 5h state — dim the name.
                 name_color="$white"
                 [ "$weekly_int" -ge 100 ] 2>/dev/null && name_color="$dim"

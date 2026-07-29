@@ -205,22 +205,18 @@ class TestPickProfileRoute:
         ) == "gmail"
 
 
-class TestLeaseAwareRouting:
-    def test_parallel_launches_do_not_all_choose_the_same_account(self):
+class TestSessionRouting:
+    def test_parallel_launches_share_the_freshest_account(self):
         rows = [
             accounts_row("gmail", 10.0, seven_day=10.0),
             accounts_row("work", 20.0, seven_day=20.0),
         ]
-        leases = [
-            {"pid": 101, "label": "gmail", "model_family": "general"},
-            {"pid": 102, "label": "gmail", "model_family": "general"},
-        ]
 
-        ranked = accounts.rank_profile_rows(rows, leases, skip_pid=None)
+        ranked = accounts.rank_profile_rows(rows)
 
-        assert [row["label"] for row in ranked] == ["work", "gmail"]
+        assert [row["label"] for row in ranked] == ["gmail", "work"]
 
-    def test_profile_selection_reserves_before_releasing_the_lock(
+    def test_parallel_profile_selection_uses_one_current_account(
         self, tmp_path, monkeypatch
     ):
         blobs = {
@@ -278,7 +274,7 @@ class TestLeaseAwareRouting:
         second = accounts.select_profile(lease_pid=102)
 
         assert first["label"] == "first"
-        assert second["label"] == "second"
+        assert second["label"] == "first"
         assert {lease["pid"] for lease in leases} == {101, 102}
 
 
@@ -305,7 +301,6 @@ class TestHandoffTarget:
         assert accounts.handoff_target(
             "first",
             require_fable=False,
-            lease_pid=123,
         ) == "second"
 
     def test_live_session_routes_around_an_exhausted_pin(self, monkeypatch):
@@ -318,8 +313,36 @@ class TestHandoffTarget:
         assert accounts.handoff_target(
             "first",
             require_fable=False,
-            lease_pid=123,
         ) == "second"
+
+    def test_auto_mode_converges_live_sessions_on_the_freshest_account(
+        self, monkeypatch
+    ):
+        rows = [
+            accounts_row("first", 10.0, seven_day=10.0),
+            accounts_row("second", 20.0, seven_day=20.0),
+        ]
+        self._wire(monkeypatch, rows)
+
+        assert accounts.handoff_target(
+            "second",
+            require_fable=False,
+        ) == "first"
+
+    def test_fable_mode_converges_live_sessions_on_the_best_fable_account(
+        self, monkeypatch
+    ):
+        rows = [
+            accounts_row("gmail", 29.0, seven_day=34.0, fable=0.0),
+            accounts_row("poynting", 2.0, seven_day=47.0, fable=51.0),
+            accounts_row("coram-work", 17.0, seven_day=48.0, fable=62.0),
+        ]
+        self._wire(monkeypatch, rows, mode="fable")
+
+        assert accounts.handoff_target(
+            "coram-work",
+            require_fable=True,
+        ) == "gmail"
 
 
 class TestMergeTokenVaults:
@@ -1736,6 +1759,205 @@ class TestCmdLs:
 
 
 class TestStatuslineAccountBoard:
+    def _render_reset_row(self, tmp_path, last_seen):
+        repo = Path(__file__).resolve().parent.parent
+        home = tmp_path / "home"
+        claude_dir = home / ".claude"
+        claude_dir.mkdir(parents=True)
+        (claude_dir / "statusline.conf").write_text(
+            'SHOW_ACCOUNT_RESETS=1\n'
+            'MAX_COLS=200\n'
+            'ACCOUNT_LABELS="current:current@example.com|current-org '
+            'poynting:poynting@example.com|poynting-org"\n'
+        )
+        now = int(time.time())
+        resets = {
+            "current@example.com|current-org": {
+                "email": "current@example.com",
+                "org_uuid": "current-org",
+                "five_hour_pct": 1,
+                "seven_day_pct": 1,
+                "last_seen": now,
+            },
+            "poynting@example.com|poynting-org": {
+                "email": "poynting@example.com",
+                "org_uuid": "poynting-org",
+                "five_hour_pct": 100,
+                "five_hour_reset": datetime.fromtimestamp(
+                    now - 3600, tz=timezone.utc
+                ).isoformat(),
+                "seven_day_pct": 30,
+                "last_seen": last_seen,
+            },
+        }
+        (claude_dir / "account-resets.json").write_text(json.dumps(resets))
+        project = tmp_path / "project"
+        project.mkdir()
+        fixture = json.loads((repo / "test/fixtures/input.json").read_text())
+        fixture["workspace"]["current_dir"] = str(project)
+        script = tmp_path / "statusline.sh"
+        script.write_text(
+            (repo / "bin/statusline.sh")
+            .read_text()
+            .replace("/tmp/claude", str(tmp_path / "cache"))
+        )
+        env = os.environ.copy()
+        env.update(
+            {
+                "HOME": str(home),
+                "TZ": "UTC",
+                "ACCOUNTS_ROUTED_LABEL": "current",
+                "ACCOUNTS_ROUTED_EMAIL": "current@example.com",
+                "ACCOUNTS_ROUTED_ORG_UUID": "current-org",
+            }
+        )
+        env.pop("CLAUDE_CONFIG_DIR", None)
+        result = subprocess.run(
+            ["bash", str(script)],
+            input=json.dumps(fixture),
+            text=True,
+            capture_output=True,
+            env=env,
+            check=True,
+        )
+        rendered = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+        return next(line for line in rendered.splitlines() if "Poynting" in line)
+
+    def test_unconfirmed_reset_keeps_last_confirmed_utilization(self, tmp_path):
+        row = self._render_reset_row(tmp_path, int(time.time()) - 7200)
+
+        assert re.search(r"Poynting\s+100%(?:\s|$)", row)
+        assert "reset pending" in row
+
+    def test_post_reset_poll_confirms_empty_window(self, tmp_path):
+        row = self._render_reset_row(tmp_path, int(time.time()) - 1800)
+
+        assert re.search(r"Poynting\s+0%(?:\s|$)", row)
+        assert "reset pending" not in row
+
+    def test_fresher_account_ledger_replaces_stale_usage_cache(self, tmp_path):
+        repo = Path(__file__).resolve().parent.parent
+        now = int(time.time())
+        home = tmp_path / "home"
+        claude_dir = home / ".claude"
+        claude_dir.mkdir(parents=True)
+        (claude_dir / "statusline.conf").write_text("MAX_COLS=200\n")
+        (claude_dir / "account-resets.json").write_text(
+            json.dumps(
+                {
+                    "current@example.com|current-org": {
+                        "email": "current@example.com",
+                        "org_uuid": "current-org",
+                        "five_hour_pct": 90,
+                        "five_hour_reset": datetime.fromtimestamp(
+                            now + 14400, tz=timezone.utc
+                        ).isoformat(),
+                        "seven_day_pct": 40,
+                        "fable_pct": 53,
+                        "last_seen": now - 1800,
+                    }
+                }
+            )
+        )
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        usage_cache = cache / "statusline-usage-cache-current.json"
+        usage_cache.write_text(
+            json.dumps(
+                {
+                    "five_hour": {
+                        "utilization": 85,
+                        "resets_at": datetime.fromtimestamp(
+                            now - 1800, tz=timezone.utc
+                        ).isoformat(),
+                    },
+                    "seven_day": {"utilization": 37},
+                }
+            )
+        )
+        os.utime(usage_cache, (now - 3600, now - 3600))
+        cache_clock = tmp_path / "cache-clock"
+        cache_clock.touch()
+        os.utime(cache_clock, (now - 1200, now - 1200))
+        (cache / "statusline-usage-prev-current.json").write_text(
+            json.dumps(
+                {
+                    "ts": now - 7200,
+                    "five_hour": 80,
+                    "seven_day": 30,
+                }
+            )
+        )
+        (cache / "statusline-profile-cache-current.json").write_text(
+            json.dumps(
+                {
+                    "account": {"email": "current@example.com"},
+                    "organization": {"uuid": "current-org"},
+                }
+            )
+        )
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        project = tmp_path / "project"
+        project.mkdir()
+        race_marker = tmp_path / "cache-replaced"
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        fake_cat = fake_bin / "cat"
+        fake_cat.write_text(
+            """#!/usr/bin/env bash
+if [ "$1" = "$RACE_CACHE_FILE" ] && [ ! -e "$RACE_MARKER" ]; then
+    /bin/cat "$1"
+    : > "$RACE_MARKER"
+    /bin/cp "$1" "${RACE_CACHE_FILE}.replacement"
+    /bin/mv "${RACE_CACHE_FILE}.replacement" "$RACE_CACHE_FILE"
+    touch -r "$RACE_CACHE_CLOCK" "$RACE_CACHE_FILE"
+    exit 0
+fi
+exec /bin/cat "$@"
+"""
+        )
+        fake_cat.chmod(0o755)
+        fixture = json.loads((repo / "test/fixtures/input.json").read_text())
+        fixture["workspace"]["current_dir"] = str(project)
+        script = tmp_path / "statusline.sh"
+        script.write_text(
+            (repo / "bin/statusline.sh")
+            .read_text()
+            .replace("/tmp/claude", str(cache))
+        )
+        env = os.environ.copy()
+        env.update(
+            {
+                "HOME": str(home),
+                "TZ": "UTC",
+                "CLAUDE_CONFIG_DIR": str(profile),
+                "ACCOUNTS_ROUTED_LABEL": "current",
+                "ACCOUNTS_ROUTED_EMAIL": "current@example.com",
+                "ACCOUNTS_ROUTED_ORG_UUID": "current-org",
+                "PATH": f"{fake_bin}:{env['PATH']}",
+                "RACE_CACHE_FILE": str(usage_cache),
+                "RACE_CACHE_CLOCK": str(cache_clock),
+                "RACE_MARKER": str(race_marker),
+            }
+        )
+
+        result = subprocess.run(
+            ["bash", str(script)],
+            input=json.dumps(fixture),
+            text=True,
+            capture_output=True,
+            env=env,
+            check=True,
+        )
+        rendered = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+        session = next(line for line in rendered.splitlines() if line.startswith("session"))
+
+        assert race_marker.exists()
+        assert re.search(r"session\s+.*\s90%(?:\s|$)", session)
+        assert "100%" not in session
+        assert "85%" not in session
+
     def test_excluded_account_is_not_rendered(self, tmp_path):
         repo = Path(__file__).resolve().parent.parent
         home = tmp_path / "home"

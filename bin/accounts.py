@@ -11,7 +11,7 @@ The setup-token vault remains separate for headless hound jobs.
 Router commands:
   set LABEL       pin new sessions to LABEL
   auto            route new sessions to the freshest account
-  fable           prefer a Fable-capable account; fall back to normal routing
+  fable           run supervised sessions on Fable when headroom is available
   status / ls     mode + per-account 5h/7d/fable headroom, ⚠login flags
   poll / refresh  refresh the usage board / re-auth stale accounts (no browser)
   mint / tokens   mint a long-lived token for an account / list minted tokens
@@ -593,7 +593,6 @@ LEASES_PATH = HOME / ".accounts" / "leases.json"
 CLAUDE_HOME = HOME / ".claude"
 CLAUDE_STATE_PATH = HOME / ".claude.json"
 LEASE_STALE_S = 30.0
-LEASE_WEIGHT_PCT = 20.0
 
 PROFILE_SHARED_ENTRIES = (
     "CLAUDE.md",
@@ -1269,26 +1268,14 @@ def pick_profile_route(
 
 def rank_profile_rows(
     rows: list[dict],
-    leases: list[dict],
     *,
-    skip_pid: int | None,
     require_fable: bool = False,
 ) -> list[dict]:
-    counts: dict[str, int] = {}
-    for lease in leases:
-        if skip_pid is not None and lease.get("pid") == skip_pid:
-            continue
-        label = lease.get("label")
-        if label:
-            counts[label] = counts.get(label, 0) + 1
-
     def score(row: dict) -> tuple:
         axes = [row["five_hour"], row["seven_day"]]
         if require_fable:
             axes.append(row["fable"])
-        pressure = counts.get(row["label"], 0) * LEASE_WEIGHT_PCT
         return (
-            binding_pct(*axes) + pressure,
             binding_pct(*axes),
             float("inf") if row["five_hour"] is None else row["five_hour"],
         )
@@ -1520,8 +1507,6 @@ def select_profile(
         leases = load_session_leases()
         rows = rank_profile_rows(
             rows,
-            leases,
-            skip_pid=lease_pid,
             require_fable=prefer_fable,
         )
         if mode.get("mode") == "fable" and not require_fable:
@@ -1619,7 +1604,6 @@ def handoff_target(
     current_label: str,
     *,
     require_fable: bool,
-    lease_pid: int,
 ) -> str | None:
     try:
         blobs = load_blobs()
@@ -1627,34 +1611,16 @@ def handoff_target(
         rows = route_rows(blobs, current_label, time.time())
         rows = rank_profile_rows(
             rows,
-            load_session_leases(),
-            skip_pid=lease_pid,
             require_fable=require_fable or mode.get("mode") == "fable",
         )
         excludes = excluded_labels()
-        current = next((row for row in rows if row["label"] == current_label), None)
-        current_eligible = _profile_row_eligible(
-            current,
-            current_label,
-            excludes,
-            require_fable=require_fable,
-        )
-        pin_target = pick_profile_route(
+        target = pick_profile_route(
             rows,
             excludes,
             pin,
             require_fable=require_fable,
         )
-        if pin and pin_target == pin and pin != current_label:
-            return pin
-        if current_eligible:
-            return None
-        return pick_profile_route(
-            rows,
-            excludes | {current_label},
-            pin,
-            require_fable=require_fable,
-        )
+        return target if target != current_label else None
     except Exception:
         return None
 
@@ -1744,8 +1710,7 @@ def cmd_auto(_args) -> None:
 
 
 def cmd_fable(_args) -> None:
-    """Prefer an account with Fable (premium weekly) headroom; degrade to normal
-    5h routing when none can do Fable."""
+    """Run supervised sessions on Fable while Fable headroom is available."""
     save_mode("fable", None)
     blobs = load_blobs()
     blocked_labels = sync_profile_credentials(blobs, persist=False)
@@ -1763,7 +1728,7 @@ def cmd_fable(_args) -> None:
         ),
         key=_fable_rank,
     )
-    print("FABLE — supervised sessions prefer Fable headroom")
+    print("FABLE — supervised sessions switch to Fable when headroom is available")
     if not usable:
         print(
             "  no Fable headroom anywhere right now — "
@@ -1872,7 +1837,7 @@ def main(argv: list[str] | None = None) -> None:
 
     sub.add_parser("auto", help="route new sessions to the freshest account").set_defaults(fn=cmd_auto)
     sub.add_parser(
-        "fable", help="prefer a Fable-capable account; fall back to normal routing"
+        "fable", help="run supervised sessions on Fable when headroom is available"
     ).set_defaults(fn=cmd_fable)
     sub.add_parser("status", help="mode + per-account 5h + ⚠login flags").set_defaults(fn=cmd_status)
 

@@ -282,11 +282,21 @@ Credentials and entitlement caches are isolated; projects, transcripts, settings
 skills, and plugins are shared. Interactive sessions remain first-party
 `claude.ai` subscription sessions instead of API/setup-token sessions.
 
+Install the router from a local checkout:
+
+```bash
+./install-account-router.sh
+```
+
+The installer leaves Claude's native binary at `~/.local/bin/claude`, installs
+the router tools under `~/.local/bin`, and prepends a supervised launcher from
+`~/.accounts/bin` in new zsh sessions.
+
 | Command | What it does |
 |---------|---------------|
 | `accounts set <label>` | Prefer `<label>` while it has safe quota headroom |
 | `accounts auto` | Route sessions to the freshest account |
-| `accounts fable` | Prefer a Fable-capable account |
+| `accounts fable` | Switch supervised sessions to Fable while headroom is available |
 | `accounts status` | Mode + per-account 5h headroom + ⚠login flags |
 | `accounts poll` | Refresh dormant file-backed profiles, then poll every routable account |
 | `accounts refresh [label]` | Refresh stale file-backed credentials without a browser |
@@ -298,8 +308,9 @@ skills, and plugins are shared. Interactive sessions remain first-party
 `claude-router.py` supervises interactive sessions. It reserves the selected
 account, watches the active model's quota windows, and resumes the exact session
 under another isolated profile before a window is exhausted. The shell never
-regains control during a handoff. If every Fable-capable account is gated, the
-same session resumes on Opus using the safest general-model account.
+regains control during a handoff. Changing to Fable mode also moves running
+supervised sessions to Fable in place. If every Fable-capable account is gated,
+the same session resumes on Opus using the safest general-model account.
 Minted long-lived tokens remain outside `~/.claude`
 (`~/.accounts/vault.json`); archival copies only session JSONLs from
 `~/.claude/projects`.

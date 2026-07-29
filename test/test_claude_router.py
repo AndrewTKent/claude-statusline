@@ -21,6 +21,46 @@ claude_router = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(claude_router)
 
 
+def test_router_uses_native_binary_when_path_points_to_the_launcher(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "home"
+    native = home / ".local/bin/claude"
+    launcher_dir = tmp_path / "launcher"
+    native.parent.mkdir(parents=True)
+    launcher_dir.mkdir()
+    native.write_text("")
+    (launcher_dir / "claude").write_text("")
+    native.chmod(0o755)
+    (launcher_dir / "claude").chmod(0o755)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", str(launcher_dir))
+    monkeypatch.delenv("CLAUDE_REAL_BIN", raising=False)
+
+    assert claude_router.claude_binary() == str(native)
+
+
+def test_supervised_launcher_executes_the_router(tmp_path):
+    home = tmp_path / "home"
+    router = home / ".local/bin/claude-router"
+    output = tmp_path / "args.json"
+    router.parent.mkdir(parents=True)
+    router.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$@\" > {output}\n"
+    )
+    router.chmod(0o755)
+
+    result = subprocess.run(
+        [REPO / "shell/claude-supervised", "--resume", "session-id"],
+        env={**os.environ, "HOME": str(home)},
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert output.read_text().splitlines() == ["--resume", "session-id"]
+
+
 def _blob(token):
     return json.dumps(
         {
@@ -155,6 +195,54 @@ def test_running_supervisor_reexecs_new_router_code(monkeypatch):
         "--resume",
         session_id,
     ]
+
+
+def test_fable_mode_launches_directly_on_fable(monkeypatch):
+    selected = {
+        "profile": "/profiles/fable",
+        "label": "fable",
+        "email": "fable@example.com",
+        "org_uuid": "org-fable",
+    }
+    selections = []
+    launches = []
+
+    class Child:
+        def poll(self):
+            return 0
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "load_mode",
+        lambda: {"mode": "fable", "label": None},
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "select_profile",
+        lambda **kwargs: selections.append(kwargs) or selected,
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "upsert_session_lease",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "remove_session_lease",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        claude_router.subprocess,
+        "Popen",
+        lambda command, **kwargs: launches.append((command, kwargs)) or Child(),
+    )
+
+    assert claude_router.run_supervised("/real/claude", ["--model", "opus"]) == 0
+    assert selections[0]["require_fable"] is True
+    assert launches[0][0][-2:] == ["--model", "fable"]
 
 
 def test_passthrough_preserves_an_explicit_profile(monkeypatch):
@@ -493,6 +581,116 @@ def test_running_session_hands_off_without_returning_to_the_shell(tmp_path):
     assert launches[1]["args"][-4:] == [
         "--model",
         "opus",
+        "--resume",
+        first_session,
+    ]
+
+
+def test_running_opus_session_switches_to_fable_when_mode_changes(tmp_path):
+    home = tmp_path / "home"
+    claude_dir = home / ".claude"
+    accounts_dir = home / ".accounts"
+    claude_dir.mkdir(parents=True)
+    accounts_dir.mkdir()
+    (home / ".claude.json").write_text('{"hasCompletedOnboarding":true}')
+    (claude_dir / "settings.json").write_text('{"model":"opus"}')
+    (accounts_dir / "blobs.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "accounts": {
+                    "general": {
+                        "blob": _blob("general"),
+                        "email": "general@example.com",
+                        "org_uuid": "org-general",
+                    },
+                    "fable": {
+                        "blob": _blob("fable"),
+                        "email": "fable@example.com",
+                        "org_uuid": "org-fable",
+                    },
+                },
+            }
+        )
+    )
+    mode_path = accounts_dir / "mode.json"
+    mode_path.write_text('{"mode":"auto","label":null}')
+    (claude_dir / "account-resets.json").write_text(
+        json.dumps(
+            {
+                "general@example.com|org-general": {
+                    "five_hour_pct": 10,
+                    "seven_day_pct": 10,
+                    "fable_pct": 100,
+                },
+                "fable@example.com|org-fable": {
+                    "five_hour_pct": 20,
+                    "seven_day_pct": 20,
+                    "fable_pct": 20,
+                },
+            }
+        )
+    )
+    log_path = tmp_path / "launches.jsonl"
+    fake_claude = tmp_path / "fake-claude"
+    fake_claude.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, signal, sys, time\n"
+        "from pathlib import Path\n"
+        "args = sys.argv[1:]\n"
+        "sid = None\n"
+        "for flag in ('--session-id', '--resume'):\n"
+        "    if flag in args:\n"
+        "        sid = args[args.index(flag) + 1]\n"
+        "label = os.environ['ACCOUNTS_ROUTED_LABEL']\n"
+        "with Path(os.environ['ROUTER_TEST_LOG']).open('a') as f:\n"
+        "    f.write(json.dumps({'args': args, 'label': label}) + '\\n')\n"
+        "model = 'Fable 5.max' if 'fable' in args else 'Opus 5.max'\n"
+        "Path(os.environ['ACCOUNTS_ROUTER_STATE']).write_text(\n"
+        "    json.dumps({'session_id': sid, 'model': model})\n"
+        ")\n"
+        "count = len(Path(os.environ['ROUTER_TEST_LOG']).read_text().splitlines())\n"
+        "if count == 1:\n"
+        "    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n"
+        "    deadline = time.time() + 2\n"
+        "    while time.time() < deadline: time.sleep(0.05)\n"
+    )
+    fake_claude.chmod(0o755)
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(home),
+            "CLAUDE_REAL_BIN": str(fake_claude),
+            "ACCOUNTS_ROUTER_INTERVAL": "0.05",
+            "ROUTER_TEST_LOG": str(log_path),
+            "PYTHONPATH": str(REPO / "bin"),
+        }
+    )
+    process = subprocess.Popen(
+        [sys.executable, str(REPO / "bin" / "claude-router.py")],
+        cwd=tmp_path,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.time() + 5
+    while time.time() < deadline and not log_path.exists():
+        time.sleep(0.02)
+    assert log_path.exists()
+    mode_path.write_text('{"mode":"fable","label":null}')
+
+    stdout, stderr = process.communicate(timeout=10)
+    launches = [json.loads(line) for line in log_path.read_text().splitlines()]
+
+    assert process.returncode == 0
+    assert stdout == ""
+    assert stderr == ""
+    assert [launch["label"] for launch in launches] == ["general", "fable"]
+    first_session = launches[0]["args"][-1]
+    assert launches[1]["args"][-4:] == [
+        "--model",
+        "fable",
         "--resume",
         first_session,
     ]

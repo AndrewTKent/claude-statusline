@@ -42,6 +42,9 @@ def claude_binary() -> str:
     explicit = os.environ.get("CLAUDE_REAL_BIN")
     if explicit:
         return explicit
+    native = Path.home() / ".local/bin/claude"
+    if native.is_file() and os.access(native, os.X_OK):
+        return str(native)
     binary = shutil.which("claude")
     if not binary:
         raise RuntimeError("claude binary not found")
@@ -250,6 +253,10 @@ def run_supervised(binary: str, args: list[str]) -> int:
     loaded_mtime = source_mtime()
     current_model = model_name(args)
     current_family = "fable" if current_model == "fable" else "general"
+    if accounts.load_mode().get("mode") == "fable" and current_family != "fable":
+        current_model = "fable"
+        current_family = "fable"
+        launch_args = replace_model_args(launch_args, current_model)
     model_override = None
     selected = accounts.select_profile(
         require_fable=current_family == "fable",
@@ -341,38 +348,53 @@ def run_supervised(binary: str, args: list[str]) -> int:
                             *resume_session_args(args, session_id, current_model),
                         ],
                     )
-                target = accounts.handoff_target(
-                    selected["label"],
-                    require_fable=current_family == "fable",
-                    lease_pid=router_pid,
-                )
-                next_model = model_override or current_model
-                next_override = model_override
-                if target:
-                    next_profile = accounts.select_profile(
-                        avoid_labels={selected["label"]},
-                        require_fable=current_family == "fable",
-                        lease_pid=router_pid,
-                    )
-                    if next_profile is None or next_profile["label"] != target:
-                        continue
-                elif current_family == "fable" and not accounts.profile_has_headroom(
-                    selected["label"],
-                    require_fable=True,
+                if (
+                    accounts.load_mode().get("mode") == "fable"
+                    and current_family != "fable"
                 ):
-                    next_model = os.environ.get(
-                        "ACCOUNTS_FABLE_FALLBACK_MODEL",
-                        FABLE_FALLBACK_MODEL,
-                    )
-                    next_override = next_model
                     next_profile = accounts.select_profile(
-                        require_fable=False,
+                        require_fable=True,
                         lease_pid=router_pid,
                     )
                     if next_profile is None:
                         continue
+                    next_model = "fable"
+                    next_override = None
                 else:
-                    continue
+                    target = accounts.handoff_target(
+                        selected["label"],
+                        require_fable=current_family == "fable",
+                    )
+                    next_model = model_override or current_model
+                    next_override = model_override
+                    if target:
+                        next_profile = accounts.select_profile(
+                            avoid_labels={selected["label"]},
+                            require_fable=current_family == "fable",
+                            lease_pid=router_pid,
+                        )
+                        if next_profile is None or next_profile["label"] != target:
+                            continue
+                    elif (
+                        current_family == "fable"
+                        and not accounts.profile_has_headroom(
+                            selected["label"],
+                            require_fable=True,
+                        )
+                    ):
+                        next_model = os.environ.get(
+                            "ACCOUNTS_FABLE_FALLBACK_MODEL",
+                            FABLE_FALLBACK_MODEL,
+                        )
+                        next_override = next_model
+                        next_profile = accounts.select_profile(
+                            require_fable=False,
+                            lease_pid=router_pid,
+                        )
+                        if next_profile is None:
+                            continue
+                    else:
+                        continue
                 output_frozen = set_synchronized_output(True)
                 freeze_started = time.monotonic()
                 stop_for_handoff(child)
