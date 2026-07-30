@@ -15,7 +15,7 @@ jobs:
         uses: ludeeus/action-shellcheck@master
         with:
           scandir: bin/
-          additional_files: install.sh uninstall.sh install-codex.sh
+          additional_files: install.sh install-account-router.sh uninstall.sh install-codex.sh shell/claude-supervised test/test_install_account_router.sh
           severity: error
 
   test-claude:
@@ -31,7 +31,7 @@ jobs:
       - name: Install pytest
         run: python3 -m pip install pytest
       - name: Claude-side tests (accounts + scan-tokens)
-        run: python3 -m pytest test/test_accounts.py test/test_scan_tokens.py -q
+        run: python3 -m pytest test/test_accounts.py test/test_claude_router.py test/test_scan_tokens.py -q
 
   test:
     runs-on: ${{ matrix.os }}
@@ -58,6 +58,8 @@ jobs:
           [ -f ~/.claude/statusline.sh ] || { echo "FAIL: script not installed"; exit 1; }
           jq -e '.statusLine' ~/.claude/settings.json || { echo "FAIL: settings not patched"; exit 1; }
           echo "PASS: install script works"
+      - name: Test account router installer
+        run: bash test/test_install_account_router.sh
       - name: Test ledger functions
         run: bash test/test_ledger.sh
       - name: Test transcript backups

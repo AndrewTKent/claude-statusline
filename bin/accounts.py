@@ -9,9 +9,9 @@ reset-aware headroom and resumes it under another profile before quota exhaustio
 The setup-token vault remains separate for headless remote-host jobs.
 
 Router commands:
-  set LABEL       pin new sessions to LABEL
-  auto            route new sessions to the freshest account
-  fable           prefer a Fable-capable account; fall back to normal routing
+  set LABEL       force every supervised session onto LABEL
+  auto            route supervised sessions to the freshest account
+  fable           run supervised sessions on Fable when headroom is available
   status / ls     mode + per-account 5h/7d/fable headroom, ⚠login flags
   poll / refresh  refresh the usage board / re-auth stale accounts (no browser)
   mint / tokens   mint a long-lived token for an account / list minted tokens
@@ -43,6 +43,7 @@ HOME = Path.home()
 LIVE_SERVICE = "Claude Code-credentials"
 LOCK_PATH = HOME / ".claude" / "accounts.lock"
 RESETS_PATH = HOME / ".claude" / "account-resets.json"
+SESSION_LIMITS_PATH = HOME / ".accounts" / "session-limits.json"
 CONF_PATH = HOME / ".claude" / "statusline.conf"
 MIRROR_LOG = HOME / ".claude" / "accounts-mirror.log"
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
@@ -50,6 +51,7 @@ USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"  # public Claude Code OAuth client (PKCE, no secret)
 STALE_AFTER_S = 3 * 3600
+SESSION_LIMIT_FALLBACK_S = 5 * 3600
 LEGACY_ROUTE_AGENT_LABEL = "com.claude-accounts-route"
 LEGACY_ROUTE_AGENT_PATH = HOME / "Library" / "LaunchAgents" / f"{LEGACY_ROUTE_AGENT_LABEL}.plist"
 
@@ -507,6 +509,48 @@ def merge_reset_rows(rows: dict[str, dict]) -> None:
         os.replace(tmp, RESETS_PATH)
 
 
+def mark_session_limit(
+    email: str,
+    org_uuid: str,
+    *,
+    now_ts: float | None = None,
+) -> None:
+    with locked():
+        key = f"{email}|{org_uuid}"
+        detected_at = time.time() if now_ts is None else now_ts
+        row = resets_row(load_resets(), email, org_uuid)
+        reset = parse_iso(row.get("five_hour_reset"))
+        expires_at = (
+            reset.timestamp()
+            if reset is not None and reset.timestamp() > detected_at
+            else detected_at + SESSION_LIMIT_FALLBACK_S
+        )
+        limits = load_session_limits(detected_at)
+        limits[key] = {
+            "detected_at": detected_at,
+            "expires_at": expires_at,
+        }
+        _write_0600(
+            SESSION_LIMITS_PATH,
+            json.dumps(limits, indent=2, sort_keys=True) + "\n",
+        )
+
+
+def load_session_limits(now_ts: float) -> dict[str, dict]:
+    try:
+        limits = json.loads(SESSION_LIMITS_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(limits, dict):
+        return {}
+    return {
+        key: value
+        for key, value in limits.items()
+        if isinstance(value, dict)
+        and float(value.get("expires_at", 0)) > now_ts
+    }
+
+
 def cmd_poll(_args) -> None:
     """Query every stored account's remaining limits and repaint the board."""
     with locked():
@@ -593,7 +637,6 @@ LEASES_PATH = HOME / ".accounts" / "leases.json"
 CLAUDE_HOME = HOME / ".claude"
 CLAUDE_STATE_PATH = HOME / ".claude.json"
 LEASE_STALE_S = 30.0
-LEASE_WEIGHT_PCT = 20.0
 
 PROFILE_SHARED_ENTRIES = (
     "CLAUDE.md",
@@ -1155,10 +1198,14 @@ def route_rows(blobs: dict, active_label: str | None, now_ts: float) -> list[dic
     binding-window runway (lowest worst-of-5h/7d), freshest 5h as tiebreak;
     rows missing a rate axis are unpickable (_rate_eligible) and sort last."""
     resets = load_resets()
+    session_limits = load_session_limits(now_ts)
     rows = []
     for label, e in (blobs.get("accounts") or {}).items():
+        key = f"{e.get('email')}|{e.get('org_uuid')}"
         row = resets_row(resets, e.get("email"), e.get("org_uuid"))
         effs = effective_pcts(row, now_utc())
+        if key in session_limits:
+            effs["five_hour"] = 100.0
         last_seen = row.get("last_seen")
         rows.append(
             {
@@ -1172,11 +1219,14 @@ def route_rows(blobs: dict, active_label: str | None, now_ts: float) -> list[dic
                 "stale": bool(last_seen) and (now_ts - last_seen) > STALE_AFTER_S,
             }
         )
-    rows.sort(key=lambda r: (
-        r["five_hour"] is None or r["seven_day"] is None,
-        binding_pct(r["five_hour"], r["seven_day"]),
-        float("inf") if r["five_hour"] is None else r["five_hour"],
-    ))
+    rows.sort(
+        key=lambda r: (
+            r["five_hour"] is None or r["seven_day"] is None,
+            binding_pct(r["five_hour"], r["seven_day"]),
+            float("inf") if r["five_hour"] is None else r["five_hour"],
+            r["label"],
+        )
+    )
     return rows
 
 
@@ -1246,7 +1296,17 @@ def pick_profile_route(
     pin: str | None,
     *,
     require_fable: bool = False,
+    force_pin: bool = False,
 ) -> str | None:
+    if force_pin and pin is not None:
+        return next(
+            (
+                row["label"]
+                for row in rows
+                if row["label"] == pin and not row["expired"]
+            ),
+            None,
+        )
     ordered = rows
     if pin is not None:
         ordered = sorted(rows, key=lambda row: row["label"] != pin)
@@ -1269,28 +1329,16 @@ def pick_profile_route(
 
 def rank_profile_rows(
     rows: list[dict],
-    leases: list[dict],
     *,
-    skip_pid: int | None,
     require_fable: bool = False,
 ) -> list[dict]:
-    counts: dict[str, int] = {}
-    for lease in leases:
-        if skip_pid is not None and lease.get("pid") == skip_pid:
-            continue
-        label = lease.get("label")
-        if label:
-            counts[label] = counts.get(label, 0) + 1
-
     def score(row: dict) -> tuple:
-        axes = [row["five_hour"], row["seven_day"]]
         if require_fable:
-            axes.append(row["fable"])
-        pressure = counts.get(row["label"], 0) * LEASE_WEIGHT_PCT
+            return _fable_rank(row)
         return (
-            binding_pct(*axes) + pressure,
-            binding_pct(*axes),
+            binding_pct(row["five_hour"], row["seven_day"]),
             float("inf") if row["five_hour"] is None else row["five_hour"],
+            row["label"],
         )
 
     return sorted(rows, key=score)
@@ -1479,11 +1527,6 @@ def cmd_tokens(_args) -> None:
 
 
 def _fable_first(rows: list[dict]) -> list[dict]:
-    """Reorder for fable mode: fable-eligible accounts first (most binding-window
-    runway), everything else keeps its existing order. The profile picker then
-    takes the first usable row, so fallback (no eligible fable account) is
-    automatic. Stable sort preserves the incoming (headroom) order inside each group."""
-
     def key(r: dict) -> tuple:
         if fable_eligible(r["five_hour"], r["seven_day"], r["fable"]):
             return (0, *_fable_rank(r))
@@ -1492,39 +1535,41 @@ def _fable_first(rows: list[dict]) -> list[dict]:
     return sorted(rows, key=key)
 
 
-def _route_preferences() -> tuple[dict, str | None]:
+def _route_preferences() -> tuple[dict, str | None, bool]:
     mode = load_mode()
-    pin = os.environ.get("ACCOUNTS_PIN") or None
-    if pin is None and mode.get("mode") == "set":
-        pin = mode.get("label")
-    return mode, pin
+    session_pin = os.environ.get("ACCOUNTS_PIN") or None
+    if session_pin is not None:
+        return mode, session_pin, False
+    if mode.get("mode") == "set":
+        return mode, mode.get("label"), True
+    return mode, None, False
 
 
 def select_profile(
     *,
     avoid_labels: set[str] | None = None,
     require_fable: bool = False,
+    prefer_fable: bool | None = None,
     lease_pid: int | None = None,
 ) -> dict | None:
     avoid_labels = avoid_labels or set()
     with locked():
         blobs = load_blobs()
         blocked_labels = sync_profile_credentials(blobs, persist=True)
-        mode, pin = _route_preferences()
+        mode, pin, force_pin = _route_preferences()
         rows = [
             row
             for row in route_rows(blobs, None, time.time())
             if row["label"] not in blocked_labels
         ]
-        prefer_fable = require_fable or mode.get("mode") == "fable"
+        if prefer_fable is None:
+            prefer_fable = require_fable or mode.get("mode") == "fable"
         leases = load_session_leases()
         rows = rank_profile_rows(
             rows,
-            leases,
-            skip_pid=lease_pid,
             require_fable=prefer_fable,
         )
-        if mode.get("mode") == "fable" and not require_fable:
+        if prefer_fable and not require_fable:
             rows = _fable_first(rows)
         excludes = excluded_labels() | avoid_labels
         accounts_map = blobs.get("accounts") or {}
@@ -1535,6 +1580,7 @@ def select_profile(
                 excludes,
                 pin,
                 require_fable=require_fable,
+                force_pin=force_pin,
             )
             if picked is None:
                 break
@@ -1619,42 +1665,39 @@ def handoff_target(
     current_label: str,
     *,
     require_fable: bool,
-    lease_pid: int,
 ) -> str | None:
     try:
         blobs = load_blobs()
-        mode, pin = _route_preferences()
+        mode, pin, force_pin = _route_preferences()
         rows = route_rows(blobs, current_label, time.time())
         rows = rank_profile_rows(
             rows,
-            load_session_leases(),
-            skip_pid=lease_pid,
-            require_fable=require_fable or mode.get("mode") == "fable",
+            require_fable=require_fable,
         )
         excludes = excluded_labels()
-        current = next((row for row in rows if row["label"] == current_label), None)
-        current_eligible = _profile_row_eligible(
-            current,
-            current_label,
-            excludes,
-            require_fable=require_fable,
+        current = next(
+            (row for row in rows if row["label"] == current_label),
+            None,
         )
-        pin_target = pick_profile_route(
-            rows,
-            excludes,
-            pin,
-            require_fable=require_fable,
-        )
-        if pin and pin_target == pin and pin != current_label:
-            return pin
-        if current_eligible:
+        if (
+            require_fable
+            and pin is None
+            and _profile_row_eligible(
+                current,
+                current_label,
+                excludes,
+                require_fable=True,
+            )
+        ):
             return None
-        return pick_profile_route(
+        target = pick_profile_route(
             rows,
-            excludes | {current_label},
+            excludes,
             pin,
             require_fable=require_fable,
+            force_pin=force_pin,
         )
+        return target if target != current_label else None
     except Exception:
         return None
 
@@ -1687,7 +1730,7 @@ def cmd_pick_env(args) -> None:
 
 
 RATE_CAP_PCT = 80.0
-FABLE_CAP_PCT = 80.0
+FABLE_CAP_PCT = 95.0
 
 
 def fable_eligible(
@@ -1709,11 +1752,16 @@ def fable_eligible(
 
 
 def _fable_rank(r: dict) -> tuple:
-    """Most usable Fable runway first: binding window, then fable, then 5h.
-    Only rank eligible rows — eligibility guarantees every axis is non-None."""
-    return (binding_pct(r["five_hour"], r["seven_day"], r["fable"]), r["fable"], r["five_hour"])
+    return (
+        float("inf") if r["fable"] is None else r["fable"],
+        binding_pct(r["five_hour"], r["seven_day"]),
+        float("inf") if r["five_hour"] is None else r["five_hour"],
+        r["label"],
+    )
+
+
 def cmd_set(args) -> None:
-    """Prefer <label> while it has safe quota headroom."""
+    """Force supervised sessions onto <label>."""
     with locked():
         blobs = load_blobs()
         blocked_labels = sync_profile_credentials(blobs, persist=True)
@@ -1727,11 +1775,11 @@ def cmd_set(args) -> None:
         ensure_native_profile(args.label, e)
         save_mode("set", args.label)
     print(f"SET → {args.label}")
-    print("supervised sessions follow it while the account has safe quota headroom")
+    print("supervised sessions use it until the routing mode changes")
 
 
 def cmd_auto(_args) -> None:
-    """Route new sessions to the freshest account."""
+    """Route supervised sessions to the freshest account."""
     save_mode("auto", None)
     blobs = load_blobs()
     blocked_labels = sync_profile_credentials(blobs, persist=False)
@@ -1744,8 +1792,7 @@ def cmd_auto(_args) -> None:
 
 
 def cmd_fable(_args) -> None:
-    """Prefer an account with Fable (premium weekly) headroom; degrade to normal
-    5h routing when none can do Fable."""
+    """Run supervised sessions on Fable while Fable headroom is available."""
     save_mode("fable", None)
     blobs = load_blobs()
     blocked_labels = sync_profile_credentials(blobs, persist=False)
@@ -1763,7 +1810,7 @@ def cmd_fable(_args) -> None:
         ),
         key=_fable_rank,
     )
-    print("FABLE — supervised sessions prefer Fable headroom")
+    print("FABLE — supervised sessions switch to Fable when headroom is available")
     if not usable:
         print(
             "  no Fable headroom anywhere right now — "
@@ -1789,20 +1836,29 @@ def cmd_status(_args) -> None:
         tag = f"SET → {mode['label']}"
         ordered = rows
         pin = mode["label"]
+        force_pin = True
     elif mode["mode"] == "fable":
         tag = "FABLE"
         ordered = _fable_first(rows)
         pin = None
+        force_pin = False
     else:
         tag = "AUTO"
         ordered = rows
         pin = None
-    next_general = pick_profile_route(ordered, excludes, pin)
+        force_pin = False
+    next_general = pick_profile_route(
+        ordered,
+        excludes,
+        pin,
+        force_pin=force_pin,
+    )
     next_fable = pick_profile_route(
         ordered,
         excludes,
         pin,
         require_fable=True,
+        force_pin=force_pin,
     )
     print(
         f"mode: {tag}   general: {next_general or '(none free)'}"
@@ -1866,13 +1922,19 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="accounts", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_set = sub.add_parser("set", help="prefer <label> while quota is safe")
+    p_set = sub.add_parser(
+        "set",
+        help="force every supervised session onto <label>",
+    )
     p_set.add_argument("label")
     p_set.set_defaults(fn=cmd_set)
 
-    sub.add_parser("auto", help="route new sessions to the freshest account").set_defaults(fn=cmd_auto)
     sub.add_parser(
-        "fable", help="prefer a Fable-capable account; fall back to normal routing"
+        "auto",
+        help="route supervised sessions to the freshest account",
+    ).set_defaults(fn=cmd_auto)
+    sub.add_parser(
+        "fable", help="run supervised sessions on Fable when headroom is available"
     ).set_defaults(fn=cmd_fable)
     sub.add_parser("status", help="mode + per-account 5h + ⚠login flags").set_defaults(fn=cmd_status)
 

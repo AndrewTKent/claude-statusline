@@ -567,8 +567,36 @@ eval "$(echo "$input" | jq -r '
     "CACHE_READ=" + (.context_window.current_usage.cache_read_input_tokens // 0 | tostring | @sh),
     "CACHE_CREATE=" + (.context_window.current_usage.cache_creation_input_tokens // 0 | tostring | @sh),
     "SESSION_ID=" + (.session_id // "" | @sh),
+    "EFFORT_VAL=" + (.effort.level // .effort_level // "" | @sh),
     "CTX_SIZE=" + (.context_window.context_window_size // 200000 | tostring | @sh)
 ' 2>/dev/null)"
+
+# ── Effort level ───────────────────────────────────────
+EFFORT=""
+effort_val="${EFFORT_VAL:-}"
+if [ -z "$effort_val" ]; then
+    settings_path="$HOME/.claude/settings.json"
+    [ -f "$settings_path" ] && effort_val=$(jq -r '.effortLevel // empty' "$settings_path" 2>/dev/null)
+fi
+effort_label="$effort_val"
+prior_router_effort=""
+if [[ "${ACCOUNTS_ROUTER_STATE:-}" == /tmp/claude/account-router-*.json ]] &&
+   [ -f "$ACCOUNTS_ROUTER_STATE" ]; then
+    prior_router_effort=$(jq -r '.effort // empty' "$ACCOUNTS_ROUTER_STATE" 2>/dev/null)
+fi
+if [ "${CLAUDE_ROUTER_ULTRACODE:-}" = "1" ] && [ "$effort_val" = "xhigh" ]; then
+    if [ -z "$prior_router_effort" ] || [ "$prior_router_effort" = "ultracode" ]; then
+        effort_label="ultracode"
+    fi
+fi
+case "$effort_label" in
+    low)    EFFORT="${dim}.low${reset}" ;;
+    medium) EFFORT="${orange}.medium${reset}" ;;
+    high)   EFFORT="${red}.high${reset}" ;;
+    xhigh)  EFFORT="${red}.xhigh${reset}" ;;
+    max)    EFFORT="${red}.max${reset}" ;;
+    ultracode) EFFORT="${magenta}.ultracode${reset}" ;;
+esac
 
 # ── OAuth token resolution ──────────────────────────────
 get_oauth_token() {
@@ -692,9 +720,10 @@ if [[ "${ACCOUNTS_ROUTER_STATE:-}" == /tmp/claude/account-router-*.json ]] &&
     jq -cn \
         --arg session_id "$SESSION_ID" \
         --arg model "$MODEL" \
+        --arg effort "$effort_label" \
         --arg label "$ACCT_TAG" \
         --arg cwd "$CWD" \
-        '{session_id:$session_id,model:$model,label:$label,cwd:$cwd}' \
+        '{session_id:$session_id,model:$model,effort:$effort,label:$label,cwd:$cwd}' \
         > "$_router_state_tmp" 2>/dev/null &&
         chmod 600 "$_router_state_tmp" 2>/dev/null &&
         mv "$_router_state_tmp" "$ACCOUNTS_ROUTER_STATE" 2>/dev/null
@@ -915,23 +944,6 @@ CONTEXT_INT=$(printf "%.0f" "$CONTEXT_PCT")
 CTX_BAR=$(build_context_bar "$CONTEXT_INT" 15)
 CTX_COLOR=$(color_for_context "$CONTEXT_INT")
 
-# ── Effort level ───────────────────────────────────────
-# Claude Code 2.1+ emits effort as `.effort.level`; older builds used
-# `.effort_level`. Accept both, then fall back to settings.json.
-EFFORT=""
-effort_val=$(echo "$input" | jq -r '.effort.level // .effort_level // empty' 2>/dev/null)
-if [ -z "$effort_val" ]; then
-    settings_path="$HOME/.claude/settings.json"
-    [ -f "$settings_path" ] && effort_val=$(jq -r '.effortLevel // empty' "$settings_path" 2>/dev/null)
-fi
-case "$effort_val" in
-    low)    EFFORT="${dim}.low${reset}" ;;
-    medium) EFFORT="${orange}.medium${reset}" ;;
-    high)   EFFORT="${red}.high${reset}" ;;
-    xhigh)  EFFORT="${red}.xhigh${reset}" ;;
-    max)    EFFORT="${red}.max${reset}" ;;
-esac
-
 # ── Fast mode ──────────────────────────────────────────
 FAST_MODE=""
 settings_fast=$(jq -r '.fastMode // false' "$HOME/.claude/settings.json" 2>/dev/null)
@@ -1120,7 +1132,11 @@ if $needs_refresh || $needs_profile_refresh; then
                                            "prev_extra=" + (.extra_usage.used_credits // 0 | tostring)' "$cache_file" 2>/dev/null)"
                             printf '{"ts":%s,"five_hour":%s,"seven_day":%s,"extra_used":%s}' "$prev_ts" "${prev_5h:-0}" "${prev_7d:-0}" "${prev_extra:-0}" > "/tmp/claude/statusline-usage-prev-${ACCOUNT_CACHE_KEY}.json"
                         fi
-                        echo "$response" > "$cache_file"
+                        usage_cache_tmp=$(mktemp "${cache_file}.tmp.XXXXXX")
+                        if [ -n "$usage_cache_tmp" ]; then
+                            printf '%s\n' "$response" > "$usage_cache_tmp"
+                            mv "$usage_cache_tmp" "$cache_file"
+                        fi
 
                         # Cross-account reset ledger: record the active account's
                         # 5h/7d reset times + utilization so other sessions can
@@ -1191,18 +1207,36 @@ if $needs_refresh || $needs_profile_refresh; then
     fi
 fi
 
-# Always read from cache (may be stale by one cycle — imperceptible)
+# Prefer the freshest exact-account snapshot. A stale cache can belong to a
+# completed quota window when a newer cross-account poll already has the truth.
 usage_data=""
-[ -f "$cache_file" ] && usage_data=$(cat "$cache_file" 2>/dev/null)
-
-# Fallback when the live usage poll is rate-limited (429 → no cache, common on
-# multi-session hosts): rebuild the 5h/7d bars from the current account's ledger row.
-if [ -z "$usage_data" ] && [ -n "$ACCT_EMAIL" ]; then
+_usage_cache_seen=0
+_usage_data_source=""
+if [ -f "$cache_file" ]; then
+    _usage_cache_id_before=$(stat -f '%i:%m' "$cache_file" 2>/dev/null || stat -c '%i:%Y' "$cache_file" 2>/dev/null || echo "")
+    usage_data=$(cat "$cache_file" 2>/dev/null)
+    _usage_cache_id_after=$(stat -f '%i:%m' "$cache_file" 2>/dev/null || stat -c '%i:%Y' "$cache_file" 2>/dev/null || echo "")
+    if [ -n "$_usage_cache_id_before" ] && [ "$_usage_cache_id_before" = "$_usage_cache_id_after" ]; then
+        _usage_cache_seen="${_usage_cache_id_after##*:}"
+        _usage_data_source="cache"
+    else
+        usage_data=""
+    fi
+fi
+if [ -n "$ACCT_EMAIL" ]; then
     _ledger_file="$HOME/.claude/account-resets.json"
     if [ -f "$_ledger_file" ]; then
-        usage_data=$(jq -c --arg key "${ACCT_EMAIL}|${ACCT_ORG_UUID}" --arg email "$ACCT_EMAIL" '
-            (.[$key] // (to_entries | map(.value) | map(select(.email == $email)) | .[0])) as $e
-            | if $e == null then empty
+        _ledger_usage=$(jq -c \
+            --arg key "${ACCT_EMAIL}|${ACCT_ORG_UUID}" \
+            --arg email "$ACCT_EMAIL" \
+            --arg uuid "$ACCT_ORG_UUID" \
+            --argjson cache_seen "$_usage_cache_seen" '
+            (.[$key] // (
+                if $uuid == "" then
+                    (to_entries | map(.value) | map(select(.email == $email)) | .[0])
+                else null end
+            )) as $e
+            | if $e == null or (($e.last_seen // 0) <= $cache_seen) then empty
               else {
                   five_hour: { utilization: ($e.five_hour_pct // 0), resets_at: ($e.five_hour_reset // null) },
                   seven_day: { utilization: ($e.seven_day_pct // 0), resets_at: ($e.seven_day_reset // null) },
@@ -1213,6 +1247,10 @@ if [ -z "$usage_data" ] && [ -n "$ACCT_EMAIL" ]; then
                     else [] end
                   )
                 } end' "$_ledger_file" 2>/dev/null)
+        if [ -n "$_ledger_usage" ]; then
+            usage_data="$_ledger_usage"
+            _usage_data_source="ledger"
+        fi
     fi
 fi
 
@@ -1388,7 +1426,7 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
     ' 2>/dev/null)"
 
     # Interpolate between polls for fractional precision
-    if [ -f "$prev_poll_file" ] && [ -f "$cache_file" ]; then
+    if [ "$_usage_data_source" = "cache" ] && [ -f "$prev_poll_file" ] && [ -f "$cache_file" ]; then
         poll_ts=$(stat -f %m "$cache_file" 2>/dev/null || stat -c %Y "$cache_file" 2>/dev/null)
         # One jq pull — saves 2 spawns per render.
         eval "$(jq -r '"prev_ts=" + (.ts // 0 | tostring),
@@ -1544,6 +1582,11 @@ _ralign() {
     printf '%*s%s' "$pad" '' "$s"
 }
 
+_account_rank_precedes() {
+    local LC_ALL=C
+    [[ "$1" < "$2" ]]
+}
+
 ACCOUNT_ROWS=""  # per-account stacked rows (new layout); each row starts with \n
 if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
     ledger_file="$HOME/.claude/account-resets.json"
@@ -1582,10 +1625,13 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
         # refresh expiry lives inside each blob (epoch-ms). Keyed email|org to
         # match the ledger rows below.
         accounts_blobs="$HOME/.accounts/blobs.json"
+        session_limits_file="$HOME/.accounts/session-limits.json"
         _route_mode=$(jq -r '.mode // ""' "$HOME/.accounts/mode.json" 2>/dev/null)
+        _route_label=$(jq -r '.label // ""' "$HOME/.accounts/mode.json" 2>/dev/null)
         _US=$'\x1f'
         _name_w=9
         ACCOUNTS_EXPIRED_LOOKUP=""
+        ACTIVE_SESSION_LIMITS_LOOKUP=""
         if [ -f "$accounts_blobs" ]; then
             ACCOUNTS_EXPIRED_LOOKUP=$(jq -r --argjson now "$now_ar" '
                 (.accounts // {}) | to_entries[] | .value |
@@ -1596,14 +1642,25 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                        or ($exp != null and ($exp / 1000) <= $now)) |
                 "\(.email)|\(.org_uuid)"' "$accounts_blobs" 2>/dev/null)
         fi
+        if [ -f "$session_limits_file" ]; then
+            ACTIVE_SESSION_LIMITS_LOOKUP=$(jq -r --argjson now "$now_ar" '
+                if type == "object" then
+                    to_entries[]
+                    | select(.value | type == "object")
+                    | select(
+                        (try ((.value.expires_at // 0) | tonumber) catch 0) > $now
+                    )
+                    | .key
+                else empty end' "$session_limits_file" 2>/dev/null)
+        fi
         entries=$(jq -r --argjson now "$now_ar" '
             to_entries[] |
             [(.value.email // (.key | split("|") | .[0])),
              (.value.org_uuid // ((.key | split("|") | .[1]) // "")),
              (.value.five_hour_reset // ""),
-             (.value.five_hour_pct // 0 | tostring),
+             (.value.five_hour_pct // "" | tostring),
              (.value.seven_day_reset // ""),
-             (.value.seven_day_pct // 0 | tostring),
+             (.value.seven_day_pct // "" | tostring),
              (.value.fable_reset // ""),
              (.value.fable_pct // "" | tostring),
              (.value.last_seen // 0 | tostring)] |
@@ -1615,23 +1672,16 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
             while IFS=$'\x1f' read -r em uuid iso pct seven_day_iso weekly_pct_ledger fbl_iso fable_pct_ledger last_seen_ts; do
                 [ -z "$em" ] && continue
                 ep=""
-                # pct_state: ok = use stored pct; reset = fresh window, show 0%;
-                # unknown = stale account, show —. Decided after rollover.
+                # A reset is empty only after a poll confirms it.
                 pct_state="ok"
                 if [ -n "$iso" ] && [ "$iso" != "null" ]; then
                     ep=$(iso_to_epoch "$iso")
                     if [ -n "$ep" ]; then
                         if [ "$ep" -le "$now_ar" ]; then
-                            # Reset elapsed. The new window started at 0% — but
-                            # only if the elapsed reset is the MOST RECENT one
-                            # (within ~5h of now). If it's older than that, the
-                            # account has been idle for many windows and we
-                            # have no signal for the current one — unknown.
-                            since_reset=$(( now_ar - ep ))
-                            if [ "$since_reset" -le 18000 ]; then
+                            if [ -n "$last_seen_ts" ] && [ "$last_seen_ts" -ge "$ep" ] 2>/dev/null; then
                                 pct_state="reset"
                             else
-                                pct_state="unknown"
+                                pct_state="pending"
                             fi
                         fi
                         while [ "$ep" -le "$((now_ar + 30))" ]; do
@@ -1640,7 +1690,11 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     fi
                 fi
                 tag=$(resolve_account_label "$em" "$uuid")
-                account_label_is_excluded "$tag" && continue
+                if account_label_is_excluded "$tag"; then
+                    if [ "$_route_mode" != "set" ] || [ "$tag" != "$_route_label" ]; then
+                        continue
+                    fi
+                fi
                 parsed+="${em}|${uuid}|${tag}|${ep}|${pct}|${pct_state}|${seven_day_iso}|${weekly_pct_ledger}|${fbl_iso}|${fable_pct_ledger}|${last_seen_ts}"$'\n'
                 if [ -n "$ep" ]; then
                     if [ -z "$soonest_epoch" ] || [ "$ep" -lt "$soonest_epoch" ] 2>/dev/null; then
@@ -1653,6 +1707,13 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
             # epoch sort to the end. Epoch is field 4; row now has 8 fields.
             parsed=$(printf '%s' "$parsed" | awk -F'|' 'NF>=8 { key=($4==""?"9999999999":$4); print key"\t"$0 }' | sort -n | cut -f2-)
 
+            _best_key=""
+            _best_binding=""
+            _best_five=""
+            _best_fable=""
+            _best_label=""
+            printf -v _rate_cap_rank '%020.12f' 80
+            printf -v _fable_cap_rank '%020.12f' 95
             while IFS='|' read -r em uuid tag ep pct pct_state seven_day_iso weekly_pct_ledger fbl_iso fable_pct_ledger last_seen_ts; do
                 [ -z "$em" ] && continue
                 # Match the active account on (email, org_uuid). Legacy ledger
@@ -1712,21 +1773,27 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 else
                     pct_disp="$pct"
                 fi
-                # Reset state overrides cached values: a freshly-rolled window
-                # starts at 0%, an account with no recent samples is unknown.
+                if [ -n "$ACTIVE_SESSION_LIMITS_LOOKUP" ] && \
+                   printf '%s\n' "$ACTIVE_SESSION_LIMITS_LOOKUP" | grep -qxF "${em}|${uuid}"; then
+                    pct_disp=100
+                    pct_state="ok"
+                fi
+                five_known=0
+                [ -n "$pct_disp" ] && five_known=1
+                # A post-reset poll confirms the new window started empty.
                 if [ "${pct_state:-ok}" = "reset" ]; then
                     pct_int=0
                     pct_disp="0"
+                fi
+                five_rank=""
+                if [ "$five_known" = "1" ]; then
+                    printf -v five_rank '%020.12f' "$pct_disp"
                 fi
                 pct_int=$(printf "%.0f" "$pct_disp" 2>/dev/null || echo 0)
                 pct_color=$(color_for_pct "$pct_int")
                 # Display fractional util for the current account (matches the
                 # "current" row); other accounts only have integer ledger data.
-                if [ "${pct_state:-ok}" = "unknown" ]; then
-                    pct_show="$(_pad_to_cols '—' 4)"
-                    pct_color="$dim"
-                    pct_int=0
-                elif [ "$is_current" = "1" ]; then
+                if [ "$is_current" = "1" ]; then
                     pct_show=$(fmt_pct "$pct_disp")
                 else
                     pct_show=$(printf "%d%%" "$pct_int")
@@ -1783,12 +1850,15 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 # accounts: flag a dead vaulted refresh token (needs /login to use).
                 exp_suffix=""
                 stale_suffix=""
+                if [ "${pct_state:-ok}" = "pending" ]; then
+                    stale_suffix=" ${dim}~ reset pending${reset}"
+                fi
                 # The current account's row renders live payload values (5h /
                 # weekly / fable overlays above), so the ledger's age is
                 # irrelevant for it — never tag the row you're sitting on.
                 if [ "$is_current" != "1" ] && [ -n "$last_seen_ts" ] && [ "$last_seen_ts" -gt 0 ] 2>/dev/null && \
                    [ $(( now_ar - last_seen_ts )) -gt 10800 ]; then
-                    stale_suffix=" ${dim}~ stale${reset}"
+                    stale_suffix+=" ${dim}~ stale${reset}"
                 fi
                 if [ -n "$ACCOUNTS_EXPIRED_LOOKUP" ] && \
                    printf '%s\n' "$ACCOUNTS_EXPIRED_LOOKUP" | grep -qxF "${em}|${uuid}"; then
@@ -1817,8 +1887,8 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 # Account tags appear in title-case for display (alumni /
                 # Acme) but we still key on the lowercased name for lookups.
                 # Handled in the rendering block below.
-                # extra_int still feeds the hard-wall warning + best-next score
-                # below, even though the visible column now shows weekly util.
+                # extra_int still feeds the hard-wall warning below, even
+                # though the visible column now shows weekly util.
                 if [ -n "$extra_pct" ] && [ -n "$extra_limit_cents" ] && awk "BEGIN{exit !(${extra_limit_cents:-0} > 0)}"; then
                     extra_int=$(printf "%.0f" "$extra_pct" 2>/dev/null || echo 0)
                 else
@@ -1834,8 +1904,9 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     weekly_pct_disp="$seven_day_pct_display"
                     weekly_state="ok"
                 else
-                    weekly_pct_disp="${weekly_pct_ledger:-0}"
+                    weekly_pct_disp="${weekly_pct_ledger:-}"
                     weekly_state="ok"
+                    sd_ep=""
                     if [ -n "$seven_day_iso" ] && [ "$seven_day_iso" != "null" ]; then
                         sd_ep=$(iso_to_epoch "$seven_day_iso")
                         if [ -n "$sd_ep" ] && [ "$sd_ep" -le "$now_ar" ] 2>/dev/null; then
@@ -1843,7 +1914,20 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                         fi
                     fi
                 fi
+                weekly_known=0
+                [ -n "$weekly_pct_disp" ] && weekly_known=1
+                [ "$weekly_known" = "0" ] && weekly_state="unknown"
                 weekly_int=$(printf "%.0f" "$weekly_pct_disp" 2>/dev/null || echo 0)
+                weekly_rank_value="$weekly_pct_disp"
+                if [ "$weekly_known" = "1" ] && [ -n "${sd_ep:-}" ] &&
+                   [ "$sd_ep" -le "$now_ar" ] 2>/dev/null &&
+                   [ -n "$last_seen_ts" ] && [ "$last_seen_ts" -ge "$sd_ep" ] 2>/dev/null; then
+                    weekly_rank_value=0
+                fi
+                weekly_rank=""
+                if [ "$weekly_known" = "1" ]; then
+                    printf -v weekly_rank '%020.12f' "$weekly_rank_value"
+                fi
                 # Bare colored % — the header row labels the column.
                 if [ "$weekly_state" = "unknown" ]; then
                     weekly_color="$dim"
@@ -1862,10 +1946,26 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 else
                     fable_disp="${fable_pct_ledger:-}"
                 fi
+                fable_known=0
+                fable_rank_value=""
+                if [ -n "$fable_disp" ]; then
+                    fable_known=1
+                    fable_rank_value="$fable_disp"
+                fi
                 fable_state="ok"
+                fbl_ep=""
                 if [ -n "$fbl_iso" ] && [ "$fbl_iso" != "null" ]; then
                     fbl_ep=$(iso_to_epoch "$fbl_iso")
                     [ -n "$fbl_ep" ] && [ "$fbl_ep" -le "$now_ar" ] 2>/dev/null && fable_state="unknown"
+                fi
+                if [ "$fable_known" = "1" ] && [ -n "$fbl_ep" ] &&
+                   [ "$fbl_ep" -le "$now_ar" ] 2>/dev/null &&
+                   [ -n "$last_seen_ts" ] && [ "$last_seen_ts" -ge "$fbl_ep" ] 2>/dev/null; then
+                    fable_rank_value=0
+                fi
+                fable_rank=""
+                if [ "$fable_known" = "1" ]; then
+                    printf -v fable_rank '%020.12f' "$fable_rank_value"
                 fi
                 if [ "$fable_state" = "unknown" ] || [ -z "$fable_disp" ]; then
                     fable_color="$dim"; fb_raw="—"; fable_int=""
@@ -1886,21 +1986,15 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
 
                 # Row note: one of (in priority order)
                 #   ⚠ hard wall  — 5h≥90% AND extra≥99% AND not resetting soon
-                #   ✓ use now    — best non-current candidate under the same
-                #                  scoring model as plan CLI
+                #   ✓ use now    — next account selected by the router
                 #   → resets Xh  — a reset lands within 2h (windfall)
                 #   (blank)      — unremarkable
                 note=""
-                # Runway is gated by the WORST window a session must clear: 5h +
-                # 7d always, + fable in fable mode (accounts.py binding_pct).
-                binding_int="$pct_int"
-                [ "${weekly_int:-0}" -gt "$binding_int" ] 2>/dev/null && binding_int="$weekly_int"
-                if [ "$_route_mode" = "fable" ] && [ -n "${fable_int:-}" ] && \
-                   [ "$fable_int" -gt "$binding_int" ] 2>/dev/null; then
-                    binding_int="$fable_int"
+                binding_rank="$five_rank"
+                if [ "$five_known" = "1" ] && [ "$weekly_known" = "1" ] &&
+                   _account_rank_precedes "$binding_rank" "$weekly_rank"; then
+                    binding_rank="$weekly_rank"
                 fi
-                headroom=$(( 100 - binding_int ))
-                extra_headroom=$(( 100 - extra_int ))
                 has_wall=0
                 if [ "$pct_int" -ge 90 ] 2>/dev/null && [ "$extra_int" -ge 99 ] 2>/dev/null; then
                     if [ -z "$_hrs_to_reset" ] || awk "BEGIN{exit !($_hrs_to_reset > 1.0)}"; then
@@ -1909,30 +2003,64 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     fi
                 fi
 
-                # Score = binding headroom + 0.5×extra + 5h-reset windfall; the
-                # windfall only when 5h binds (a 5h reset can't restore 7d/fable).
-                windfall=0
-                if [ "$binding_int" -eq "$pct_int" ] 2>/dev/null && [ -n "$_hrs_to_reset" ]; then
-                    # Bonus scaled by fraction of a 2h plan horizon that lands
-                    # AFTER the reset.
-                    windfall=$(awk -v h="$_hrs_to_reset" 'BEGIN {
-                        if (h < 0 || h >= 2) print 0; else printf "%d", 100*(2-h)/2
-                    }')
-                fi
-                score=$(( headroom + extra_headroom / 2 + windfall ))
-                [ "$has_wall" = "1" ] && score=0
-                # 95 mirrors the router's eligibility caps (RATE_CAP_PCT/FABLE_CAP_PCT).
-                [ "$binding_int" -ge 95 ] 2>/dev/null && score=0
-                [ -n "$exp_suffix" ] && score=0
-                # Fable mode can't rank an unknown fable axis (mirrors fable_eligible).
-                if [ "$_route_mode" = "fable" ] && [ -z "${fable_int:-}" ]; then
-                    score=0
+                candidate_eligible=0
+                if [ "$_route_mode" = "set" ]; then
+                    if [ -n "$_route_label" ] && [ "$tag" = "$_route_label" ] &&
+                       [ -z "$exp_suffix" ]; then
+                        candidate_eligible=1
+                    fi
+                else
+                    candidate_eligible=1
+                    if [ "$five_known" = "0" ] || [ "$weekly_known" = "0" ] ||
+                       ! _account_rank_precedes "$five_rank" "$_rate_cap_rank" ||
+                       ! _account_rank_precedes "$weekly_rank" "$_rate_cap_rank" ||
+                       [ -n "$exp_suffix" ]; then
+                        candidate_eligible=0
+                    fi
+                    if [ "$_route_mode" = "fable" ] &&
+                       { [ "$fable_known" = "0" ] ||
+                         ! _account_rank_precedes "$fable_rank" "$_fable_cap_rank"; }; then
+                        candidate_eligible=0
+                    fi
                 fi
 
-                # Track best non-current account for the "✓ use now" marker.
-                if [ "$is_current" = "0" ] && [ "$score" -gt "${_best_score:-0}" ]; then
-                    _best_score=$score
-                    _best_key="${em}${_US}${uuid}"
+                if [ "$is_current" = "0" ] && [ "$candidate_eligible" = "1" ]; then
+                    candidate_is_better=0
+                    compare_general_rank=1
+                    if [ -z "$_best_key" ]; then
+                        candidate_is_better=1
+                        compare_general_rank=0
+                    elif [ "$_route_mode" = "fable" ] &&
+                         _account_rank_precedes "$fable_rank" "$_best_fable"; then
+                        candidate_is_better=1
+                        compare_general_rank=0
+                    elif [ "$_route_mode" = "fable" ] &&
+                         _account_rank_precedes "$_best_fable" "$fable_rank"; then
+                        compare_general_rank=0
+                    fi
+                    if [ "$compare_general_rank" = "1" ] &&
+                       _account_rank_precedes "$binding_rank" "$_best_binding"; then
+                        candidate_is_better=1
+                    elif [ "$compare_general_rank" = "1" ] &&
+                         _account_rank_precedes "$_best_binding" "$binding_rank"; then
+                        candidate_is_better=0
+                    elif [ "$compare_general_rank" = "1" ] &&
+                         _account_rank_precedes "$five_rank" "$_best_five"; then
+                        candidate_is_better=1
+                    elif [ "$compare_general_rank" = "1" ] &&
+                         _account_rank_precedes "$_best_five" "$five_rank"; then
+                        candidate_is_better=0
+                    elif [ "$compare_general_rank" = "1" ] &&
+                         _account_rank_precedes "$tag" "$_best_label"; then
+                        candidate_is_better=1
+                    fi
+                    if [ "$candidate_is_better" = "1" ]; then
+                        _best_key="${em}${_US}${uuid}"
+                        _best_binding="$binding_rank"
+                        _best_five="$five_rank"
+                        _best_fable="${fable_rank:-}"
+                        _best_label="$tag"
+                    fi
                 fi
 
                 # 5h reset as relative time — the header labels the column;
@@ -1968,19 +2096,11 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 else
                     wk_reset_rel="—"
                 fi
-                if [ "${pct_state:-ok}" = "unknown" ]; then
-                    # Window rolled over since the last poll, so this % is last-known,
-                    # not current — show it dimmed rather than blanking to —, so a
-                    # burned account stays visible (the "~ stale" suffix flags it's not live).
-                    _last_int=$(printf "%.0f" "$pct" 2>/dev/null || echo 0)
-                    if [ "$_last_int" -gt 0 ] 2>/dev/null; then
-                        pct_raw="${_last_int}%"
-                        pct_color="$dim"
-                    else
-                        pct_raw="—"
-                    fi
-                else
+                if [ "$five_known" = "1" ]; then
                     pct_raw="${pct_int}%"
+                else
+                    pct_raw="—"
+                    pct_color="$dim"
                 fi
                 # Weekly-capped accounts are unusable regardless of 5h state — dim the name.
                 name_color="$white"
@@ -2151,7 +2271,7 @@ if [ -n "$_routed_label" ]; then
             set)
                 _pin_target=$(jq -r '.label // ""' "$_mode_file" 2>/dev/null)
                 if [ -n "$_pin_target" ] && [ "$_pin_target" != "$_routed_label" ]; then
-                    _rlabel="pin ${_pin_target} bypassed"
+                    _rlabel="set ${_pin_target} pending"
                 else
                     _rlabel="pinned"
                 fi
@@ -2518,7 +2638,7 @@ render_iterm2() {
     # Detect terminal
     if [ -n "$ITERM_SESSION_ID" ]; then
         # Push structured data to iTerm2 status bar components
-        emit_iterm2_var "claude_model" "${MODEL}${effort_val:+.${effort_val}}"
+        emit_iterm2_var "claude_model" "${MODEL}${effort_label:+.${effort_label}}"
         emit_iterm2_var "claude_cost" "\$${COST_FMT}${DAILY_SUFFIX:+ ($DAILY_FMT/d)}"
         emit_iterm2_var "claude_ctx" "ctx:${CONTEXT_INT}%"
 

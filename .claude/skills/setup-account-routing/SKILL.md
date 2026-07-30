@@ -1,14 +1,14 @@
 ---
 name: setup-account-routing
-description: Set up native-profile multi-account routing for Claude Code — account labels, isolated config profiles, headroom selection, and the zsh wrapper.
+description: Set up native-profile multi-account routing for Claude Code — account labels, isolated config profiles, quota-aware live handoffs, and the supervised launcher.
 ---
 
 # Setup: account routing (accounts)
 
 Multi-account routing for Claude Code. Each account gets an isolated native
-`CLAUDE_CONFIG_DIR`; new sessions choose a profile by headroom while running
-sessions keep their selected account. Run `/setup-statusline` first — both tools
-share `~/.claude/statusline.conf`.
+`CLAUDE_CONFIG_DIR`. The supervisor chooses by quota headroom and resumes the
+same conversation under another profile when the active account is blocked.
+Run `/setup-statusline` first — both tools share `~/.claude/statusline.conf`.
 
 ## Hard rules
 
@@ -32,16 +32,23 @@ share `~/.claude/statusline.conf`.
    Labels must match the email address shown by Claude. Same email in two
    organizations requires `|org-uuid` suffixes.
 
-2. **Install the CLI:**
+2. **Install the supervised launcher:**
 
    ```bash
-   ln -sf "$REPO/bin/accounts.py" ~/.local/bin/accounts
+   cd "$REPO"
+   ./install-account-router.sh
+   export PATH="$HOME/.accounts/bin:$PATH"
    ```
 
-3. **Seed each account into the store.** Bypass the wrapper with `command claude`,
-   `/login` as the account, exit Claude, then run:
+   The installer keeps the native Claude binary at `~/.local/bin/claude`, links
+   the router tools under `~/.local/bin`, and places the supervised `claude`
+   launcher first on `PATH`.
+
+3. **Seed each account into the store.** Run the native binary directly, `/login`
+   as the account, exit Claude, then run:
 
    ```bash
+   ~/.local/bin/claude
    accounts status
    ```
 
@@ -49,54 +56,22 @@ share `~/.claude/statusline.conf`.
    login into `~/.accounts/blobs.json`; routed launches subsequently keep refreshed
    credentials synchronized from their native profiles.
 
-4. **Add the launch wrapper** to `~/.zshrc`:
-
-   ```zsh
-   # >>> accounts auto-route (native profiles) >>>
-   claude() {
-     local _bin _env _mode _k
-     _bin="$(whence -p claude)" || { print -u2 "claude binary not found"; return 127; }
-     case " $* " in
-       *" -p "*|*" --print "*|*" --version "*|*" --help "*|*" setup-token "*|*" -c "*|*" --continue "*|*" --resume "*)
-         _env="$("$HOME/.local/bin/accounts" pick-env 2>/dev/null)" || _env=""
-         ( [ -n "$_env" ] && eval "$_env"; exec "$_bin" "$@" )
-         return $? ;;
-     esac
-     _mode="start"
-     while true; do
-       _env="$("$HOME/.local/bin/accounts" pick-env 2>/dev/null)" || _env=""
-       ( [ -n "$_env" ] && eval "$_env"
-         [ -n "${ACCOUNTS_ROUTED_LABEL:-}" ] && print -u2 "accounts → $ACCOUNTS_ROUTED_LABEL"
-         if [ "$_mode" = "start" ]; then exec "$_bin" "$@"; else exec "$_bin" --continue; fi )
-       printf 'accounts: [Enter] resume this conversation on the freshest account · anything else quits  '
-       _k=""
-       read -t 5 -k 1 _k 2>/dev/null || _k="q"
-       printf '\n'
-       case "$_k" in
-         $'\n'|$'') _mode="continue" ;;
-         *) break ;;
-       esac
-     done
-   }
-   # <<< accounts auto-route <<<
-   ```
-
-   Pin one launch with `ACCOUNTS_PIN=<label> claude`. If no account is eligible,
-   the wrapper clears inherited routing variables and Claude uses its default
-   native login.
-
-5. **Pick a mode:**
+4. **Pick a mode:**
 
    ```bash
-   accounts auto           # each new session uses the freshest account
-   accounts fable          # prefer a Fable-capable account
-   accounts set <label>    # pin new sessions
+   accounts auto           # route supervised sessions by general quota headroom
+   accounts fable          # switch live supervised sessions by Fable, weekly, and 5h headroom
+   accounts set <label>    # force every supervised session to this account
    ```
 
-   Mode changes affect new and restarted sessions. Running sessions keep their
-   current profile; exit and resume to reroute the conversation.
+   Mode changes are detected by running supervisors. Handoffs preserve the exact
+   session ID and do not return control to the shell. Source changes to either
+   router module reload the supervisor in place. New launches default to
+   ultracode effort and an invisible Claude session name unless explicitly set.
 
-6. **Optional headless-job tokens:**
+   Pin one launch with `ACCOUNTS_PIN=<label> claude`.
+
+5. **Optional headless-job tokens:**
 
    ```bash
    accounts mint <label>
@@ -122,4 +97,5 @@ ACCOUNTS_PIN=<label> accounts pick-env
 2. `accounts auto` releases a persistent pin.
 3. `accounts poll` refreshes the headroom board; `accounts refresh <label>`
    refreshes an expired access token.
-4. Exit and resume the Claude session after changing modes.
+4. `accounts status` reports a forced `set` target even when its cached quota is
+   exhausted; the runtime follows the same rule.
