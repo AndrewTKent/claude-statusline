@@ -297,8 +297,8 @@ the router tools under `~/.local/bin`, and prepends a supervised launcher from
 | `accounts set <label>` | Force every supervised session onto `<label>` |
 | `accounts auto` | Route supervised sessions to the freshest account |
 | `accounts fable` | Switch live supervised sessions to Fable while headroom is available |
-| `accounts status` | Mode + per-account 5h headroom + ⚠login flags |
-| `accounts poll` | Refresh dormant file-backed profiles, then poll every routable account |
+| `accounts status` | Mode + per-account 5h/7d/Fable headroom + ⚠login flags |
+| `accounts poll` | Refresh dormant stored/native profiles, then poll every routable account |
 | `accounts refresh [label]` | Refresh stale file-backed credentials without a browser |
 | `accounts mint <label>` | Mint + vault a 1-year token for headless jobs |
 | `accounts tokens` | List minted tokens and expiry |

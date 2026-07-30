@@ -177,6 +177,64 @@ def test_mark_session_limit_quarantines_stale_usage_until_reset(
     assert rows[0]["five_hour"] == 100.0
 
 
+def test_mark_fable_limit_only_quarantines_fable_until_its_reset(
+    tmp_path,
+    monkeypatch,
+):
+    resets_path = tmp_path / "account-resets.json"
+    limits_path = tmp_path / "session-limits.json"
+    resets_path.write_text(
+        json.dumps(
+            {
+                "work@example.com|org-work": {
+                    "email": "work@example.com",
+                    "org_uuid": "org-work",
+                    "five_hour_pct": 15.0,
+                    "seven_day_pct": 50.0,
+                    "fable_pct": 65.0,
+                    "fable_reset": "2026-07-30T09:20:00+00:00",
+                    "last_seen": 1_785_381_600.0,
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(accounts, "RESETS_PATH", resets_path)
+    monkeypatch.setattr(accounts, "SESSION_LIMITS_PATH", limits_path)
+    monkeypatch.setattr(accounts, "LOCK_PATH", tmp_path / "accounts.lock")
+    monkeypatch.setattr(accounts, "_lock_depth", 0)
+
+    accounts.mark_fable_limit(
+        "work@example.com",
+        "org-work",
+        now_ts=1_785_381_600.0,
+    )
+
+    block = json.loads(limits_path.read_text())[
+        "work@example.com|org-work|fable"
+    ]
+    assert block == {
+        "detected_at": 1_785_381_600.0,
+        "expires_at": 1_785_403_200.0,
+    }
+    rows = accounts.route_rows(
+        {
+            "accounts": {
+                "work": {
+                    "blob": _live_blob("work"),
+                    "email": "work@example.com",
+                    "org_uuid": "org-work",
+                }
+            }
+        },
+        None,
+        1_785_381_700.0,
+    )
+
+    assert rows[0]["five_hour"] == 15.0
+    assert rows[0]["seven_day"] == 50.0
+    assert rows[0]["fable"] == 100.0
+
+
 def test_cli_help_describes_hard_force_and_live_supervision(monkeypatch, capsys):
     monkeypatch.setattr(accounts, "retire_legacy_route_agent", lambda: None)
 
@@ -187,6 +245,7 @@ def test_cli_help_describes_hard_force_and_live_supervision(monkeypatch, capsys)
     output = capsys.readouterr().out
     assert "force every supervised session onto <label>" in output
     assert "route supervised sessions to the freshest account" in output
+    assert "5h/7d/fable headroom" in output
     assert "prefer <label> while quota is safe" not in output
     assert "route new sessions" not in output
 
@@ -313,6 +372,27 @@ class TestPickProfileRoute:
             require_fable=True,
             force_pin=True,
         ) is None
+
+    def test_automatic_route_skips_stale_usage(self):
+        rows = [
+            accounts_row("stale", 1.0, stale=True),
+            accounts_row("fresh", 20.0),
+        ]
+
+        assert accounts.pick_profile_route(rows, set(), None) == "fresh"
+
+    def test_forced_pin_ignores_stale_usage(self):
+        rows = [
+            accounts_row("fresh", 5.0),
+            accounts_row("stale", 100.0, stale=True),
+        ]
+
+        assert accounts.pick_profile_route(
+            rows,
+            set(),
+            "stale",
+            force_pin=True,
+        ) == "stale"
 
 
 class TestSessionRouting:
@@ -452,6 +532,58 @@ class TestSessionRouting:
 
         assert selected["label"] == "general"
 
+    def test_forced_label_can_reuse_a_stale_live_profile(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        blobs = {
+            "accounts": {
+                "current": {
+                    "blob": _live_blob("current"),
+                    "email": "current@x",
+                    "org_uuid": "org-current",
+                }
+            }
+        }
+        rows = [
+            accounts_row(
+                "current",
+                20.0,
+                seven_day=20.0,
+                stale=True,
+            )
+        ]
+        monkeypatch.setattr(accounts, "locked", nullcontext)
+        monkeypatch.setattr(accounts, "load_blobs", lambda: blobs)
+        monkeypatch.setattr(
+            accounts,
+            "sync_profile_credentials",
+            lambda *_args, **_kwargs: set(),
+        )
+        monkeypatch.setattr(
+            accounts,
+            "load_mode",
+            lambda: {"mode": "fable", "label": None},
+        )
+        monkeypatch.setattr(accounts, "route_rows", lambda *_args: list(rows))
+        monkeypatch.setattr(accounts, "load_session_leases", lambda: [])
+        monkeypatch.setattr(accounts, "verify_entry_auth", lambda *_args: "ok")
+        monkeypatch.setattr(
+            accounts,
+            "ensure_native_profile",
+            lambda label, _entry: tmp_path / label,
+        )
+        monkeypatch.setattr(accounts, "excluded_labels", set)
+
+        selected = accounts.select_profile(
+            require_fable=False,
+            prefer_fable=False,
+            force_label="current",
+        )
+
+        assert selected["label"] == "current"
+
 
 class TestHandoffTarget:
     def _wire(self, monkeypatch, rows, *, mode="auto", label=None):
@@ -477,6 +609,32 @@ class TestHandoffTarget:
             "first",
             require_fable=False,
         ) == "second"
+
+    def test_stale_current_fable_hands_off_to_a_fresh_candidate(
+        self,
+        monkeypatch,
+    ):
+        rows = [
+            accounts_row(
+                "current",
+                10.0,
+                seven_day=10.0,
+                fable=10.0,
+                stale=True,
+            ),
+            accounts_row(
+                "fresh",
+                20.0,
+                seven_day=20.0,
+                fable=20.0,
+            ),
+        ]
+        self._wire(monkeypatch, rows)
+
+        assert accounts.handoff_target(
+            "current",
+            require_fable=True,
+        ) == "fresh"
 
     def test_set_mode_moves_to_exhausted_target(self, monkeypatch):
         rows = [
@@ -662,9 +820,18 @@ class TestAccountEligibility:
         assert [r["label"] for r in rows] == ["B", "A"]
 
 
-def accounts_row(label, five_hour, expired=False, active=False, fable=0.0, seven_day=0.0):
+def accounts_row(
+    label,
+    five_hour,
+    expired=False,
+    active=False,
+    fable=0.0,
+    seven_day=0.0,
+    stale=False,
+):
     return {"label": label, "email": f"{label}@x", "five_hour": five_hour,
-            "seven_day": seven_day, "fable": fable, "expired": expired, "active": active}
+            "seven_day": seven_day, "fable": fable, "expired": expired,
+            "active": active, "stale": stale}
 
 
 class TestUsageMapping:
@@ -735,19 +902,24 @@ class TestRefreshDormantProfiles:
             "write_profile_credentials",
             lambda label, blob: writes.append((label, blob)),
         )
+        monkeypatch.setattr(accounts, "load_blobs", lambda: blobs)
         monkeypatch.setattr(accounts, "save_blobs", lambda value: None)
 
-        assert accounts.refresh_dormant_profiles(blobs) == 1
+        assert accounts.refresh_dormant_profiles() == 1
         assert blobs["accounts"]["gmail"]["blob"] == new
         assert writes == [("gmail", new)]
 
-    def test_skips_dormant_keychain_profiles(self, monkeypatch):
+    def test_refreshes_dormant_keychain_profiles_inside_native_claude(
+        self,
+        monkeypatch,
+    ):
         old = self._expired_access_blob("old")
         blobs = {
             "accounts": {
                 "work": {"blob": old, "email": "w@x", "org_uuid": "o1"}
             }
         }
+        native_refreshes = []
         monkeypatch.setattr(accounts.time, "time", lambda: 2_000.0)
         monkeypatch.setattr(accounts, "load_session_leases", list)
         monkeypatch.setattr(accounts, "excluded_labels", set)
@@ -763,8 +935,220 @@ class TestRefreshDormantProfiles:
             "refresh_blob_access",
             lambda _blob: pytest.fail("rotated a keychain-owned credential"),
         )
+        monkeypatch.setattr(
+            accounts,
+            "refresh_keychain_profiles",
+            lambda labels, _now: native_refreshes.append(labels) or len(labels),
+        )
+        monkeypatch.setattr(accounts, "load_blobs", lambda: blobs)
 
-        assert accounts.refresh_dormant_profiles(blobs) == 0
+        assert accounts.refresh_dormant_profiles() == 1
+        assert native_refreshes == [["work"]]
+
+    def test_native_refresh_uses_a_zero_worker_transient_daemon(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        old = self._expired_access_blob("old")
+        new = _live_blob("new")
+        live = {"blob": old}
+        launches = []
+        json_paths = []
+        process_events = []
+
+        class Process:
+            pid = 123
+
+            def poll(self):
+                process_events.append("poll")
+                return None
+
+            def terminate(self):
+                pytest.fail("terminated Claude during native credential refresh")
+
+            def wait(self, timeout=None):
+                pytest.fail("waited for the daemon's 50-second idle timeout")
+
+            def kill(self):
+                pytest.fail("killed Claude during native credential refresh")
+
+        def launch(command, **kwargs):
+            json_path = Path(command[command.index("--json-path") + 1])
+            assert not json_path.exists()
+            json_paths.append(json_path)
+            launches.append((command, kwargs))
+            live["blob"] = new
+            return Process()
+
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "must-not-leak")
+        monkeypatch.setattr(
+            accounts,
+            "native_claude_binary",
+            lambda: "/native/claude",
+        )
+        monkeypatch.setattr(
+            accounts,
+            "native_profile_refresh_supported",
+            lambda _binary: True,
+        )
+        monkeypatch.setattr(
+            accounts,
+            "native_profile_path",
+            lambda label: tmp_path / "profiles" / label,
+        )
+        monkeypatch.setattr(
+            accounts,
+            "profile_live_blob",
+            lambda _label: live["blob"],
+        )
+        monkeypatch.setattr(accounts.subprocess, "Popen", launch)
+
+        assert accounts.refresh_keychain_profiles(["work"]) == 1
+        assert launches[0][0][:4] == [
+            "/native/claude",
+            "daemon",
+            "run",
+            "--origin",
+        ]
+        assert launches[0][1]["env"]["CLAUDE_CONFIG_DIR"] == str(
+            tmp_path / "profiles" / "work"
+        )
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in launches[0][1]["env"]
+        assert launches[0][1]["stdin"] is subprocess.DEVNULL
+        assert launches[0][1]["stdout"] is subprocess.DEVNULL
+        assert launches[0][1]["stderr"] is subprocess.DEVNULL
+        assert launches[0][1]["start_new_session"] is True
+        assert len(launches[0][1]["pass_fds"]) == 1
+        assert json_paths[0].parent.exists()
+        assert process_events == ["poll"]
+
+    def test_native_refresh_lock_remains_held_by_the_daemon(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(
+            accounts,
+            "NATIVE_REFRESH_LOCK_PATH",
+            tmp_path / "native-refresh.lock",
+        )
+
+        with accounts.try_native_refresh_lock() as lock:
+            assert lock is not None
+            child = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import time; time.sleep(0.2)",
+                ],
+                pass_fds=(lock.fileno(),),
+            )
+
+        with accounts.try_native_refresh_lock() as overlap:
+            assert overlap is None
+
+        child.wait(timeout=2)
+        with accounts.try_native_refresh_lock() as available:
+            assert available is not None
+
+    def test_dormant_refresh_reloads_the_store_before_saving(
+        self,
+        monkeypatch,
+    ):
+        old = self._expired_access_blob("old")
+        current = {
+            "accounts": {
+                "work": {"blob": old, "email": "w@x", "org_uuid": "o1"},
+                "added": {
+                    "blob": _live_blob("added"),
+                    "email": "a@x",
+                    "org_uuid": "o2",
+                },
+            }
+        }
+        saved = []
+        monkeypatch.setattr(accounts.time, "time", lambda: 2_000.0)
+        monkeypatch.setattr(accounts, "load_blobs", lambda: current)
+        monkeypatch.setattr(accounts, "load_session_leases", list)
+        monkeypatch.setattr(accounts, "excluded_labels", set)
+        monkeypatch.setattr(
+            accounts,
+            "profile_live_blob",
+            lambda label: old if label == "work" else _live_blob("added"),
+        )
+        monkeypatch.setattr(accounts, "kc_read", lambda *_args: None)
+        monkeypatch.setattr(
+            accounts,
+            "refresh_blob_access",
+            lambda _blob: _live_blob("new"),
+        )
+        monkeypatch.setattr(accounts, "write_profile_credentials", lambda *_args: None)
+        monkeypatch.setattr(
+            accounts,
+            "save_blobs",
+            lambda blobs: saved.append(json.loads(json.dumps(blobs))),
+        )
+
+        assert accounts.refresh_dormant_profiles() == 1
+        assert set(saved[0]["accounts"]) == {"work", "added"}
+
+    @pytest.mark.parametrize(
+        ("version", "help_text", "expected"),
+        [
+            (
+                "2.1.219 (Claude Code)",
+                "run [json-path] --json-path <p> --log-file <p>",
+                False,
+            ),
+            ("2.1.220 (Claude Code)", "run [json-path] --json-path <p>", False),
+            (
+                "2.1.220 (Claude Code)",
+                "run [json-path] --json-path <p> --log-file <p>",
+                True,
+            ),
+        ],
+    )
+    def test_native_refresh_gate_checks_version_and_daemon_contract(
+        self,
+        version,
+        help_text,
+        expected,
+        monkeypatch,
+    ):
+        responses = [
+            types.SimpleNamespace(returncode=0, stdout=version, stderr=""),
+            types.SimpleNamespace(returncode=0, stdout=help_text, stderr=""),
+        ]
+        monkeypatch.setattr(
+            accounts.subprocess,
+            "run",
+            lambda *_args, **_kwargs: responses.pop(0),
+        )
+
+        assert accounts.native_profile_refresh_supported("/native/claude") is expected
+
+    def test_native_refresh_is_disabled_when_the_daemon_contract_is_unknown(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(
+            accounts,
+            "native_claude_binary",
+            lambda: "/native/claude",
+        )
+        monkeypatch.setattr(
+            accounts,
+            "native_profile_refresh_supported",
+            lambda _binary: False,
+        )
+        monkeypatch.setattr(
+            accounts.subprocess,
+            "Popen",
+            lambda *_args, **_kwargs: pytest.fail("launched an unsupported daemon"),
+        )
+
+        assert accounts.refresh_keychain_profiles(["work"]) == 0
 
     def test_manual_refresh_does_not_rotate_keychain_credentials(
         self,
@@ -815,14 +1199,32 @@ class TestRefreshDormantProfiles:
             "refresh_blob_access",
             lambda _blob: pytest.fail("refreshed an unavailable profile"),
         )
+        monkeypatch.setattr(accounts, "load_blobs", lambda: blobs)
 
-        assert accounts.refresh_dormant_profiles(blobs) == 0
+        assert accounts.refresh_dormant_profiles() == 0
 
     def test_poll_refreshes_dormant_profiles_first(self, monkeypatch, capsys):
-        blobs = {"accounts": {}}
+        before = {"accounts": {"before": {}}}
+        after = {"accounts": {"after": {}}}
+        snapshots = iter([before, after])
         calls = []
-        monkeypatch.setattr(accounts, "locked", lambda blocking=True: nullcontext())
-        monkeypatch.setattr(accounts, "load_blobs", lambda: blobs)
+        lock_depth = 0
+
+        class TrackingLock:
+            def __enter__(self):
+                nonlocal lock_depth
+                lock_depth += 1
+
+            def __exit__(self, *_args):
+                nonlocal lock_depth
+                lock_depth -= 1
+
+        monkeypatch.setattr(
+            accounts,
+            "locked",
+            lambda blocking=True: TrackingLock(),
+        )
+        monkeypatch.setattr(accounts, "load_blobs", lambda: next(snapshots))
         monkeypatch.setattr(
             accounts,
             "sync_profile_credentials",
@@ -831,7 +1233,11 @@ class TestRefreshDormantProfiles:
         monkeypatch.setattr(
             accounts,
             "refresh_dormant_profiles",
-            lambda value: calls.append(("refresh", value)) or 2,
+            lambda: (
+                pytest.fail("poll held the accounts lock during native refresh")
+                if lock_depth
+                else calls.append(("refresh",)) or 2
+            ),
         )
         monkeypatch.setattr(
             accounts,
@@ -841,7 +1247,7 @@ class TestRefreshDormantProfiles:
 
         accounts.cmd_poll(types.SimpleNamespace())
 
-        assert calls == [("refresh", blobs), ("poll", blobs)]
+        assert calls == [("refresh",), ("poll", after)]
         assert "refreshed usage for 4 account(s)" in capsys.readouterr().out
 
 
@@ -1086,6 +1492,26 @@ class TestCmdSet:
         with pytest.raises(SystemExit):
             accounts.cmd_set(types.SimpleNamespace(label="B"))
         assert not accounts.MODE_PATH.exists()
+
+    def test_refuses_a_server_rejected_login(self, tmp_path, monkeypatch, capsys):
+        self._paths(tmp_path, monkeypatch)
+        rejected = {"blob": _live_blob("a"), "auth_dead_at": 1}
+        monkeypatch.setattr(
+            accounts,
+            "load_blobs",
+            lambda: {"accounts": {"B": rejected}},
+        )
+        monkeypatch.setattr(
+            accounts,
+            "sync_profile_credentials",
+            lambda *_args, **_kwargs: set(),
+        )
+
+        with pytest.raises(SystemExit):
+            accounts.cmd_set(types.SimpleNamespace(label="B"))
+
+        assert not accounts.MODE_PATH.exists()
+        assert "login is unusable" in capsys.readouterr().err
 
     def test_pins_native_profile_without_touching_global_credentials(self, tmp_path, monkeypatch):
         self._paths(tmp_path, monkeypatch)
@@ -1700,11 +2126,11 @@ class TestRouteRowsStale:
         assert by_label["fresh"]["stale"] is False
         assert by_label["old"]["stale"] is True
 
-    def test_stale_false_when_never_seen(self, monkeypatch):
+    def test_missing_last_seen_is_stale(self, monkeypatch):
         monkeypatch.setattr(accounts, "load_resets", lambda: {})
         blobs = {"accounts": {"gmail": {"blob": _live_blob("g"), "email": "g@x", "org_uuid": "o1"}}}
         rows = accounts.route_rows(blobs, None, time.time())
-        assert rows[0]["stale"] is False
+        assert rows[0]["stale"] is True
 
 
 class TestCmdPickEnv:
@@ -1729,8 +2155,13 @@ class TestCmdPickEnv:
         mode="auto",
         mode_label=None,
     ):
+        now = time.time()
+        resets = {
+            key: {"last_seen": now, **row}
+            for key, row in (resets or {}).items()
+        }
         monkeypatch.setattr(accounts, "load_blobs", lambda: {"accounts": blobs})
-        monkeypatch.setattr(accounts, "load_resets", lambda: resets or {})
+        monkeypatch.setattr(accounts, "load_resets", lambda: resets)
         monkeypatch.setattr(accounts, "excluded_labels", lambda: set(excludes))
         monkeypatch.setattr(accounts, "load_mode", lambda: {"mode": mode, "label": mode_label})
         monkeypatch.setattr(accounts, "PROFILES_PATH", tmp_path / "profiles")
@@ -2026,6 +2457,104 @@ class TestCmdLs:
 
 
 class TestStatuslineAccountBoard:
+    def test_session_limit_markers_cap_only_the_matching_column(self, tmp_path):
+        repo = Path(__file__).resolve().parent.parent
+        home = tmp_path / "home"
+        claude_dir = home / ".claude"
+        accounts_dir = home / ".accounts"
+        claude_dir.mkdir(parents=True)
+        accounts_dir.mkdir()
+        (claude_dir / "statusline.conf").write_text(
+            'SHOW_ACCOUNT_RESETS=1\n'
+            'MAX_COLS=200\n'
+            'ACCOUNT_LABELS="current:current@example.com|current-org '
+            'fable-only:fable@example.com|fable-org '
+            'session-only:session@example.com|session-org"\n'
+        )
+        now = time.time()
+        (claude_dir / "account-resets.json").write_text(
+            json.dumps(
+                {
+                    "current@example.com|current-org": {
+                        "email": "current@example.com",
+                        "org_uuid": "current-org",
+                        "five_hour_pct": 1,
+                        "seven_day_pct": 2,
+                        "fable_pct": 3,
+                        "last_seen": now,
+                    },
+                    "fable@example.com|fable-org": {
+                        "email": "fable@example.com",
+                        "org_uuid": "fable-org",
+                        "five_hour_pct": 12,
+                        "seven_day_pct": 34,
+                        "fable_pct": 56,
+                        "last_seen": now,
+                    },
+                    "session@example.com|session-org": {
+                        "email": "session@example.com",
+                        "org_uuid": "session-org",
+                        "five_hour_pct": 23,
+                        "seven_day_pct": 45,
+                        "fable_pct": 67,
+                        "last_seen": now,
+                    },
+                }
+            )
+        )
+        (accounts_dir / "session-limits.json").write_text(
+            json.dumps(
+                {
+                    "fable@example.com|fable-org|fable": {
+                        "expires_at": now + 3600,
+                    },
+                    "session@example.com|session-org": {
+                        "expires_at": now + 3600,
+                    },
+                }
+            )
+        )
+        project = tmp_path / "project"
+        project.mkdir()
+        fixture = json.loads((repo / "test/fixtures/input.json").read_text())
+        fixture["workspace"]["current_dir"] = str(project)
+        script = tmp_path / "statusline.sh"
+        script.write_text(
+            (repo / "bin/statusline.sh")
+            .read_text()
+            .replace("/tmp/claude", str(tmp_path / "cache"))
+        )
+        env = os.environ.copy()
+        env.update(
+            {
+                "HOME": str(home),
+                "TZ": "UTC",
+                "ACCOUNTS_ROUTED_LABEL": "current",
+                "ACCOUNTS_ROUTED_EMAIL": "current@example.com",
+                "ACCOUNTS_ROUTED_ORG_UUID": "current-org",
+            }
+        )
+        env.pop("CLAUDE_CONFIG_DIR", None)
+
+        result = subprocess.run(
+            ["bash", str(script)],
+            input=json.dumps(fixture),
+            text=True,
+            capture_output=True,
+            env=env,
+            check=True,
+        )
+
+        rendered = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+        fable_row = next(
+            line for line in rendered.splitlines() if "Fable-only" in line
+        )
+        session_row = next(
+            line for line in rendered.splitlines() if "Session-only" in line
+        )
+        assert re.search(r"Fable-only\s+12%.*34%\s+100%", fable_row)
+        assert re.search(r"Session-only\s+100%.*45%\s+67%", session_row)
+
     def _render_reset_row(self, tmp_path, last_seen):
         repo = Path(__file__).resolve().parent.parent
         home = tmp_path / "home"
@@ -2889,7 +3418,14 @@ class TestVerifyEntryAuth:
 
 class TestAuthDeadRouting:
     def test_route_rows_marks_flagged_entry_expired_and_pick_skips(self, monkeypatch):
-        monkeypatch.setattr(accounts, "load_resets", lambda: {})
+        monkeypatch.setattr(
+            accounts,
+            "load_resets",
+            lambda: {
+                "a@x|1": {"last_seen": NOW_TS},
+                "b@x|2": {"last_seen": NOW_TS},
+            },
+        )
         blobs = {
             "accounts": {
                 "dead": {
