@@ -1946,6 +1946,10 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 else
                     fable_disp="${fable_pct_ledger:-}"
                 fi
+                if [ -n "$ACTIVE_SESSION_LIMITS_LOOKUP" ] && \
+                   printf '%s\n' "$ACTIVE_SESSION_LIMITS_LOOKUP" | grep -qxF "${em}|${uuid}|fable"; then
+                    fable_disp=100
+                fi
                 fable_known=0
                 fable_rank_value=""
                 if [ -n "$fable_disp" ]; then

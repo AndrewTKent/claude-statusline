@@ -44,6 +44,7 @@ LIVE_SERVICE = "Claude Code-credentials"
 LOCK_PATH = HOME / ".claude" / "accounts.lock"
 RESETS_PATH = HOME / ".claude" / "account-resets.json"
 SESSION_LIMITS_PATH = HOME / ".accounts" / "session-limits.json"
+NATIVE_REFRESH_LOCK_PATH = HOME / ".accounts" / "native-refresh.lock"
 CONF_PATH = HOME / ".claude" / "statusline.conf"
 MIRROR_LOG = HOME / ".claude" / "accounts-mirror.log"
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
@@ -52,6 +53,9 @@ TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"  # public Claude Code OAuth client (PKCE, no secret)
 STALE_AFTER_S = 3 * 3600
 SESSION_LIMIT_FALLBACK_S = 5 * 3600
+NATIVE_DAEMON_MIN_VERSION = (2, 1, 220)
+NATIVE_REFRESH_WAIT_S = 5.0
+NATIVE_REFRESH_POLL_S = 0.1
 LEGACY_ROUTE_AGENT_LABEL = "com.claude-accounts-route"
 LEGACY_ROUTE_AGENT_PATH = HOME / "Library" / "LaunchAgents" / f"{LEGACY_ROUTE_AGENT_LABEL}.plist"
 
@@ -536,6 +540,33 @@ def mark_session_limit(
         )
 
 
+def mark_fable_limit(
+    email: str,
+    org_uuid: str,
+    *,
+    now_ts: float | None = None,
+) -> None:
+    with locked():
+        key = f"{email}|{org_uuid}|fable"
+        detected_at = time.time() if now_ts is None else now_ts
+        row = resets_row(load_resets(), email, org_uuid)
+        reset = parse_iso(row.get("fable_reset"))
+        expires_at = (
+            reset.timestamp()
+            if reset is not None and reset.timestamp() > detected_at
+            else detected_at + SESSION_LIMIT_FALLBACK_S
+        )
+        limits = load_session_limits(detected_at)
+        limits[key] = {
+            "detected_at": detected_at,
+            "expires_at": expires_at,
+        }
+        _write_0600(
+            SESSION_LIMITS_PATH,
+            json.dumps(limits, indent=2, sort_keys=True) + "\n",
+        )
+
+
 def load_session_limits(now_ts: float) -> dict[str, dict]:
     try:
         limits = json.loads(SESSION_LIMITS_PATH.read_text())
@@ -556,7 +587,9 @@ def cmd_poll(_args) -> None:
     with locked():
         blobs = load_blobs()
         sync_profile_credentials(blobs, persist=True)
-        refresh_dormant_profiles(blobs)
+    refresh_dormant_profiles()
+    with locked():
+        blobs = load_blobs()
     n = poll_blobs_usage(blobs)
     print(f"refreshed usage for {n} account(s)")
 
@@ -871,14 +904,25 @@ def sync_profile_credentials(blobs: dict, *, persist: bool) -> set[str]:
     return blocked_labels
 
 
-def load_mode() -> dict:
+def load_mode_snapshot() -> tuple[dict, tuple[int, int] | None]:
+    default = {"mode": "auto", "label": None}
     try:
-        m = json.loads(MODE_PATH.read_text())
-        if m.get("mode") in ("auto", "set", "fable"):
-            return m
-    except (OSError, json.JSONDecodeError):
-        pass
-    return {"mode": "auto", "label": None}
+        with MODE_PATH.open() as mode_file:
+            stat = os.fstat(mode_file.fileno())
+            try:
+                mode = json.load(mode_file)
+            except json.JSONDecodeError:
+                mode = default
+    except OSError:
+        return default, None
+    generation = (stat.st_ino, stat.st_mtime_ns)
+    if isinstance(mode, dict) and mode.get("mode") in ("auto", "set", "fable"):
+        return mode, generation
+    return default, generation
+
+
+def load_mode() -> dict:
+    return load_mode_snapshot()[0]
 
 
 def save_mode(mode: str, label: str | None) -> None:
@@ -1124,11 +1168,157 @@ def profile_live_blob(label: str) -> str | None:
         return None
 
 
-def refresh_dormant_profiles(blobs: dict) -> int:
+def native_claude_binary() -> str | None:
+    binary = Path(
+        os.environ.get("CLAUDE_REAL_BIN") or HOME / ".local/bin/claude"
+    )
+    if binary.is_file() and os.access(binary, os.X_OK):
+        return str(binary)
+    return None
+
+
+def native_profile_refresh_supported(binary: str) -> bool:
+    try:
+        version = subprocess.run(
+            [binary, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", version.stdout)
+    if (
+        version.returncode != 0
+        or match is None
+        or tuple(map(int, match.groups())) < NATIVE_DAEMON_MIN_VERSION
+    ):
+        return False
+    try:
+        help_result = subprocess.run(
+            [binary, "daemon", "run", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    help_text = help_result.stdout + help_result.stderr
+    required = ("run [json-path]", "--json-path", "--log-file")
+    return help_result.returncode == 0 and all(
+        marker in help_text for marker in required
+    )
+
+
+@contextmanager
+def try_native_refresh_lock():
+    NATIVE_REFRESH_LOCK_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        handle = open(NATIVE_REFRESH_LOCK_PATH, "w")
+    except OSError:
+        yield None
+        return
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        yield None
+        return
+    try:
+        yield handle
+    finally:
+        # Native daemons inherit this descriptor, so the lock outlives this process.
+        handle.close()
+
+
+def refresh_keychain_profiles(
+    labels: list[str],
+    now_ts: float | None = None,
+    *,
+    wait_s: float = NATIVE_REFRESH_WAIT_S,
+) -> int:
+    if not labels:
+        return 0
+    with try_native_refresh_lock() as refresh_lock:
+        if refresh_lock is None:
+            return 0
+        binary = native_claude_binary()
+        if binary is None or not native_profile_refresh_supported(binary):
+            return 0
+        now_ts = time.time() if now_ts is None else now_ts
+        before = {
+            label: profile_live_blob(label) or ""
+            for label in labels
+        }
+        processes: list[subprocess.Popen] = []
+        launched: set[str] = set()
+        for index, label in enumerate(labels):
+            fd, json_name = tempfile.mkstemp(
+                prefix=f"claude-auth-refresh-{os.getpid()}-{index}-",
+                suffix=".json",
+            )
+            os.close(fd)
+            json_path = Path(json_name)
+            json_path.unlink()
+            env = os.environ.copy()
+            for name in (
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+            ):
+                env.pop(name, None)
+            env["CLAUDE_CONFIG_DIR"] = str(native_profile_path(label))
+            try:
+                process = subprocess.Popen(
+                    [
+                        binary,
+                        "daemon",
+                        "run",
+                        "--origin",
+                        "transient",
+                        "--json-path",
+                        str(json_path),
+                        "--log-file",
+                        os.devnull,
+                    ],
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                    pass_fds=(refresh_lock.fileno(),),
+                )
+            except OSError:
+                continue
+            processes.append(process)
+            launched.add(label)
+
+        refreshed: set[str] = set()
+        deadline = time.monotonic() + wait_s
+        while launched - refreshed:
+            for label in launched - refreshed:
+                blob = profile_live_blob(label) or ""
+                expiry = blob_access_expiry(blob)
+                if blob_access_token(blob) and (
+                    blob != before[label]
+                    or (expiry is not None and expiry > now_ts)
+                ):
+                    refreshed.add(label)
+            for process in processes:
+                process.poll()
+            if not launched - refreshed or time.monotonic() >= deadline:
+                break
+            time.sleep(NATIVE_REFRESH_POLL_S)
+        return len(refreshed)
+
+
+def refresh_dormant_profiles() -> int:
     now = time.time()
     refreshed = 0
     changed = False
+    keychain_labels: list[str] = []
     with locked():
+        blobs = load_blobs()
         active_labels = {
             lease.get("label") for lease in load_session_leases()
         }
@@ -1145,6 +1335,7 @@ def refresh_dormant_profiles(blobs: dict) -> int:
             keychain_service = profile_keychain_service(label)
             keychain_blob = kc_read(keychain_service)
             if keychain_blob:
+                keychain_labels.append(label)
                 continue
             try:
                 new_blob = refresh_blob_access(blob)
@@ -1163,7 +1354,7 @@ def refresh_dormant_profiles(blobs: dict) -> int:
             changed = True
         if changed:
             save_blobs(blobs)
-    return refreshed
+    return refreshed + refresh_keychain_profiles(keychain_labels, now)
 
 
 def poll_blobs_usage(blobs: dict) -> int:
@@ -1206,6 +1397,8 @@ def route_rows(blobs: dict, active_label: str | None, now_ts: float) -> list[dic
         effs = effective_pcts(row, now_utc())
         if key in session_limits:
             effs["five_hour"] = 100.0
+        if f"{key}|fable" in session_limits:
+            effs["fable"] = 100.0
         last_seen = row.get("last_seen")
         rows.append(
             {
@@ -1216,7 +1409,7 @@ def route_rows(blobs: dict, active_label: str | None, now_ts: float) -> list[dic
                 "fable": effs["fable"],
                 "expired": entry_needs_login(e, now_ts),
                 "active": label == active_label,
-                "stale": bool(last_seen) and (now_ts - last_seen) > STALE_AFTER_S,
+                "stale": not last_seen or (now_ts - last_seen) > STALE_AFTER_S,
             }
         )
     rows.sort(
@@ -1312,6 +1505,8 @@ def pick_profile_route(
         ordered = sorted(rows, key=lambda row: row["label"] != pin)
     for row in ordered:
         if row["expired"]:
+            continue
+        if row.get("stale"):
             continue
         if row["label"] in excludes:
             continue
@@ -1551,12 +1746,16 @@ def select_profile(
     require_fable: bool = False,
     prefer_fable: bool | None = None,
     lease_pid: int | None = None,
+    force_label: str | None = None,
 ) -> dict | None:
     avoid_labels = avoid_labels or set()
     with locked():
         blobs = load_blobs()
         blocked_labels = sync_profile_credentials(blobs, persist=True)
         mode, pin, force_pin = _route_preferences()
+        if force_label is not None:
+            pin = force_label
+            force_pin = True
         rows = [
             row
             for row in route_rows(blobs, None, time.time())
@@ -1634,6 +1833,7 @@ def _profile_row_eligible(
     return bool(
         row
         and not row["expired"]
+        and not row.get("stale")
         and label not in excludes
         and _rate_eligible(row["five_hour"], row["seven_day"])
         and (
@@ -1647,15 +1847,31 @@ def _profile_row_eligible(
     )
 
 
-def profile_has_headroom(label: str, *, require_fable: bool) -> bool:
+def profile_fable_exhausted(label: str) -> bool:
     try:
         rows = route_rows(load_blobs(), label, time.time())
         row = next((candidate for candidate in rows if candidate["label"] == label), None)
-        return _profile_row_eligible(
-            row,
-            label,
-            excluded_labels(),
-            require_fable=require_fable,
+        return bool(
+            row
+            and not row.get("stale")
+            and not fable_eligible(
+                row["five_hour"],
+                row["seven_day"],
+                row["fable"],
+            )
+        )
+    except Exception:
+        return False
+
+
+def profile_general_exhausted(label: str) -> bool:
+    try:
+        rows = route_rows(load_blobs(), label, time.time())
+        row = next((candidate for candidate in rows if candidate["label"] == label), None)
+        return bool(
+            row
+            and not row.get("stale")
+            and not _rate_eligible(row["five_hour"], row["seven_day"])
         )
     except Exception:
         return False
@@ -1770,8 +1986,8 @@ def cmd_set(args) -> None:
         e = (blobs.get("accounts") or {}).get(args.label)
         if not e:
             die(f"'{args.label}' has no stored OAuth login")
-        if blob_expired(e.get("blob", ""), time.time()):
-            die(f"'{args.label}' refresh token is expired — /login it first")
+        if entry_needs_login(e, time.time()):
+            die(f"'{args.label}' login is unusable — /login it first")
         ensure_native_profile(args.label, e)
         save_mode("set", args.label)
     print(f"SET → {args.label}")
@@ -1936,7 +2152,10 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser(
         "fable", help="run supervised sessions on Fable when headroom is available"
     ).set_defaults(fn=cmd_fable)
-    sub.add_parser("status", help="mode + per-account 5h + ⚠login flags").set_defaults(fn=cmd_status)
+    sub.add_parser(
+        "status",
+        help="mode + per-account 5h/7d/fable headroom + ⚠login flags",
+    ).set_defaults(fn=cmd_status)
 
     sub.add_parser(
         "poll", help="refresh the usage board for all stored accounts now"

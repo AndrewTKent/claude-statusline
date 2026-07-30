@@ -36,9 +36,11 @@ ROUTER_INTERVAL_S = 2.0
 LEASE_HEARTBEAT_S = 5.0
 FABLE_FALLBACK_MODEL = "opus"
 DEFAULT_EFFORT = "ultracode"
-DEFAULT_SESSION_NAME = "\u2063"
+DEFAULT_SESSION_NAME = "\u200b"
+LEGACY_DEFAULT_SESSION_NAMES = {" ", "\u2063"}
 ULTRACODE_ENV = "CLAUDE_ROUTER_ULTRACODE"
 SESSION_LIMIT_TEXT = "You've hit your session limit"
+FABLE_LIMIT_TEXT = "You've reached your Fable 5 limit."
 SYNC_OUTPUT_ON = b"\x1b[?2026h"
 SYNC_OUTPUT_OFF = b"\x1b[?2026l"
 
@@ -107,12 +109,20 @@ def with_default_effort(args: list[str]) -> list[str]:
 
 
 def with_default_session_name(args: list[str]) -> list[str]:
-    if any(
-        arg in {"-n", "--name"} or arg.startswith("--name=")
-        for arg in args
-    ):
-        return list(args)
-    return [*args, "--name", DEFAULT_SESSION_NAME]
+    updated = list(args)
+    for index, arg in enumerate(updated):
+        if arg in {"-n", "--name"}:
+            if (
+                index + 1 < len(updated)
+                and updated[index + 1] in LEGACY_DEFAULT_SESSION_NAMES
+            ):
+                updated[index + 1] = DEFAULT_SESSION_NAME
+            return updated
+        if arg.startswith("--name="):
+            if arg.partition("=")[2] in LEGACY_DEFAULT_SESSION_NAMES:
+                updated[index] = f"--name={DEFAULT_SESSION_NAME}"
+            return updated
+    return [*updated, "--name", DEFAULT_SESSION_NAME]
 
 
 def replace_model_args(args: list[str], model: str) -> list[str]:
@@ -267,21 +277,24 @@ def transcript_size(path: Path | None) -> int:
         return 0
 
 
-def is_session_limit_record(record: dict) -> bool:
+def record_limit_kind(record: dict) -> str | None:
     if (
         record.get("type") != "assistant"
         or record.get("isApiErrorMessage") is not True
         or record.get("apiErrorStatus") != 429
         or record.get("error") != "rate_limit"
     ):
-        return False
+        return None
     content = (record.get("message") or {}).get("content") or []
-    return any(
-        isinstance(block, dict)
-        and block.get("type") == "text"
-        and SESSION_LIMIT_TEXT in str(block.get("text") or "")
-        for block in content
-    )
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "text":
+            continue
+        text = str(block.get("text") or "")
+        if FABLE_LIMIT_TEXT in text:
+            return "fable"
+        if SESSION_LIMIT_TEXT in text:
+            return "session"
+    return None
 
 
 def record_timestamp(record: dict) -> float | None:
@@ -299,7 +312,7 @@ def read_new_session_limit(
     offset: int,
     *,
     not_before: float | None = None,
-) -> tuple[bool, int]:
+) -> tuple[str | None, int]:
     try:
         with path.open("rb") as transcript:
             transcript.seek(min(offset, path.stat().st_size))
@@ -308,30 +321,45 @@ def read_new_session_limit(
                 record_offset = transcript.tell()
                 line = transcript.readline()
                 if not line:
-                    return False, next_offset
+                    return None, next_offset
                 if not line.endswith(b"\n"):
-                    return False, record_offset
+                    return None, record_offset
                 next_offset = transcript.tell()
                 try:
                     record = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if not isinstance(record, dict) or not is_session_limit_record(record):
+                if not isinstance(record, dict):
+                    continue
+                limit_kind = record_limit_kind(record)
+                if limit_kind is None:
                     continue
                 timestamp = record_timestamp(record)
                 if not_before is None or (
                     timestamp is not None and timestamp >= not_before
                 ):
-                    return True, next_offset
+                    return limit_kind, next_offset
     except OSError:
-        return False, offset
+        return None, offset
+
+
+def mark_detected_limit(selected: dict, limit_kind: str) -> None:
+    marker = (
+        accounts.mark_fable_limit
+        if limit_kind == "fable"
+        else accounts.mark_session_limit
+    )
+    marker(selected["email"], selected["org_uuid"])
 
 
 def session_limit_route(
     selected: dict,
     current_family: str,
+    limit_kind: str,
     router_pid: int,
 ) -> tuple[dict, str | None] | None:
+    if limit_kind == "fable" and current_family != "fable":
+        return None
     next_profile = accounts.select_profile(
         avoid_labels={selected["label"]},
         require_fable=current_family == "fable",
@@ -355,21 +383,24 @@ def session_limit_route(
         lease_pid=router_pid,
     )
     if (
-        next_profile is None
-        or next_profile["label"] == selected["label"]
+        next_profile is not None
+        and next_profile["label"] == selected["label"]
     ):
+        next_profile = None
+    if (
+        next_profile is None
+        and limit_kind == "fable"
+        and not accounts.profile_general_exhausted(selected["label"])
+    ):
+        next_profile = accounts.select_profile(
+            require_fable=False,
+            prefer_fable=False,
+            lease_pid=router_pid,
+            force_label=selected["label"],
+        )
+    if next_profile is None:
         return None
     return next_profile, fallback_model
-
-
-def source_generation() -> tuple[int, int] | None:
-    try:
-        return (
-            Path(__file__).stat().st_mtime_ns,
-            Path(accounts.__file__).stat().st_mtime_ns,
-        )
-    except OSError:
-        return None
 
 
 def set_synchronized_output(enabled: bool) -> bool:
@@ -446,11 +477,11 @@ def run_supervised(binary: str, args: list[str]) -> int:
     router_pid = os.getpid()
     state_path = Path(f"/tmp/claude/account-router-{router_pid}.json")
     interval = float(os.environ.get("ACCOUNTS_ROUTER_INTERVAL", ROUTER_INTERVAL_S))
-    loaded_generation = source_generation()
+    mode, applied_mode_generation = accounts.load_mode_snapshot()
     current_model = model_name(args)
     current_effort = option_value(args, "--effort")
     current_family = "fable" if current_model == "fable" else "general"
-    if accounts.load_mode().get("mode") == "fable" and current_family != "fable":
+    if mode.get("mode") == "fable" and current_family != "fable":
         current_model = "fable"
         current_family = "fable"
         launch_args = replace_model_args(launch_args, current_model)
@@ -500,7 +531,7 @@ def run_supervised(binary: str, args: list[str]) -> int:
             last_heartbeat = time.monotonic()
             handoff = False
             limit_route = None
-            limit_rejected = False
+            limit_rejected = None
             while child.poll() is None:
                 try:
                     time.sleep(interval)
@@ -531,21 +562,19 @@ def run_supervised(binary: str, args: list[str]) -> int:
                 if isinstance(rendered_effort, str) and rendered_effort:
                     current_effort = rendered_effort
                 if transcript_path is not None:
-                    limited, transcript_offset = read_new_session_limit(
+                    detected_limit, transcript_offset = read_new_session_limit(
                         transcript_path,
                         transcript_offset,
                         not_before=transcript_not_before,
                     )
-                    if limited and not limit_rejected:
-                        limit_rejected = True
-                        accounts.mark_session_limit(
-                            selected["email"],
-                            selected["org_uuid"],
-                        )
+                    if detected_limit is not None and limit_rejected is None:
+                        limit_rejected = detected_limit
+                        mark_detected_limit(selected, detected_limit)
                 if limit_rejected:
                     limit_route = session_limit_route(
                         selected,
                         current_family,
+                        limit_rejected,
                         router_pid,
                     )
                 now = time.monotonic()
@@ -559,51 +588,76 @@ def run_supervised(binary: str, args: list[str]) -> int:
                     last_heartbeat = now
                 if not session_id:
                     continue
-                current_generation = source_generation()
-                if (
-                    loaded_generation is not None
-                    and current_generation is not None
-                    and current_generation != loaded_generation
-                ):
-                    stop_for_handoff(child)
-                    os.execv(
-                        sys.executable,
-                        [
-                            sys.executable,
-                            str(Path(__file__).resolve()),
-                            *resume_session_args(
-                                args,
-                                session_id,
-                                current_model,
-                                current_effort,
-                            ),
-                        ],
-                    )
                 if limit_rejected:
                     if limit_route is None:
                         continue
                     next_profile, next_override = limit_route
                     next_model = next_override or current_model
-                elif (
-                    accounts.load_mode().get("mode") == "fable"
-                    and current_family != "fable"
-                ):
-                    next_profile = accounts.select_profile(
-                        require_fable=True,
-                        lease_pid=router_pid,
-                    )
-                    if next_profile is None:
-                        continue
-                    next_model = "fable"
-                    next_override = None
                 else:
-                    target = accounts.handoff_target(
-                        selected["label"],
-                        require_fable=current_family == "fable",
-                    )
-                    next_model = model_override or current_model
-                    next_override = model_override
-                    if target:
+                    mode, mode_generation = accounts.load_mode_snapshot()
+                    mode_changed = mode_generation != applied_mode_generation
+                    if (
+                        mode.get("mode") == "fable"
+                        and current_family != "fable"
+                    ):
+                        next_profile = accounts.select_profile(
+                            require_fable=True,
+                            lease_pid=router_pid,
+                        )
+                        if next_profile is None:
+                            continue
+                        next_model = "fable"
+                        next_override = None
+                    elif current_family == "fable":
+                        target = accounts.handoff_target(
+                            selected["label"],
+                            require_fable=True,
+                        )
+                        if target:
+                            next_profile = accounts.select_profile(
+                                avoid_labels={selected["label"]},
+                                require_fable=True,
+                                lease_pid=router_pid,
+                            )
+                            if (
+                                next_profile is None
+                                or next_profile["label"] != target
+                            ):
+                                continue
+                            next_model = "fable"
+                            next_override = None
+                        elif accounts.profile_fable_exhausted(
+                            selected["label"]
+                        ):
+                            next_model = os.environ.get(
+                                "ACCOUNTS_FABLE_FALLBACK_MODEL",
+                                FABLE_FALLBACK_MODEL,
+                            )
+                            next_override = next_model
+                            next_profile = accounts.select_profile(
+                                require_fable=False,
+                                prefer_fable=False,
+                                lease_pid=router_pid,
+                            )
+                            if next_profile is None:
+                                continue
+                        else:
+                            if mode_changed:
+                                applied_mode_generation = mode_generation
+                            continue
+                    elif (
+                        mode.get("mode") == "set"
+                        and mode.get("label")
+                        and mode.get("label") != selected["label"]
+                    ):
+                        target = accounts.handoff_target(
+                            selected["label"],
+                            require_fable=False,
+                        )
+                        if not target:
+                            continue
+                        next_model = model_override or current_model
+                        next_override = model_override
                         next_profile = accounts.select_profile(
                             avoid_labels={selected["label"]},
                             require_fable=current_family == "fable",
@@ -611,27 +665,12 @@ def run_supervised(binary: str, args: list[str]) -> int:
                         )
                         if next_profile is None or next_profile["label"] != target:
                             continue
-                    elif (
-                        current_family == "fable"
-                        and not accounts.profile_has_headroom(
-                            selected["label"],
-                            require_fable=True,
-                        )
-                    ):
-                        next_model = os.environ.get(
-                            "ACCOUNTS_FABLE_FALLBACK_MODEL",
-                            FABLE_FALLBACK_MODEL,
-                        )
-                        next_override = next_model
-                        next_profile = accounts.select_profile(
-                            require_fable=False,
-                            prefer_fable=False,
-                            lease_pid=router_pid,
-                        )
-                        if next_profile is None:
-                            continue
+                    elif mode_changed:
+                        applied_mode_generation = mode_generation
+                        continue
                     else:
                         continue
+                    applied_mode_generation = mode_generation
                 stop_for_handoff(child)
                 launch_args = resume_session_args(
                     args,
@@ -669,21 +708,19 @@ def run_supervised(binary: str, args: list[str]) -> int:
                 if isinstance(rendered_effort, str) and rendered_effort:
                     current_effort = rendered_effort
                 if transcript_path is not None:
-                    limited, transcript_offset = read_new_session_limit(
+                    detected_limit, transcript_offset = read_new_session_limit(
                         transcript_path,
                         transcript_offset,
                         not_before=transcript_not_before,
                     )
-                    if limited and not limit_rejected:
-                        limit_rejected = True
-                        accounts.mark_session_limit(
-                            selected["email"],
-                            selected["org_uuid"],
-                        )
+                    if detected_limit is not None and limit_rejected is None:
+                        limit_rejected = detected_limit
+                        mark_detected_limit(selected, detected_limit)
                 if limit_rejected:
                     limit_route = session_limit_route(
                         selected,
                         current_family,
+                        limit_rejected,
                         router_pid,
                     )
                 if not limit_rejected or limit_route is None:
