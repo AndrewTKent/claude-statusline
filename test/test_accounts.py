@@ -114,6 +114,83 @@ class TestEffectivePcts:
         assert accounts.effective_pcts(row, now)["fable"] == 0.0
 
 
+def test_mark_session_limit_quarantines_stale_usage_until_reset(
+    tmp_path,
+    monkeypatch,
+):
+    resets_path = tmp_path / "account-resets.json"
+    limits_path = tmp_path / "session-limits.json"
+    resets_path.write_text(
+        json.dumps(
+            {
+                "work@example.com|org-work": {
+                    "email": "work@example.com",
+                    "org_uuid": "org-work",
+                    "five_hour_pct": 15.0,
+                    "five_hour_reset": "2026-07-30T04:20:00+00:00",
+                    "seven_day_pct": 50.0,
+                    "fable_pct": 65.0,
+                    "last_seen": 100.0,
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(accounts, "RESETS_PATH", resets_path)
+    monkeypatch.setattr(accounts, "SESSION_LIMITS_PATH", limits_path)
+    monkeypatch.setattr(accounts, "LOCK_PATH", tmp_path / "accounts.lock")
+    monkeypatch.setattr(accounts, "_lock_depth", 0)
+
+    accounts.mark_session_limit(
+        "work@example.com",
+        "org-work",
+        now_ts=1_785_381_600.0,
+    )
+
+    reset_row = json.loads(resets_path.read_text())["work@example.com|org-work"]
+    assert reset_row["five_hour_pct"] == 15.0
+    block = json.loads(limits_path.read_text())["work@example.com|org-work"]
+    assert block == {
+        "detected_at": 1_785_381_600.0,
+        "expires_at": 1_785_385_200.0,
+    }
+
+    reset_row["five_hour_pct"] = 20.0
+    reset_row["last_seen"] = 1_785_381_700.0
+    resets_path.write_text(
+        json.dumps({"work@example.com|org-work": reset_row})
+    )
+    monkeypatch.setattr(accounts, "load_resets", lambda: json.loads(resets_path.read_text()))
+    rows = accounts.route_rows(
+        {
+            "accounts": {
+                "work": {
+                    "blob": _live_blob("work"),
+                    "email": "work@example.com",
+                    "org_uuid": "org-work",
+                }
+            }
+        },
+        None,
+        1_785_381_700.0,
+    )
+
+    assert rows[0]["five_hour"] == 100.0
+
+
+def test_cli_help_describes_hard_force_and_live_supervision(monkeypatch, capsys):
+    monkeypatch.setattr(accounts, "retire_legacy_route_agent", lambda: None)
+
+    with pytest.raises(SystemExit) as exit_info:
+        accounts.main(["--help"])
+
+    assert exit_info.value.code == 0
+    output = capsys.readouterr().out
+    assert "force every supervised session onto <label>" in output
+    assert "route supervised sessions to the freshest account" in output
+    assert "prefer <label> while quota is safe" not in output
+    assert "route new sessions" not in output
+
+
 class TestBlobAccessToken:
     def test_nested(self):
         blob = json.dumps({"claudeAiOauth": {"accessToken": "tok-1"}})
@@ -204,6 +281,39 @@ class TestPickProfileRoute:
             require_fable=True,
         ) == "gmail"
 
+    def test_forced_pin_ignores_quota_and_exclusions(self):
+        rows = [
+            accounts_row("gmail", 5.0, seven_day=5.0),
+            accounts_row("work", 100.0, seven_day=100.0, fable=100.0),
+        ]
+
+        assert accounts.pick_profile_route(
+            rows,
+            {"work"},
+            "work",
+            require_fable=True,
+            force_pin=True,
+        ) == "work"
+
+    def test_forced_pin_rejects_an_expired_account(self):
+        rows = [
+            accounts_row(
+                "work",
+                10.0,
+                expired=True,
+                seven_day=10.0,
+                fable=10.0,
+            ),
+        ]
+
+        assert accounts.pick_profile_route(
+            rows,
+            {"work"},
+            "work",
+            require_fable=True,
+            force_pin=True,
+        ) is None
+
 
 class TestSessionRouting:
     def test_parallel_launches_share_the_freshest_account(self):
@@ -215,6 +325,16 @@ class TestSessionRouting:
         ranked = accounts.rank_profile_rows(rows)
 
         assert [row["label"] for row in ranked] == ["gmail", "work"]
+
+    def test_equal_general_rank_breaks_on_label(self):
+        rows = [
+            accounts_row("zulu", 10.0, seven_day=20.0),
+            accounts_row("alpha", 10.0, seven_day=20.0),
+        ]
+
+        ranked = accounts.rank_profile_rows(rows)
+
+        assert [row["label"] for row in ranked] == ["alpha", "zulu"]
 
     def test_parallel_profile_selection_uses_one_current_account(
         self, tmp_path, monkeypatch
@@ -277,6 +397,61 @@ class TestSessionRouting:
         assert second["label"] == "first"
         assert {lease["pid"] for lease in leases} == {101, 102}
 
+    def test_fable_selection_prefers_lowest_fable_utilization(self):
+        rows = [
+            accounts_row("low-fable", 75.0, seven_day=10.0, fable=10.0),
+            accounts_row("low-general", 20.0, seven_day=20.0, fable=20.0),
+        ]
+
+        ranked = accounts.rank_profile_rows(rows, require_fable=True)
+
+        assert [row["label"] for row in ranked] == ["low-fable", "low-general"]
+
+    def test_general_fallback_ignores_fable_mode_ranking(self, tmp_path, monkeypatch):
+        blobs = {
+            "accounts": {
+                "fable": {
+                    "blob": _live_blob("fable"),
+                    "email": "fable@x",
+                    "org_uuid": "org-fable",
+                },
+                "general": {
+                    "blob": _live_blob("general"),
+                    "email": "general@x",
+                    "org_uuid": "org-general",
+                },
+            }
+        }
+        rows = [
+            accounts_row("fable", 70.0, seven_day=60.0, fable=10.0),
+            accounts_row("general", 10.0, seven_day=20.0, fable=90.0),
+        ]
+        monkeypatch.setattr(accounts, "locked", nullcontext)
+        monkeypatch.setattr(accounts, "load_blobs", lambda: blobs)
+        monkeypatch.setattr(
+            accounts,
+            "sync_profile_credentials",
+            lambda *_args, **_kwargs: set(),
+        )
+        monkeypatch.setattr(
+            accounts,
+            "load_mode",
+            lambda: {"mode": "fable", "label": None},
+        )
+        monkeypatch.setattr(accounts, "route_rows", lambda *_args: list(rows))
+        monkeypatch.setattr(accounts, "load_session_leases", lambda: [])
+        monkeypatch.setattr(accounts, "verify_entry_auth", lambda *_args: "ok")
+        monkeypatch.setattr(
+            accounts,
+            "ensure_native_profile",
+            lambda label, _entry: tmp_path / label,
+        )
+        monkeypatch.setattr(accounts, "excluded_labels", set)
+
+        selected = accounts.select_profile(prefer_fable=False)
+
+        assert selected["label"] == "general"
+
 
 class TestHandoffTarget:
     def _wire(self, monkeypatch, rows, *, mode="auto", label=None):
@@ -303,17 +478,17 @@ class TestHandoffTarget:
             require_fable=False,
         ) == "second"
 
-    def test_live_session_routes_around_an_exhausted_pin(self, monkeypatch):
+    def test_set_mode_moves_to_exhausted_target(self, monkeypatch):
         rows = [
-            accounts_row("first", 80.0, seven_day=10.0),
+            accounts_row("first", 100.0, seven_day=100.0),
             accounts_row("second", 20.0, seven_day=20.0),
         ]
         self._wire(monkeypatch, rows, mode="set", label="first")
 
         assert accounts.handoff_target(
-            "first",
+            "second",
             require_fable=False,
-        ) == "second"
+        ) == "first"
 
     def test_auto_mode_converges_live_sessions_on_the_freshest_account(
         self, monkeypatch
@@ -329,20 +504,68 @@ class TestHandoffTarget:
             require_fable=False,
         ) == "first"
 
-    def test_fable_mode_converges_live_sessions_on_the_best_fable_account(
-        self, monkeypatch
-    ):
+    def test_fable_session_stays_until_handoff_threshold(self, monkeypatch):
         rows = [
-            accounts_row("gmail", 29.0, seven_day=34.0, fable=0.0),
-            accounts_row("poynting", 2.0, seven_day=47.0, fable=51.0),
-            accounts_row("coram-work", 17.0, seven_day=48.0, fable=62.0),
+            accounts_row("current", 10.0, seven_day=10.0, fable=81.0),
+            accounts_row("other", 10.0, seven_day=10.0, fable=82.0),
         ]
         self._wire(monkeypatch, rows, mode="fable")
 
         assert accounts.handoff_target(
-            "coram-work",
+            "current",
             require_fable=True,
-        ) == "gmail"
+        ) is None
+
+    def test_fable_session_switches_at_handoff_threshold(self, monkeypatch):
+        rows = [
+            accounts_row("current", 10.0, seven_day=10.0, fable=95.0),
+            accounts_row("other", 10.0, seven_day=10.0, fable=82.0),
+        ]
+        self._wire(monkeypatch, rows, mode="fable")
+
+        assert accounts.handoff_target(
+            "current",
+            require_fable=True,
+        ) == "other"
+
+    def test_fable_session_switches_when_weekly_window_cannot_spend(
+        self, monkeypatch
+    ):
+        rows = [
+            accounts_row("current", 10.0, seven_day=80.0, fable=20.0),
+            accounts_row("other", 10.0, seven_day=20.0, fable=82.0),
+        ]
+        self._wire(monkeypatch, rows, mode="fable")
+
+        assert accounts.handoff_target(
+            "current",
+            require_fable=True,
+        ) == "other"
+
+    def test_general_fallback_uses_general_headroom_in_fable_mode(
+        self,
+        monkeypatch,
+    ):
+        rows = [
+            accounts_row(
+                "current",
+                79.0,
+                seven_day=79.0,
+                fable=95.0,
+            ),
+            accounts_row(
+                "other",
+                10.0,
+                seven_day=10.0,
+                fable=100.0,
+            ),
+        ]
+        self._wire(monkeypatch, rows, mode="fable")
+
+        assert accounts.handoff_target(
+            "current",
+            require_fable=False,
+        ) == "other"
 
 
 class TestMergeTokenVaults:
@@ -914,6 +1137,53 @@ class TestCmdStatus:
         assert "gmail" in output
         assert "[excluded]" in output
 
+    def test_set_mode_status_matches_the_forced_runtime_target(
+        self,
+        monkeypatch,
+        capsys,
+    ):
+        monkeypatch.setattr(
+            accounts,
+            "locked",
+            lambda blocking=True: nullcontext(),
+        )
+        monkeypatch.setattr(accounts, "load_blobs", lambda: {"accounts": {}})
+        monkeypatch.setattr(
+            accounts,
+            "capture_live_to_blobs",
+            lambda blobs: None,
+        )
+        monkeypatch.setattr(
+            accounts,
+            "sync_profile_credentials",
+            lambda blobs, persist: set(),
+        )
+        monkeypatch.setattr(
+            accounts,
+            "load_mode",
+            lambda: {"mode": "set", "label": "work"},
+        )
+        monkeypatch.setattr(
+            accounts,
+            "route_rows",
+            lambda blobs, active, now: [
+                accounts_row("gmail", 5.0, seven_day=5.0),
+                accounts_row(
+                    "work",
+                    100.0,
+                    seven_day=100.0,
+                    fable=100.0,
+                ),
+            ],
+        )
+        monkeypatch.setattr(accounts, "excluded_labels", lambda: {"work"})
+
+        accounts.cmd_status(types.SimpleNamespace())
+
+        output = capsys.readouterr().out
+        assert "general: work" in output
+        assert "fable: work" in output
+
 
 class TestNativeProfiles:
     def _paths(self, tmp_path, monkeypatch):
@@ -1319,13 +1589,13 @@ class TestFableEligible:
         assert accounts.fable_eligible(30.0, 30.0, 40.0) is True
 
     def test_boundary_just_under_cap(self):
-        assert accounts.fable_eligible(79.0, 79.0, 79.0) is True
+        assert accounts.fable_eligible(79.0, 79.0, 94.0) is True
 
     def test_fable_none_ineligible(self):
         assert accounts.fable_eligible(10.0, 10.0, None) is False
 
     def test_fable_at_cap_ineligible(self):
-        assert accounts.fable_eligible(10.0, 10.0, 80.0) is False  # cap is exclusive
+        assert accounts.fable_eligible(10.0, 10.0, 95.0) is False
 
     def test_fable_over_cap_ineligible(self):
         assert accounts.fable_eligible(10.0, 10.0, 100.0) is False
@@ -1334,14 +1604,13 @@ class TestFableEligible:
         assert accounts.fable_eligible(None, 10.0, 10.0) is False
 
     def test_five_hour_at_cap_ineligible(self):
-        assert accounts.fable_eligible(95.0, 10.0, 10.0) is False  # 5h floor
+        assert accounts.fable_eligible(80.0, 10.0, 10.0) is False
 
     def test_seven_day_none_ineligible(self):
         assert accounts.fable_eligible(10.0, None, 10.0) is False
 
     def test_seven_day_at_cap_ineligible(self):
-        # the trap: fresh fable but the weekly (all-models) window is maxed
-        assert accounts.fable_eligible(10.0, 95.0, 10.0) is False
+        assert accounts.fable_eligible(10.0, 80.0, 10.0) is False
 
     def test_fable_headroom_useless_when_weekly_capped(self):
         # 0% fable used but weekly maxed → can't make requests → not usable
@@ -1370,12 +1639,11 @@ class TestPickEnvFable:
         "ymail": {"token": "sk-ymail", "expires_at": NOW + 1000},
     }}
 
-    def test_fable_first_orders_eligible_by_binding(self):
-        # binding: ymail 40 (fable), brown 50 (5h), gmail 80 (fable)
+    def test_fable_first_orders_eligible_by_fable_utilization(self):
         rows = [accounts_row("gmail", 10.0, fable=80.0),
                 accounts_row("brown", 50.0, fable=10.0),
                 accounts_row("ymail", 20.0, fable=40.0)]
-        assert [r["label"] for r in accounts._fable_first(rows)] == ["ymail", "brown", "gmail"]
+        assert [r["label"] for r in accounts._fable_first(rows)] == ["brown", "ymail", "gmail"]
 
     def test_equal_binding_breaks_on_fable(self):
         # Both bind at 50 (their 5h); the fresher fable axis wins the tie.
@@ -1383,11 +1651,15 @@ class TestPickEnvFable:
                 accounts_row("B", 50.0, fable=20.0, seven_day=10.0)]
         assert [r["label"] for r in accounts._fable_first(rows)] == ["B", "A"]
 
-    def test_binding_window_outranks_fable_axis_at_launch(self):
-        # The pick-env path of the same live miss: 8%-runway ymail must not win.
-        rows = [accounts_row("ymail", 21.0, fable=12.0, seven_day=92.0),
+    def test_lowest_fable_wins_when_rate_windows_are_usable(self):
+        rows = [accounts_row("ymail", 21.0, fable=12.0, seven_day=79.0),
                 accounts_row("coram-work", 30.0, fable=19.0, seven_day=19.0)]
-        assert accounts.pick_profile_route(accounts._fable_first(rows), set(), None) == "coram-work"
+        assert accounts.pick_profile_route(
+            accounts._fable_first(rows),
+            set(),
+            None,
+            require_fable=True,
+        ) == "ymail"
 
     def test_prefers_fable_over_headroom(self):
         # gmail is best 5h (5) but fable-capped; brown worse 5h (50) but fable @10.
@@ -1515,7 +1787,7 @@ class TestCmdPickEnv:
         out = capsys.readouterr().out
         assert "export ACCOUNTS_ROUTED_LABEL=gmail" in out
 
-    def test_set_mode_pin_falls_back_when_near_quota(self, tmp_path, monkeypatch, capsys):
+    def test_set_mode_ignores_quota_and_exclusions(self, tmp_path, monkeypatch, capsys):
         blobs = {
             "gmail": {"blob": _live_blob("g"), "email": "g@x", "org_uuid": "o1"},
             "work": {"blob": _live_blob("w"), "email": "w@x", "org_uuid": "o2"},
@@ -1529,11 +1801,12 @@ class TestCmdPickEnv:
             monkeypatch,
             blobs,
             resets=resets,
+            excludes={"work"},
             mode="set",
             mode_label="work",
         )
         accounts.cmd_pick_env(types.SimpleNamespace())
-        assert "export ACCOUNTS_ROUTED_LABEL=gmail" in capsys.readouterr().out
+        assert "export ACCOUNTS_ROUTED_LABEL=work" in capsys.readouterr().out
 
     def test_expired_blob_filtered(self, tmp_path, monkeypatch, capsys):
         blobs = {"gmail": {"blob": _live_blob("g", future_ms=1_000_000_000_000),  # 2001, past
@@ -2151,16 +2424,22 @@ exec /bin/cat "$@"
         assert "old@example.com" not in rendered
         assert "acct" not in session
 
-    def test_weekly_walled_account_does_not_win_best_next_marker(self, tmp_path):
+    def test_quarantined_and_weekly_walled_accounts_do_not_win_best_next_marker(
+        self,
+        tmp_path,
+    ):
         repo = Path(__file__).resolve().parent.parent
         home = tmp_path / "home"
         claude_dir = home / ".claude"
+        accounts_dir = home / ".accounts"
         claude_dir.mkdir(parents=True)
+        accounts_dir.mkdir()
         (claude_dir / "statusline.conf").write_text(
             'SHOW_ACCOUNT_RESETS=1\n'
             'MAX_COLS=200\n'
             'ACCOUNT_LABELS="current:current@example.com|cur-org '
             'walled:walled@example.com|walled-org '
+            'quarantined:quarantined@example.com|quarantined-org '
             'fresh:fresh@example.com|fresh-org"\n'
         )
         resets = {
@@ -2179,6 +2458,13 @@ exec /bin/cat "$@"
                 "seven_day_pct": 97,
                 "last_seen": time.time(),
             },
+            "quarantined@example.com|quarantined-org": {
+                "email": "quarantined@example.com",
+                "org_uuid": "quarantined-org",
+                "five_hour_pct": 5,
+                "seven_day_pct": 5,
+                "last_seen": time.time(),
+            },
             "fresh@example.com|fresh-org": {
                 "email": "fresh@example.com",
                 "org_uuid": "fresh-org",
@@ -2188,6 +2474,18 @@ exec /bin/cat "$@"
             },
         }
         (claude_dir / "account-resets.json").write_text(json.dumps(resets))
+        (accounts_dir / "session-limits.json").write_text(
+            json.dumps(
+                {
+                    "quarantined@example.com|quarantined-org": {
+                        "expires_at": time.time() + 3600,
+                    },
+                    "fresh@example.com|fresh-org": {
+                        "expires_at": time.time() - 1,
+                    },
+                }
+            )
+        )
         profile_payload = json.dumps(
             {"account": {"email": "current@example.com"}, "organization": {"uuid": "cur-org"}}
         )
@@ -2241,20 +2539,257 @@ exec /bin/cat "$@"
         # replace the fixture launch identity and blank the board.
         env.pop("CLAUDE_CONFIG_DIR", None)
 
-        result = subprocess.run(
-            ["bash", str(script)],
-            input=json.dumps(fixture),
-            text=True,
-            capture_output=True,
-            env=env,
-            check=True,
-        )
-        rendered = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+        def render():
+            result = subprocess.run(
+                ["bash", str(script)],
+                input=json.dumps(fixture),
+                text=True,
+                capture_output=True,
+                env=env,
+                check=True,
+            )
+            return re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+
+        rendered = render()
         marked = [line for line in rendered.splitlines() if "✓ best next" in line]
+        quarantined = next(
+            line for line in rendered.splitlines() if "Quarantined" in line
+        )
 
         assert marked, rendered
         assert all("Fresh" in line for line in marked), rendered
         assert not any("Walled" in line for line in marked), rendered
+        assert not any("Quarantined" in line for line in marked), rendered
+        assert "100%" in quarantined
+
+        resets["walled@example.com|walled-org"]["seven_day_pct"] = 85
+        (claude_dir / "account-resets.json").write_text(
+            json.dumps(
+                {
+                    key: value
+                    for key, value in resets.items()
+                    if key
+                    in {
+                        "current@example.com|cur-org",
+                        "walled@example.com|walled-org",
+                    }
+                }
+            )
+        )
+        (accounts_dir / "session-limits.json").write_text("{}")
+
+        rendered = render()
+        assert "✓ best next" not in rendered, rendered
+
+        resets["walled@example.com|walled-org"].pop("seven_day_pct")
+        (claude_dir / "account-resets.json").write_text(
+            json.dumps(
+                {
+                    "current@example.com|cur-org": resets[
+                        "current@example.com|cur-org"
+                    ],
+                    "walled@example.com|walled-org": resets[
+                        "walled@example.com|walled-org"
+                    ],
+                }
+            )
+        )
+
+        rendered = render()
+        assert "✓ best next" not in rendered, rendered
+
+        (claude_dir / "account-resets.json").write_text(
+            json.dumps(
+                {
+                    "current@example.com|cur-org": resets[
+                        "current@example.com|cur-org"
+                    ],
+                    "walled@example.com|walled-org": {
+                        "email": "walled@example.com",
+                        "org_uuid": "walled-org",
+                        "five_hour_pct": 79.6,
+                        "seven_day_pct": 79.6,
+                        "last_seen": time.time(),
+                    },
+                }
+            )
+        )
+        rendered = render()
+        marked = [line for line in rendered.splitlines() if "✓ best next" in line]
+        assert marked and all("Walled" in line for line in marked), rendered
+
+        (accounts_dir / "mode.json").write_text('{"mode":"fable"}')
+        (claude_dir / "account-resets.json").write_text(
+            json.dumps(
+                {
+                    "current@example.com|cur-org": resets[
+                        "current@example.com|cur-org"
+                    ],
+                    "fresh@example.com|fresh-org": {
+                        "email": "fresh@example.com",
+                        "org_uuid": "fresh-org",
+                        "five_hour_pct": 5,
+                        "seven_day_pct": 5,
+                        "fable_pct": 94.6,
+                        "last_seen": time.time(),
+                    },
+                }
+            )
+        )
+        rendered = render()
+        marked = [line for line in rendered.splitlines() if "✓ best next" in line]
+        assert marked and all("Fresh" in line for line in marked), rendered
+
+        (claude_dir / "account-resets.json").write_text(
+            json.dumps(
+                {
+                    "current@example.com|cur-org": resets[
+                        "current@example.com|cur-org"
+                    ],
+                    "walled@example.com|walled-org": {
+                        "email": "walled@example.com",
+                        "org_uuid": "walled-org",
+                        "five_hour_pct": 5,
+                        "seven_day_pct": 5,
+                        "fable_pct": 50,
+                        "last_seen": time.time(),
+                    },
+                    "fresh@example.com|fresh-org": {
+                        "email": "fresh@example.com",
+                        "org_uuid": "fresh-org",
+                        "five_hour_pct": 70,
+                        "seven_day_pct": 70,
+                        "fable_pct": 10,
+                        "last_seen": time.time(),
+                    },
+                }
+            )
+        )
+        rendered = render()
+        marked = [line for line in rendered.splitlines() if "✓ best next" in line]
+        assert marked and all("Fresh" in line for line in marked), rendered
+
+        (claude_dir / "statusline.conf").write_text(
+            'SHOW_ACCOUNT_RESETS=1\n'
+            'MAX_COLS=200\n'
+            'ACCOUNT_LABELS="current:current@example.com|cur-org '
+            'zulu:a@example.com|a-org alpha:z@example.com|z-org"\n'
+        )
+        (accounts_dir / "mode.json").unlink()
+        (claude_dir / "account-resets.json").write_text(
+            json.dumps(
+                {
+                    "current@example.com|cur-org": resets[
+                        "current@example.com|cur-org"
+                    ],
+                    "a@example.com|a-org": {
+                        "email": "a@example.com",
+                        "org_uuid": "a-org",
+                        "five_hour_pct": 10,
+                        "seven_day_pct": 20,
+                        "last_seen": time.time(),
+                    },
+                    "z@example.com|z-org": {
+                        "email": "z@example.com",
+                        "org_uuid": "z-org",
+                        "five_hour_pct": 10,
+                        "seven_day_pct": 20,
+                        "last_seen": time.time(),
+                    },
+                }
+            )
+        )
+
+        rendered = render()
+        marked = [line for line in rendered.splitlines() if "✓ best next" in line]
+        assert marked and all("Alpha" in line for line in marked), rendered
+
+        set_mode_config = (
+            'SHOW_ACCOUNT_RESETS=1\n'
+            'MAX_COLS=200\n'
+            'ACCOUNT_LABELS="current:current@example.com|cur-org '
+            'target:target@example.com|target-org '
+            'safe:safe@example.com|safe-org"\n'
+        )
+        (claude_dir / "statusline.conf").write_text(
+            set_mode_config + 'ACCOUNTS_EXCLUDE="target"\n'
+        )
+        (accounts_dir / "mode.json").write_text('{"mode":"set","label":"target"}')
+        (claude_dir / "account-resets.json").write_text(
+            json.dumps(
+                {
+                    "current@example.com|cur-org": resets[
+                        "current@example.com|cur-org"
+                    ],
+                    "target@example.com|target-org": {
+                        "email": "target@example.com",
+                        "org_uuid": "target-org",
+                        "five_hour_pct": 100,
+                        "seven_day_pct": 100,
+                        "last_seen": time.time(),
+                    },
+                    "safe@example.com|safe-org": {
+                        "email": "safe@example.com",
+                        "org_uuid": "safe-org",
+                        "five_hour_pct": 10,
+                        "seven_day_pct": 10,
+                        "last_seen": time.time(),
+                    },
+                }
+            )
+        )
+        target_blob = {
+            "email": "target@example.com",
+            "org_uuid": "target-org",
+            "blob": json.dumps(
+                {
+                    "claudeAiOauth": {
+                        "refreshToken": "rt",
+                        "refreshTokenExpiresAt": int((time.time() + 3600) * 1000),
+                    }
+                }
+            ),
+        }
+        (accounts_dir / "blobs.json").write_text(
+            json.dumps({"accounts": {"target": target_blob}})
+        )
+
+        rendered = render()
+        marked = [line for line in rendered.splitlines() if "✓ best next" in line]
+        assert marked and all("Target" in line for line in marked), rendered
+        assert not any("Safe" in line for line in marked), rendered
+
+        (accounts_dir / "mode.json").write_text('{"mode":"set","label":"current"}')
+        rendered = render()
+        assert "✓ best next" not in rendered, rendered
+
+        (claude_dir / "statusline.conf").write_text(set_mode_config)
+        (accounts_dir / "mode.json").write_text('{"mode":"set","label":"target"}')
+        target_blob["auth_dead_at"] = int(time.time())
+        (accounts_dir / "blobs.json").write_text(
+            json.dumps({"accounts": {"target": target_blob}})
+        )
+
+        rendered = render()
+        assert "✓ best next" not in rendered, rendered
+        assert "Target" in rendered and "needs reauth" in rendered, rendered
+
+        del target_blob["auth_dead_at"]
+        target_blob["blob"] = json.dumps(
+            {
+                "claudeAiOauth": {
+                    "refreshToken": "rt",
+                    "refreshTokenExpiresAt": int((time.time() - 60) * 1000),
+                }
+            }
+        )
+        (accounts_dir / "blobs.json").write_text(
+            json.dumps({"accounts": {"target": target_blob}})
+        )
+
+        rendered = render()
+        assert "✓ best next" not in rendered, rendered
+        assert "Target" in rendered and "needs reauth" in rendered, rendered
 
 
 # ---- Verified auth state (auth_dead_at) ----

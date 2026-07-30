@@ -83,6 +83,45 @@ def test_new_session_gets_a_stable_session_id():
     assert str(uuid.UUID(session_id)) == session_id
 
 
+def test_interactive_session_defaults_to_ultracode():
+    assert claude_router.with_default_effort(
+        ["--dangerously-skip-permissions"]
+    ) == [
+        "--dangerously-skip-permissions",
+        "--effort",
+        "ultracode",
+    ]
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--effort", "max"],
+        ["--effort=high"],
+    ],
+)
+def test_explicit_effort_overrides_the_ultracode_default(args):
+    assert claude_router.with_default_effort(args) == args
+
+
+def test_default_session_name_is_invisible():
+    args = claude_router.with_default_session_name(["--resume", "session-id"])
+
+    assert claude_router.option_value(args, "--name") == "\u2063"
+
+
+def test_explicit_session_name_is_preserved():
+    args = ["--name", "incident-review"]
+
+    assert claude_router.with_default_session_name(args) == args
+
+
+def test_explicit_short_session_name_is_preserved():
+    args = ["-n", "incident-review"]
+
+    assert claude_router.with_default_session_name(args) == args
+
+
 def test_handoff_resumes_exact_session_without_reforking():
     session_id = str(uuid.uuid4())
 
@@ -107,6 +146,66 @@ def test_handoff_resumes_exact_session_without_reforking():
     ]
 
 
+@pytest.mark.parametrize("selector", ["-r", "--resume", "--from-pr"])
+def test_handoff_preserves_flags_after_a_bare_optional_selector(selector):
+    session_id = str(uuid.uuid4())
+    launch_args = claude_router.with_default_session_name(
+        claude_router.with_default_effort([selector])
+    )
+
+    args = claude_router.resume_session_args(
+        launch_args,
+        session_id,
+        effort_override="xhigh",
+    )
+
+    assert args == [
+        "--name",
+        "\u2063",
+        "--effort",
+        "xhigh",
+        "--resume",
+        session_id,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("selector", "value"),
+    [
+        ("-r", "named-session"),
+        ("--resume", "named-session"),
+        ("--from-pr", "123"),
+    ],
+)
+def test_handoff_strips_valued_optional_selectors_without_losing_flags(
+    selector,
+    value,
+):
+    session_id = str(uuid.uuid4())
+
+    args = claude_router.resume_session_args(
+        [
+            selector,
+            value,
+            "--effort",
+            "ultracode",
+            "--name",
+            "incident",
+        ],
+        session_id,
+        effort_override="xhigh",
+    )
+
+    assert args == [
+        "--name",
+        "incident",
+        "--effort",
+        "xhigh",
+        "--resume",
+        session_id,
+    ]
+
+
 def test_fable_handoff_can_resume_on_opus():
     session_id = str(uuid.uuid4())
 
@@ -125,12 +224,666 @@ def test_fable_handoff_can_resume_on_opus():
     ]
 
 
+def test_handoff_replaces_launch_effort_with_live_effort():
+    session_id = str(uuid.uuid4())
+
+    args = claude_router.resume_session_args(
+        ["--model", "fable", "--effort", "ultracode"],
+        session_id,
+        "opus",
+        "high",
+    )
+
+    assert claude_router.option_value(args, "--effort") == "high"
+    assert args.count("--effort") == 1
+
+
+def test_ultracode_launch_clears_legacy_effort_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_CODE_EFFORT_LEVEL", "max")
+    selected = {
+        "profile": "/profiles/first",
+        "label": "first",
+        "email": "first@example.com",
+        "org_uuid": "org-first",
+    }
+
+    env = claude_router.routed_environment(
+        selected,
+        tmp_path / "router-state.json",
+        ["--effort", "ultracode"],
+    )
+
+    assert "CLAUDE_CODE_EFFORT_LEVEL" not in env
+    assert env["CLAUDE_ROUTER_ULTRACODE"] == "1"
+
+
+def test_explicit_effort_clears_an_inherited_effort_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_CODE_EFFORT_LEVEL", "max")
+    selected = {
+        "profile": "/profiles/first",
+        "label": "first",
+        "email": "first@example.com",
+        "org_uuid": "org-first",
+    }
+
+    env = claude_router.routed_environment(
+        selected,
+        tmp_path / "router-state.json",
+        ["--effort", "high"],
+    )
+
+    assert "CLAUDE_CODE_EFFORT_LEVEL" not in env
+    assert "CLAUDE_ROUTER_ULTRACODE" not in env
+
+
+def test_transcript_cursor_only_accepts_a_new_structured_session_limit(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "message": {"content": "You've hit your session limit"},
+            }
+        )
+        + "\n"
+    )
+    offset = transcript.stat().st_size
+    with transcript.open("a") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "isApiErrorMessage": True,
+                    "apiErrorStatus": 429,
+                    "error": "rate_limit",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "You've hit your session limit · resets later",
+                            }
+                        ]
+                    },
+                }
+            )
+            + "\n"
+        )
+
+    limited, next_offset = claude_router.read_new_session_limit(
+        transcript,
+        offset,
+    )
+
+    assert limited is True
+    assert next_offset == transcript.stat().st_size
+
+
+def test_transcript_cursor_does_not_consume_a_partial_record(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    partial = b'{"type":"assistant","isApiErrorMessage":true'
+    transcript.write_bytes(partial)
+
+    limited, next_offset = claude_router.read_new_session_limit(transcript, 0)
+
+    assert limited is False
+    assert next_offset == 0
+
+
+@pytest.mark.parametrize(
+    "first_child_stays_open",
+    [True, False],
+    ids=["prompt-remains-open", "child-exits-after-error"],
+)
+def test_api_session_limit_hands_off_the_same_conversation(
+    first_child_stays_open,
+    tmp_path,
+    monkeypatch,
+):
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("")
+    first = {
+        "profile": "/profiles/first",
+        "label": "first",
+        "email": "first@example.com",
+        "org_uuid": "org-first",
+    }
+    second = {
+        "profile": "/profiles/second",
+        "label": "second",
+        "email": "second@example.com",
+        "org_uuid": "org-second",
+    }
+    launches = []
+    limited = []
+    route_families = []
+    session_id = str(uuid.uuid4())
+
+    class Child:
+        def __init__(self, running):
+            self.running = running
+
+        def poll(self):
+            return None if self.running else 0
+
+        def wait(self):
+            return 0
+
+    def launch(command, **kwargs):
+        launches.append((command, kwargs))
+        if len(launches) == 1:
+            with transcript.open("a") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "isApiErrorMessage": True,
+                            "apiErrorStatus": 429,
+                            "error": "rate_limit",
+                            "message": {
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": (
+                                            "You've hit your session limit · "
+                                            "resets later"
+                                        ),
+                                    }
+                                ]
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+        return Child(
+            running=len(launches) == 1 and first_child_stays_open
+        )
+
+    monkeypatch.setattr(
+        claude_router,
+        "initial_session_args",
+        lambda args: ([*args, "--session-id", session_id], session_id),
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "load_mode",
+        lambda: {"mode": "auto", "label": None},
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "select_profile",
+        lambda **kwargs: second if kwargs.get("avoid_labels") else first,
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "mark_session_limit",
+        lambda email, org_uuid: limited.append((email, org_uuid)),
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "handoff_target",
+        lambda *_args, **_kwargs: "second" if limited else None,
+    )
+    monkeypatch.setattr(
+        claude_router,
+        "session_limit_route",
+        lambda _selected, family, _pid: (
+            route_families.append(family) or (second, None)
+        ),
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "upsert_session_lease",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "remove_session_lease",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        claude_router,
+        "session_transcript_path",
+        lambda candidate: transcript if candidate == session_id else None,
+    )
+    monkeypatch.setattr(
+        claude_router,
+        "read_router_state",
+        lambda _path: {
+            "session_id": session_id,
+            "model": "Fable 5",
+            "effort": "high",
+        },
+    )
+    monkeypatch.setattr(
+        claude_router,
+        "source_generation",
+        lambda: (1, 1),
+    )
+    monkeypatch.setattr(claude_router.subprocess, "Popen", launch)
+    monkeypatch.setattr(claude_router.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(claude_router, "stop_for_handoff", lambda _child: None)
+    monkeypatch.setattr(
+        claude_router,
+        "set_synchronized_output",
+        lambda _enabled: False,
+    )
+
+    assert claude_router.run_supervised(
+        "/real/claude",
+        ["--model", "opus"],
+    ) == 0
+
+    assert limited == [("first@example.com", "org-first")]
+    assert route_families == ["fable"]
+    assert [launch[1]["env"]["ACCOUNTS_ROUTED_LABEL"] for launch in launches] == [
+        "first",
+        "second",
+    ]
+    assert claude_router.option_value(launches[1][0], "--effort") == "high"
+    assert launches[1][0][-2:] == ["--resume", session_id]
+
+
+def test_session_limit_route_is_recomputed_until_a_later_set_target_exists(
+    tmp_path,
+    monkeypatch,
+):
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("")
+    first = {
+        "profile": "/profiles/first",
+        "label": "first",
+        "email": "first@example.com",
+        "org_uuid": "org-first",
+    }
+    second = {
+        "profile": "/profiles/second",
+        "label": "second",
+        "email": "second@example.com",
+        "org_uuid": "org-second",
+    }
+    session_id = str(uuid.uuid4())
+    mode = {"mode": "auto", "label": None}
+    launches = []
+    limited = []
+    route_modes = []
+    sleep_count = 0
+
+    class Child:
+        def __init__(self, first_launch):
+            self.first_launch = first_launch
+            self.polls = 0
+
+        def poll(self):
+            self.polls += 1
+            if self.first_launch and self.polls <= 2:
+                return None
+            return 0
+
+        def wait(self):
+            return 0
+
+    def sleep(_seconds):
+        nonlocal sleep_count
+        sleep_count += 1
+        if sleep_count == 2:
+            mode.update({"mode": "set", "label": "second"})
+
+    def route(_selected, _family, _pid):
+        route_modes.append(mode["mode"])
+        return (second, None) if mode["mode"] == "set" else None
+
+    def launch(command, **kwargs):
+        launches.append((command, kwargs))
+        if len(launches) == 1:
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "isApiErrorMessage": True,
+                        "apiErrorStatus": 429,
+                        "error": "rate_limit",
+                        "message": {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        "You've hit your session limit · "
+                                        "resets later"
+                                    ),
+                                }
+                            ]
+                        },
+                    }
+                )
+                + "\n"
+            )
+        return Child(first_launch=len(launches) == 1)
+
+    monkeypatch.setattr(
+        claude_router,
+        "initial_session_args",
+        lambda args: ([*args, "--session-id", session_id], session_id),
+    )
+    monkeypatch.setattr(claude_router.accounts, "load_mode", lambda: dict(mode))
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "select_profile",
+        lambda **_kwargs: first,
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "mark_session_limit",
+        lambda email, org_uuid: limited.append((email, org_uuid)),
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "upsert_session_lease",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "remove_session_lease",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        claude_router,
+        "session_transcript_path",
+        lambda candidate: transcript if candidate == session_id else None,
+    )
+    monkeypatch.setattr(
+        claude_router,
+        "read_router_state",
+        lambda _path: {
+            "session_id": session_id,
+            "model": "Opus 5",
+            "effort": "max",
+        },
+    )
+    monkeypatch.setattr(claude_router, "session_limit_route", route)
+    monkeypatch.setattr(claude_router, "source_generation", lambda: (1, 1))
+    monkeypatch.setattr(
+        claude_router.subprocess,
+        "Popen",
+        launch,
+    )
+    monkeypatch.setattr(claude_router.time, "sleep", sleep)
+    monkeypatch.setattr(claude_router, "stop_for_handoff", lambda _child: None)
+    monkeypatch.setattr(
+        claude_router,
+        "set_synchronized_output",
+        lambda _enabled: False,
+    )
+
+    assert claude_router.run_supervised("/real/claude", []) == 0
+
+    assert route_modes == ["auto", "set"]
+    assert limited == [("first@example.com", "org-first")]
+    assert [launch[1]["env"]["ACCOUNTS_ROUTED_LABEL"] for launch in launches] == [
+        "first",
+        "second",
+    ]
+    assert claude_router.option_value(launches[1][0], "--effort") == "max"
+
+
+@pytest.mark.parametrize(
+    "first_child_enters_loop",
+    [True, False],
+    ids=["alive-for-first-poll", "exits-before-first-poll"],
+)
+def test_continue_catches_a_limit_written_before_the_session_id_is_known(
+    first_child_enters_loop,
+    tmp_path,
+    monkeypatch,
+):
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "timestamp": "2001-09-09T01:46:39+00:00",
+                "isApiErrorMessage": True,
+                "apiErrorStatus": 429,
+                "error": "rate_limit",
+                "message": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "You've hit your session limit · old",
+                        }
+                    ]
+                },
+            }
+        )
+        + "\n"
+    )
+    first = {
+        "profile": "/profiles/first",
+        "label": "first",
+        "email": "first@example.com",
+        "org_uuid": "org-first",
+    }
+    second = {
+        "profile": "/profiles/second",
+        "label": "second",
+        "email": "second@example.com",
+        "org_uuid": "org-second",
+    }
+    launches = []
+    limited = []
+    session_id = str(uuid.uuid4())
+
+    class Child:
+        def __init__(self, running_once):
+            self.running_once = running_once
+
+        def poll(self):
+            if self.running_once:
+                self.running_once = False
+                return None
+            return 0
+
+        def wait(self):
+            return 0
+
+    def launch(command, **kwargs):
+        launches.append((command, kwargs))
+        if len(launches) == 1:
+            with transcript.open("a") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "timestamp": "2001-09-09T01:46:41+00:00",
+                            "isApiErrorMessage": True,
+                            "apiErrorStatus": 429,
+                            "error": "rate_limit",
+                            "message": {
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": (
+                                            "You've hit your session limit · "
+                                            "new"
+                                        ),
+                                    }
+                                ]
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+        return Child(
+            running_once=len(launches) == 1 and first_child_enters_loop
+        )
+
+    monkeypatch.setattr(claude_router.time, "time", lambda: 1_000_000_000.0)
+    monkeypatch.setattr(claude_router.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "load_mode",
+        lambda: {"mode": "auto", "label": None},
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "select_profile",
+        lambda **kwargs: second if kwargs.get("avoid_labels") else first,
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "mark_session_limit",
+        lambda email, org_uuid: limited.append((email, org_uuid)),
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "handoff_target",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "profile_has_headroom",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "upsert_session_lease",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "remove_session_lease",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        claude_router,
+        "session_transcript_path",
+        lambda candidate: transcript if candidate == session_id else None,
+    )
+    monkeypatch.setattr(
+        claude_router,
+        "read_router_state",
+        lambda _path: {"session_id": session_id, "model": "Fable 5"},
+    )
+    monkeypatch.setattr(
+        claude_router,
+        "source_generation",
+        lambda: (1, 1),
+    )
+    monkeypatch.setattr(claude_router.subprocess, "Popen", launch)
+    monkeypatch.setattr(claude_router, "stop_for_handoff", lambda _child: None)
+    monkeypatch.setattr(
+        claude_router,
+        "set_synchronized_output",
+        lambda _enabled: False,
+    )
+
+    assert claude_router.run_supervised(
+        "/real/claude",
+        ["--continue", "--model", "fable"],
+    ) == 0
+
+    assert limited == [("first@example.com", "org-first")]
+    assert [launch[1]["env"]["ACCOUNTS_ROUTED_LABEL"] for launch in launches] == [
+        "first",
+        "second",
+    ]
+    assert launches[1][0][-2:] == ["--resume", session_id]
+
+
 def test_rendered_model_name_maps_to_a_cli_alias():
     assert claude_router.model_name([], "Opus 5 (1M context)") == "opus"
     assert claude_router.model_name([], "Fable 5.max") == "fable"
 
 
-def test_running_supervisor_reexecs_new_router_code(monkeypatch):
+def test_source_generation_tracks_router_and_account_policy():
+    assert claude_router.source_generation() == (
+        Path(claude_router.__file__).stat().st_mtime_ns,
+        Path(claude_router.accounts.__file__).stat().st_mtime_ns,
+    )
+
+
+def test_handoff_finishes_synchronized_output_before_returning(monkeypatch):
+    events = []
+
+    class Child:
+        def terminate(self):
+            events.append("terminate")
+
+        def wait(self, timeout=None):
+            events.append(("wait", timeout))
+
+    monkeypatch.setattr(
+        claude_router,
+        "set_synchronized_output",
+        lambda enabled: events.append("sync-on" if enabled else "sync-off") or True,
+    )
+
+    claude_router.stop_for_handoff(Child())
+
+    assert events == ["sync-on", "terminate", ("wait", 5), "sync-off"]
+
+
+def test_synchronized_output_emits_dec_control_bytes_on_a_pty(monkeypatch):
+    master_fd, slave_fd = os.openpty()
+    stdout = os.fdopen(slave_fd, "w", closefd=False)
+    try:
+        monkeypatch.setattr(sys, "stdout", stdout)
+
+        assert claude_router.set_synchronized_output(True) is True
+        assert claude_router.set_synchronized_output(False) is True
+
+        assert os.read(master_fd, 1024) == (
+            claude_router.SYNC_OUTPUT_ON + claude_router.SYNC_OUTPUT_OFF
+        )
+    finally:
+        stdout.close()
+        os.close(slave_fd)
+        os.close(master_fd)
+
+
+def test_handoff_brackets_timeout_kill_cleanup_on_a_pty(monkeypatch):
+    master_fd, slave_fd = os.openpty()
+    stdout = os.fdopen(slave_fd, "w", closefd=False)
+
+    class Child:
+        def terminate(self):
+            os.write(slave_fd, b"terminate")
+
+        def wait(self, timeout=None):
+            os.write(slave_fd, b"wait")
+            if timeout is not None:
+                raise subprocess.TimeoutExpired("claude", timeout)
+
+        def kill(self):
+            os.write(slave_fd, b"kill")
+
+    try:
+        monkeypatch.setattr(sys, "stdout", stdout)
+
+        claude_router.stop_for_handoff(Child())
+
+        assert os.read(master_fd, 1024) == (
+            claude_router.SYNC_OUTPUT_ON
+            + b"terminatewaitkillwait"
+            + claude_router.SYNC_OUTPUT_OFF
+        )
+    finally:
+        stdout.close()
+        os.close(slave_fd)
+        os.close(master_fd)
+
+
+@pytest.mark.parametrize(
+    "generations",
+    [
+        iter([(1, 1), (2, 1)]),
+        iter([(1, 1), (1, 2)]),
+    ],
+    ids=["router-change", "account-policy-change"],
+)
+def test_running_supervisor_reexecs_new_routing_code(
+    generations,
+    monkeypatch,
+):
     session_id = str(uuid.uuid4())
     selected = {
         "profile": "/profiles/first",
@@ -138,7 +891,6 @@ def test_running_supervisor_reexecs_new_router_code(monkeypatch):
         "email": "first@example.com",
         "org_uuid": "org-first",
     }
-    mtimes = iter([1, 2])
     exec_call = {}
 
     class Reloaded(Exception):
@@ -148,7 +900,11 @@ def test_running_supervisor_reexecs_new_router_code(monkeypatch):
         def poll(self):
             return None
 
-    monkeypatch.setattr(claude_router, "source_mtime", lambda: next(mtimes))
+    monkeypatch.setattr(
+        claude_router,
+        "source_generation",
+        lambda: next(generations),
+    )
     monkeypatch.setattr(
         claude_router,
         "initial_session_args",
@@ -174,7 +930,11 @@ def test_running_supervisor_reexecs_new_router_code(monkeypatch):
     monkeypatch.setattr(
         claude_router,
         "read_router_state",
-        lambda _path: {"session_id": session_id, "model": "Opus 5"},
+        lambda _path: {
+            "session_id": session_id,
+            "model": "Opus 5",
+            "effort": "max",
+        },
     )
     monkeypatch.setattr(claude_router, "stop_for_handoff", lambda _child: None)
     monkeypatch.setattr(claude_router, "set_synchronized_output", lambda _enabled: True)
@@ -189,6 +949,9 @@ def test_running_supervisor_reexecs_new_router_code(monkeypatch):
         claude_router.run_supervised("/real/claude", [])
 
     assert exec_call["binary"] == sys.executable
+    assert exec_call["argv"][
+        exec_call["argv"].index("--effort") + 1
+    ] == "max"
     assert exec_call["argv"][-4:] == [
         "--model",
         "opus",
@@ -239,10 +1002,15 @@ def test_fable_mode_launches_directly_on_fable(monkeypatch):
         "Popen",
         lambda command, **kwargs: launches.append((command, kwargs)) or Child(),
     )
+    monkeypatch.setenv("CLAUDE_CODE_EFFORT_LEVEL", "max")
 
     assert claude_router.run_supervised("/real/claude", ["--model", "opus"]) == 0
     assert selections[0]["require_fable"] is True
     assert launches[0][0][-2:] == ["--model", "fable"]
+    assert claude_router.option_value(launches[0][0], "--effort") == "ultracode"
+    assert claude_router.option_value(launches[0][0], "--name") == "\u2063"
+    assert "CLAUDE_CODE_EFFORT_LEVEL" not in launches[0][1]["env"]
+    assert launches[0][1]["env"]["CLAUDE_ROUTER_ULTRACODE"] == "1"
 
 
 def test_passthrough_preserves_an_explicit_profile(monkeypatch):
@@ -261,6 +1029,42 @@ def test_passthrough_preserves_an_explicit_profile(monkeypatch):
 
     assert claude_router.run_passthrough("/real/claude", ["auth", "status"]) == 0
     assert calls == [("call", ["/real/claude", "auth", "status"], {})]
+
+
+def test_print_inference_defaults_to_ultracode(monkeypatch):
+    calls = []
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/profiles/explicit")
+    monkeypatch.setattr(
+        claude_router.subprocess,
+        "call",
+        lambda command, **kwargs: calls.append((command, kwargs)) or 0,
+    )
+
+    assert claude_router.run_passthrough(
+        "/real/claude",
+        ["--print", "hello"],
+    ) == 0
+
+    assert claude_router.option_value(calls[0][0], "--effort") == "ultracode"
+
+
+def test_print_explicit_effort_clears_an_inherited_override(monkeypatch):
+    calls = []
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/profiles/explicit")
+    monkeypatch.setenv("CLAUDE_CODE_EFFORT_LEVEL", "max")
+    monkeypatch.setattr(
+        claude_router.subprocess,
+        "call",
+        lambda command, **kwargs: calls.append((command, kwargs)) or 0,
+    )
+
+    assert claude_router.run_passthrough(
+        "/real/claude",
+        ["--print", "hello", "--effort", "high"],
+    ) == 0
+
+    assert claude_router.option_value(calls[0][0], "--effort") == "high"
+    assert "CLAUDE_CODE_EFFORT_LEVEL" not in calls[0][1]["env"]
 
 
 def test_fable_print_requires_fable_headroom(monkeypatch):
@@ -291,13 +1095,14 @@ def test_fable_print_requires_fable_headroom(monkeypatch):
         == 0
     )
     assert calls[0] == ("select", {"require_fable": True})
-    assert calls[1][1] == [
+    assert calls[1][1][:5] == [
         "/real/claude",
         "--model",
         "fable",
         "--print",
         "hello",
     ]
+    assert claude_router.option_value(calls[1][1], "--effort") == "ultracode"
     assert calls[1][2]["env"]["CLAUDE_CONFIG_DIR"] == "/profiles/fable"
 
 
@@ -331,15 +1136,21 @@ def test_fable_print_falls_back_to_opus(monkeypatch):
     )
     assert calls[:2] == [
         ("select", {"require_fable": True}),
-        ("select", {"require_fable": False}),
+        (
+            "select",
+            {
+                "require_fable": False,
+                "prefer_fable": False,
+            },
+        ),
     ]
-    assert calls[2][1] == [
+    assert calls[2][1][:3] == [
         "/real/claude",
         "--print",
         "hello",
-        "--model",
-        "opus",
     ]
+    assert claude_router.option_value(calls[2][1], "--model") == "opus"
+    assert claude_router.option_value(calls[2][1], "--effort") == "ultracode"
     assert calls[2][2]["env"]["CLAUDE_CONFIG_DIR"] == "/profiles/general"
 
 
@@ -360,7 +1171,156 @@ def test_passthrough_fails_closed_without_a_safe_profile(monkeypatch, capsys):
     assert "no account has enough quota" in capsys.readouterr().err
 
 
-def test_statusline_publishes_the_live_session_identity(tmp_path):
+@pytest.mark.parametrize(
+    ("reported_effort", "router_marker", "expected_effort"),
+    [
+        ("xhigh", "1", "ultracode"),
+        ("max", "1", "max"),
+        ("xhigh", None, "xhigh"),
+    ],
+)
+def test_statusline_publishes_the_live_session_identity_and_effort(
+    reported_effort,
+    router_marker,
+    expected_effort,
+    tmp_path,
+):
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    project = tmp_path / "project"
+    project.mkdir()
+    state_path = Path(
+        f"/tmp/claude/account-router-{os.getpid()}-{uuid.uuid4().hex}.json"
+    )
+    fixture = json.loads((REPO / "test" / "fixtures" / "input.json").read_text())
+    fixture["workspace"]["current_dir"] = str(project)
+    fixture["effort"] = {"level": reported_effort}
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(home),
+            "TZ": "America/Los_Angeles",
+            "ACCOUNTS_ROUTER_STATE": str(state_path),
+            "ACCOUNTS_ROUTED_LABEL": "first",
+            "ACCOUNTS_ROUTED_EMAIL": "first@example.com",
+            "ACCOUNTS_ROUTED_ORG_UUID": "org-first",
+        }
+    )
+    if router_marker is None:
+        env.pop("CLAUDE_ROUTER_ULTRACODE", None)
+    else:
+        env["CLAUDE_ROUTER_ULTRACODE"] = router_marker
+
+    subprocess.run(
+        ["bash", str(REPO / "bin" / "statusline.sh")],
+        input=json.dumps(fixture),
+        text=True,
+        capture_output=True,
+        env=env,
+        check=True,
+    )
+
+    try:
+        state = json.loads(state_path.read_text())
+        assert state["session_id"] == fixture["session_id"]
+        assert state["model"] == fixture["model"]["display_name"]
+        assert state["effort"] == expected_effort
+        assert state["label"] == "first"
+    finally:
+        state_path.unlink(missing_ok=True)
+
+
+def test_statusline_labels_an_ultracode_session(tmp_path):
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    project = tmp_path / "project"
+    project.mkdir()
+    fixture = json.loads((REPO / "test" / "fixtures" / "input.json").read_text())
+    fixture["workspace"]["current_dir"] = str(project)
+    fixture["effort"] = {"level": "xhigh"}
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(home),
+            "TZ": "America/Los_Angeles",
+            "CLAUDE_ROUTER_ULTRACODE": "1",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(REPO / "bin" / "statusline.sh")],
+        input=json.dumps(fixture),
+        text=True,
+        capture_output=True,
+        env=env,
+        check=True,
+    )
+
+    assert ".ultracode" in result.stdout
+    assert ".xhigh" not in result.stdout
+
+
+def test_statusline_keeps_plain_xhigh_distinct_from_ultracode(tmp_path):
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    project = tmp_path / "project"
+    project.mkdir()
+    fixture = json.loads((REPO / "test" / "fixtures" / "input.json").read_text())
+    fixture["workspace"]["current_dir"] = str(project)
+    fixture["effort"] = {"level": "xhigh"}
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(home),
+            "TZ": "America/Los_Angeles",
+        }
+    )
+    env.pop("CLAUDE_ROUTER_ULTRACODE", None)
+
+    result = subprocess.run(
+        ["bash", str(REPO / "bin" / "statusline.sh")],
+        input=json.dumps(fixture),
+        text=True,
+        capture_output=True,
+        env=env,
+        check=True,
+    )
+
+    assert ".xhigh" in result.stdout
+    assert ".ultracode" not in result.stdout
+
+
+def test_statusline_uses_the_live_effort_when_ultracode_is_not_active(tmp_path):
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    project = tmp_path / "project"
+    project.mkdir()
+    fixture = json.loads((REPO / "test" / "fixtures" / "input.json").read_text())
+    fixture["workspace"]["current_dir"] = str(project)
+    fixture["effort"] = {"level": "max"}
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(home),
+            "TZ": "America/Los_Angeles",
+            "CLAUDE_ROUTER_ULTRACODE": "1",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(REPO / "bin" / "statusline.sh")],
+        input=json.dumps(fixture),
+        text=True,
+        capture_output=True,
+        env=env,
+        check=True,
+    )
+
+    assert ".max" in result.stdout
+    assert ".ultracode" not in result.stdout
+
+
+def test_statusline_tracks_effort_transitions_in_router_state(tmp_path, monkeypatch):
     home = tmp_path / "home"
     (home / ".claude").mkdir(parents=True)
     project = tmp_path / "project"
@@ -379,28 +1339,57 @@ def test_statusline_publishes_the_live_session_identity(tmp_path):
             "ACCOUNTS_ROUTED_LABEL": "first",
             "ACCOUNTS_ROUTED_EMAIL": "first@example.com",
             "ACCOUNTS_ROUTED_ORG_UUID": "org-first",
+            "CLAUDE_ROUTER_ULTRACODE": "1",
         }
     )
 
-    subprocess.run(
-        ["bash", str(REPO / "bin" / "statusline.sh")],
-        input=json.dumps(fixture),
-        text=True,
-        capture_output=True,
-        env=env,
-        check=True,
-    )
-
     try:
-        state = json.loads(state_path.read_text())
-        assert state["session_id"] == fixture["session_id"]
-        assert state["model"] == fixture["model"]["display_name"]
-        assert state["label"] == "first"
+        outputs = []
+        for reported, expected in (
+            ("xhigh", "ultracode"),
+            ("max", "max"),
+            ("xhigh", "xhigh"),
+        ):
+            fixture["effort"] = {"level": reported}
+            result = subprocess.run(
+                ["bash", str(REPO / "bin" / "statusline.sh")],
+                input=json.dumps(fixture),
+                text=True,
+                capture_output=True,
+                env=env,
+                check=True,
+            )
+            outputs.append(result.stdout)
+            assert json.loads(state_path.read_text())["effort"] == expected
+
+        assert ".ultracode" in outputs[0]
+        assert ".max" in outputs[1]
+        assert ".xhigh" in outputs[2]
+        assert ".ultracode" not in outputs[2]
+
+        handoff_args = claude_router.resume_session_args(
+            ["--effort", "ultracode"],
+            fixture["session_id"],
+            effort_override=json.loads(state_path.read_text())["effort"],
+        )
+        monkeypatch.setenv("CLAUDE_ROUTER_ULTRACODE", "1")
+        handoff_env = claude_router.routed_environment(
+            {
+                "profile": "/profiles/second",
+                "label": "second",
+                "email": "second@example.com",
+                "org_uuid": "org-second",
+            },
+            tmp_path / "router-state.json",
+            handoff_args,
+        )
+        assert claude_router.option_value(handoff_args, "--effort") == "xhigh"
+        assert "CLAUDE_ROUTER_ULTRACODE" not in handoff_env
     finally:
         state_path.unlink(missing_ok=True)
 
 
-def test_statusline_says_when_a_quota_gate_bypasses_the_pin(tmp_path):
+def test_statusline_says_when_a_forced_target_is_pending(tmp_path):
     home = tmp_path / "home"
     (home / ".claude").mkdir(parents=True)
     (home / ".accounts").mkdir()
@@ -434,7 +1423,7 @@ def test_statusline_says_when_a_quota_gate_bypasses_the_pin(tmp_path):
     )
 
     assert "safe" in result.stdout
-    assert "pin preferred bypassed" in result.stdout
+    assert "set preferred pending" in result.stdout
 
 
 def test_statusline_says_when_an_env_pin_is_bypassed(tmp_path):
@@ -524,7 +1513,7 @@ def test_running_session_hands_off_without_returning_to_the_shell(tmp_path):
         "with Path(os.environ['ROUTER_TEST_LOG']).open('a') as f:\n"
         "    f.write(json.dumps({'args': args, 'label': os.environ['ACCOUNTS_ROUTED_LABEL']}) + '\\n')\n"
         "Path(os.environ['ACCOUNTS_ROUTER_STATE']).write_text(\n"
-        "    json.dumps({'session_id': sid, 'model': 'Opus'})\n"
+        "    json.dumps({'session_id': sid, 'model': 'Opus', 'effort': 'high'})\n"
         ")\n"
         "count = len(Path(os.environ['ROUTER_TEST_LOG']).read_text().splitlines())\n"
         "if count == 1:\n"
@@ -578,6 +1567,9 @@ def test_running_session_hands_off_without_returning_to_the_shell(tmp_path):
     assert [launch["label"] for launch in launches] == ["first", "second"]
     first_session = launches[0]["args"][-1]
     assert launches[0]["args"][-2] == "--session-id"
+    assert launches[1]["args"][
+        launches[1]["args"].index("--effort") + 1
+    ] == "high"
     assert launches[1]["args"][-4:] == [
         "--model",
         "opus",
@@ -647,7 +1639,7 @@ def test_running_opus_session_switches_to_fable_when_mode_changes(tmp_path):
         "    f.write(json.dumps({'args': args, 'label': label}) + '\\n')\n"
         "model = 'Fable 5.max' if 'fable' in args else 'Opus 5.max'\n"
         "Path(os.environ['ACCOUNTS_ROUTER_STATE']).write_text(\n"
-        "    json.dumps({'session_id': sid, 'model': model})\n"
+        "    json.dumps({'session_id': sid, 'model': model, 'effort': 'high'})\n"
         ")\n"
         "count = len(Path(os.environ['ROUTER_TEST_LOG']).read_text().splitlines())\n"
         "if count == 1:\n"
@@ -688,6 +1680,9 @@ def test_running_opus_session_switches_to_fable_when_mode_changes(tmp_path):
     assert stderr == ""
     assert [launch["label"] for launch in launches] == ["general", "fable"]
     first_session = launches[0]["args"][-1]
+    assert launches[1]["args"][
+        launches[1]["args"].index("--effort") + 1
+    ] == "high"
     assert launches[1]["args"][-4:] == [
         "--model",
         "fable",
@@ -757,7 +1752,7 @@ def test_fable_session_falls_back_to_opus_when_no_fable_account_is_safe(tmp_path
         "    f.write(json.dumps({'args': args, 'label': label}) + '\\n')\n"
         "model = 'Opus' if 'opus' in args else 'Fable 5.max'\n"
         "Path(os.environ['ACCOUNTS_ROUTER_STATE']).write_text(\n"
-        "    json.dumps({'session_id': sid, 'model': model})\n"
+        "    json.dumps({'session_id': sid, 'model': model, 'effort': 'max'})\n"
         ")\n"
         "count = len(Path(os.environ['ROUTER_TEST_LOG']).read_text().splitlines())\n"
         "if count == 1:\n"
@@ -791,9 +1786,9 @@ def test_fable_session_falls_back_to_opus_when_no_fable_account_is_safe(tmp_path
         json.dumps(
             {
                 "first@example.com|org-first": {
-                    "five_hour_pct": 90,
+                    "five_hour_pct": 10,
                     "seven_day_pct": 10,
-                    "fable_pct": 90,
+                    "fable_pct": 95,
                 },
                 "second@example.com|org-second": {
                     "five_hour_pct": 20,
@@ -810,8 +1805,11 @@ def test_fable_session_falls_back_to_opus_when_no_fable_account_is_safe(tmp_path
     assert process.returncode == 0
     assert stdout == ""
     assert stderr == ""
-    assert [launch["label"] for launch in launches] == ["first", "second"]
+    assert [launch["label"] for launch in launches] == ["first", "first"]
     first_session = launches[0]["args"][-1]
+    assert launches[1]["args"][
+        launches[1]["args"].index("--effort") + 1
+    ] == "max"
     assert launches[1]["args"][-4:] == [
         "--model",
         "opus",

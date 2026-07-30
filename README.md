@@ -33,7 +33,7 @@ Four tools, one repo, shared data files:
 - **Token scanning & redaction** (`bin/scan-tokens*`) — attribute every token, redact before sharing
 
 ```
-model   Fable 5.max
+model   Fable 5.ultracode
 time    ⏱ 2:29:20
 account you@example.com
 repo    my-project main (v1.2.0*)
@@ -133,7 +133,7 @@ dispatch to the renderer; anything else launches Codex). `codex-top` monitors ex
 
 | Row | Shown when | What it shows |
 |-----|-----------|----------------|
-| `model` | always | Model + effort suffix (`.low`/`.medium`/`.high`/`.xhigh`/`.max`) + `⚡fast` when Settings' fast mode is on |
+| `model` | always | Model + effort suffix (`.low`/`.medium`/`.high`/`.xhigh`/`.max`/`.ultracode`) + `⚡fast` when Settings' fast mode is on |
 | `time` | session duration available | Wall-clock (`⏱ 24:12`); adds `idle Nm` after 30s with no user turn |
 | `account` | account resolved | Tag from `ACCOUNT_LABELS`, colored per `LABEL_COLORS` |
 | `repo` | always | Dir name, `worktree`/`primary` tag, branch (dirty `*`, `↑`/`↓` ahead/behind), PR badge |
@@ -294,9 +294,9 @@ the router tools under `~/.local/bin`, and prepends a supervised launcher from
 
 | Command | What it does |
 |---------|---------------|
-| `accounts set <label>` | Prefer `<label>` while it has safe quota headroom |
-| `accounts auto` | Route sessions to the freshest account |
-| `accounts fable` | Switch supervised sessions to Fable while headroom is available |
+| `accounts set <label>` | Force every supervised session onto `<label>` |
+| `accounts auto` | Route supervised sessions to the freshest account |
+| `accounts fable` | Switch live supervised sessions to Fable while headroom is available |
 | `accounts status` | Mode + per-account 5h headroom + ⚠login flags |
 | `accounts poll` | Refresh dormant file-backed profiles, then poll every routable account |
 | `accounts refresh [label]` | Refresh stale file-backed credentials without a browser |

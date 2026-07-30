@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 import accounts
@@ -34,6 +35,10 @@ PASSTHROUGH_FLAGS = {"-h", "--help", "-p", "--print", "-v", "--version"}
 ROUTER_INTERVAL_S = 2.0
 LEASE_HEARTBEAT_S = 5.0
 FABLE_FALLBACK_MODEL = "opus"
+DEFAULT_EFFORT = "ultracode"
+DEFAULT_SESSION_NAME = "\u2063"
+ULTRACODE_ENV = "CLAUDE_ROUTER_ULTRACODE"
+SESSION_LIMIT_TEXT = "You've hit your session limit"
 SYNC_OUTPUT_ON = b"\x1b[?2026h"
 SYNC_OUTPUT_OFF = b"\x1b[?2026l"
 
@@ -95,6 +100,21 @@ def initial_session_args(args: list[str]) -> tuple[list[str], str | None]:
     return [*args, "--session-id", session_id], session_id
 
 
+def with_default_effort(args: list[str]) -> list[str]:
+    if any(arg == "--effort" or arg.startswith("--effort=") for arg in args):
+        return list(args)
+    return [*args, "--effort", DEFAULT_EFFORT]
+
+
+def with_default_session_name(args: list[str]) -> list[str]:
+    if any(
+        arg in {"-n", "--name"} or arg.startswith("--name=")
+        for arg in args
+    ):
+        return list(args)
+    return [*args, "--name", DEFAULT_SESSION_NAME]
+
+
 def replace_model_args(args: list[str], model: str) -> list[str]:
     stripped: list[str] = []
     index = 0
@@ -111,10 +131,27 @@ def replace_model_args(args: list[str], model: str) -> list[str]:
     return [*stripped, "--model", model]
 
 
+def replace_effort_args(args: list[str], effort: str) -> list[str]:
+    stripped: list[str] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--effort":
+            index += 2
+            continue
+        if arg.startswith("--effort="):
+            index += 1
+            continue
+        stripped.append(arg)
+        index += 1
+    return [*stripped, "--effort", effort]
+
+
 def resume_session_args(
     args: list[str],
     session_id: str,
     model_override: str | None = None,
+    effort_override: str | None = None,
 ) -> list[str]:
     stripped: list[str] = []
     index = 0
@@ -123,7 +160,12 @@ def resume_session_args(
         if arg in {"-c", "--continue", "--fork-session"}:
             index += 1
             continue
-        if arg in {"-r", "--resume", "--session-id", "--from-pr"}:
+        if arg in {"-r", "--resume", "--from-pr"}:
+            index += 1
+            if index < len(args) and not args[index].startswith("-"):
+                index += 1
+            continue
+        if arg == "--session-id":
             index += 2
             continue
         if any(
@@ -134,6 +176,8 @@ def resume_session_args(
             continue
         stripped.append(arg)
         index += 1
+    if effort_override:
+        stripped = replace_effort_args(stripped, effort_override)
     if model_override:
         stripped = replace_model_args(stripped, model_override)
     return [*stripped, "--resume", session_id]
@@ -160,7 +204,11 @@ def model_family(args: list[str], rendered_model: str | None = None) -> str:
     return "fable" if model_name(args, rendered_model) == "fable" else "general"
 
 
-def routed_environment(selected: dict, state_path: Path) -> dict[str, str]:
+def routed_environment(
+    selected: dict,
+    state_path: Path,
+    args: list[str],
+) -> dict[str, str]:
     env = os.environ.copy()
     for key in (
         "CLAUDE_CODE_OAUTH_TOKEN",
@@ -168,8 +216,14 @@ def routed_environment(selected: dict, state_path: Path) -> dict[str, str]:
         "ACCOUNTS_ROUTED_LABEL",
         "ACCOUNTS_ROUTED_EMAIL",
         "ACCOUNTS_ROUTED_ORG_UUID",
+        ULTRACODE_ENV,
     ):
         env.pop(key, None)
+    effort = option_value(args, "--effort")
+    if effort is not None:
+        env.pop("CLAUDE_CODE_EFFORT_LEVEL", None)
+    if effort == DEFAULT_EFFORT:
+        env[ULTRACODE_ENV] = "1"
     env.update(
         {
             "CLAUDE_CONFIG_DIR": selected["profile"],
@@ -190,9 +244,130 @@ def read_router_state(path: Path) -> dict:
     return state if isinstance(state, dict) else {}
 
 
-def source_mtime() -> int | None:
+def session_transcript_path(session_id: str | None) -> Path | None:
+    if session_id is None:
+        return None
     try:
-        return Path(__file__).stat().st_mtime_ns
+        return next(
+            (Path.home() / ".claude" / "projects").glob(
+                f"*/{session_id}.jsonl"
+            ),
+            None,
+        )
+    except OSError:
+        return None
+
+
+def transcript_size(path: Path | None) -> int:
+    if path is None:
+        return 0
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def is_session_limit_record(record: dict) -> bool:
+    if (
+        record.get("type") != "assistant"
+        or record.get("isApiErrorMessage") is not True
+        or record.get("apiErrorStatus") != 429
+        or record.get("error") != "rate_limit"
+    ):
+        return False
+    content = (record.get("message") or {}).get("content") or []
+    return any(
+        isinstance(block, dict)
+        and block.get("type") == "text"
+        and SESSION_LIMIT_TEXT in str(block.get("text") or "")
+        for block in content
+    )
+
+
+def record_timestamp(record: dict) -> float | None:
+    value = record.get("timestamp")
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def read_new_session_limit(
+    path: Path,
+    offset: int,
+    *,
+    not_before: float | None = None,
+) -> tuple[bool, int]:
+    try:
+        with path.open("rb") as transcript:
+            transcript.seek(min(offset, path.stat().st_size))
+            next_offset = transcript.tell()
+            while True:
+                record_offset = transcript.tell()
+                line = transcript.readline()
+                if not line:
+                    return False, next_offset
+                if not line.endswith(b"\n"):
+                    return False, record_offset
+                next_offset = transcript.tell()
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict) or not is_session_limit_record(record):
+                    continue
+                timestamp = record_timestamp(record)
+                if not_before is None or (
+                    timestamp is not None and timestamp >= not_before
+                ):
+                    return True, next_offset
+    except OSError:
+        return False, offset
+
+
+def session_limit_route(
+    selected: dict,
+    current_family: str,
+    router_pid: int,
+) -> tuple[dict, str | None] | None:
+    next_profile = accounts.select_profile(
+        avoid_labels={selected["label"]},
+        require_fable=current_family == "fable",
+        lease_pid=router_pid,
+    )
+    if (
+        next_profile is not None
+        and next_profile["label"] != selected["label"]
+    ):
+        return next_profile, None
+    if current_family != "fable":
+        return None
+    fallback_model = os.environ.get(
+        "ACCOUNTS_FABLE_FALLBACK_MODEL",
+        FABLE_FALLBACK_MODEL,
+    )
+    next_profile = accounts.select_profile(
+        avoid_labels={selected["label"]},
+        require_fable=False,
+        prefer_fable=False,
+        lease_pid=router_pid,
+    )
+    if (
+        next_profile is None
+        or next_profile["label"] == selected["label"]
+    ):
+        return None
+    return next_profile, fallback_model
+
+
+def source_generation() -> tuple[int, int] | None:
+    try:
+        return (
+            Path(__file__).stat().st_mtime_ns,
+            Path(accounts.__file__).stat().st_mtime_ns,
+        )
     except OSError:
         return None
 
@@ -211,25 +386,45 @@ def set_synchronized_output(enabled: bool) -> bool:
 
 
 def stop_for_handoff(child: subprocess.Popen) -> None:
-    child.terminate()
+    synchronized = set_synchronized_output(True)
     try:
-        child.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        child.kill()
-        child.wait()
+        child.terminate()
+        try:
+            child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
+    finally:
+        if synchronized:
+            set_synchronized_output(False)
 
 
 def run_passthrough(binary: str, args: list[str]) -> int:
+    is_inference = any(arg in {"-p", "--print"} for arg in args)
+    launch_args = (
+        with_default_effort(args)
+        if is_inference
+        else list(args)
+    )
     if os.environ.get("CLAUDE_CONFIG_DIR"):
-        return subprocess.call([binary, *args])
-    current_family = model_family(args)
-    launch_args = args
+        if not is_inference:
+            return subprocess.call([binary, *launch_args])
+        env = os.environ.copy()
+        env.pop("CLAUDE_CODE_EFFORT_LEVEL", None)
+        env.pop(ULTRACODE_ENV, None)
+        if option_value(launch_args, "--effort") == DEFAULT_EFFORT:
+            env[ULTRACODE_ENV] = "1"
+        return subprocess.call([binary, *launch_args], env=env)
+    current_family = model_family(launch_args)
     selected = accounts.select_profile(require_fable=current_family == "fable")
     if selected is None and current_family == "fable":
-        selected = accounts.select_profile(require_fable=False)
+        selected = accounts.select_profile(
+            require_fable=False,
+            prefer_fable=False,
+        )
         if selected is not None:
             launch_args = replace_model_args(
-                args,
+                launch_args,
                 os.environ.get(
                     "ACCOUNTS_FABLE_FALLBACK_MODEL",
                     FABLE_FALLBACK_MODEL,
@@ -241,17 +436,19 @@ def run_passthrough(binary: str, args: list[str]) -> int:
     state_path = Path(f"/tmp/claude/account-router-{os.getpid()}.json")
     return subprocess.call(
         [binary, *launch_args],
-        env=routed_environment(selected, state_path),
+        env=routed_environment(selected, state_path, launch_args),
     )
 
 
 def run_supervised(binary: str, args: list[str]) -> int:
+    args = with_default_session_name(with_default_effort(args))
     launch_args, session_id = initial_session_args(args)
     router_pid = os.getpid()
     state_path = Path(f"/tmp/claude/account-router-{router_pid}.json")
     interval = float(os.environ.get("ACCOUNTS_ROUTER_INTERVAL", ROUTER_INTERVAL_S))
-    loaded_mtime = source_mtime()
+    loaded_generation = source_generation()
     current_model = model_name(args)
+    current_effort = option_value(args, "--effort")
     current_family = "fable" if current_model == "fable" else "general"
     if accounts.load_mode().get("mode") == "fable" and current_family != "fable":
         current_model = "fable"
@@ -269,6 +466,7 @@ def run_supervised(binary: str, args: list[str]) -> int:
         )
         selected = accounts.select_profile(
             require_fable=False,
+            prefer_fable=False,
             lease_pid=router_pid,
         )
         if selected is not None:
@@ -279,33 +477,44 @@ def run_supervised(binary: str, args: list[str]) -> int:
         print("accounts: no account has enough quota for this model", file=sys.stderr)
         return 1
 
-    output_frozen = os.environ.pop("ACCOUNTS_ROUTER_OUTPUT_FROZEN", "") == "1"
-    freeze_started = time.monotonic() if output_frozen else 0.0
+    if os.environ.pop("ACCOUNTS_ROUTER_OUTPUT_FROZEN", "") == "1":
+        set_synchronized_output(False)
     try:
         while True:
             state_path.unlink(missing_ok=True)
-            env = routed_environment(selected, state_path)
+            env = routed_environment(selected, state_path, launch_args)
             accounts.upsert_session_lease(
                 router_pid,
                 session_id,
                 selected["label"],
                 current_family,
             )
+            child_started_at = time.time()
+            watched_session_id = session_id
+            transcript_path = session_transcript_path(watched_session_id)
+            transcript_offset = transcript_size(transcript_path)
+            transcript_not_before = (
+                child_started_at if transcript_path is None else None
+            )
             child = subprocess.Popen([binary, *launch_args], env=env)
             last_heartbeat = time.monotonic()
             handoff = False
+            limit_route = None
+            limit_rejected = False
             while child.poll() is None:
                 try:
                     time.sleep(interval)
                 except KeyboardInterrupt:
                     continue
                 state = read_router_state(state_path)
-                if output_frozen and (
-                    state or time.monotonic() - freeze_started >= 1.5
-                ):
-                    set_synchronized_output(False)
-                    output_frozen = False
                 session_id = state.get("session_id") or session_id
+                if session_id != watched_session_id:
+                    watched_session_id = session_id
+                    transcript_path = session_transcript_path(watched_session_id)
+                    transcript_offset = 0
+                    transcript_not_before = child_started_at
+                elif transcript_path is None:
+                    transcript_path = session_transcript_path(watched_session_id)
                 rendered_model = state.get("model")
                 if rendered_model:
                     current_model = model_name(args, rendered_model)
@@ -318,6 +527,27 @@ def run_supervised(binary: str, args: list[str]) -> int:
                         and current_model != model_override
                     ):
                         model_override = None
+                rendered_effort = state.get("effort")
+                if isinstance(rendered_effort, str) and rendered_effort:
+                    current_effort = rendered_effort
+                if transcript_path is not None:
+                    limited, transcript_offset = read_new_session_limit(
+                        transcript_path,
+                        transcript_offset,
+                        not_before=transcript_not_before,
+                    )
+                    if limited and not limit_rejected:
+                        limit_rejected = True
+                        accounts.mark_session_limit(
+                            selected["email"],
+                            selected["org_uuid"],
+                        )
+                if limit_rejected:
+                    limit_route = session_limit_route(
+                        selected,
+                        current_family,
+                        router_pid,
+                    )
                 now = time.monotonic()
                 if now - last_heartbeat >= LEASE_HEARTBEAT_S:
                     accounts.upsert_session_lease(
@@ -329,26 +559,32 @@ def run_supervised(binary: str, args: list[str]) -> int:
                     last_heartbeat = now
                 if not session_id:
                     continue
-                current_mtime = source_mtime()
+                current_generation = source_generation()
                 if (
-                    loaded_mtime is not None
-                    and current_mtime is not None
-                    and current_mtime != loaded_mtime
+                    loaded_generation is not None
+                    and current_generation is not None
+                    and current_generation != loaded_generation
                 ):
-                    if not output_frozen:
-                        output_frozen = set_synchronized_output(True)
-                        freeze_started = time.monotonic()
                     stop_for_handoff(child)
-                    os.environ["ACCOUNTS_ROUTER_OUTPUT_FROZEN"] = "1"
                     os.execv(
                         sys.executable,
                         [
                             sys.executable,
                             str(Path(__file__).resolve()),
-                            *resume_session_args(args, session_id, current_model),
+                            *resume_session_args(
+                                args,
+                                session_id,
+                                current_model,
+                                current_effort,
+                            ),
                         ],
                     )
-                if (
+                if limit_rejected:
+                    if limit_route is None:
+                        continue
+                    next_profile, next_override = limit_route
+                    next_model = next_override or current_model
+                elif (
                     accounts.load_mode().get("mode") == "fable"
                     and current_family != "fable"
                 ):
@@ -389,16 +625,20 @@ def run_supervised(binary: str, args: list[str]) -> int:
                         next_override = next_model
                         next_profile = accounts.select_profile(
                             require_fable=False,
+                            prefer_fable=False,
                             lease_pid=router_pid,
                         )
                         if next_profile is None:
                             continue
                     else:
                         continue
-                output_frozen = set_synchronized_output(True)
-                freeze_started = time.monotonic()
                 stop_for_handoff(child)
-                launch_args = resume_session_args(args, session_id, next_model)
+                launch_args = resume_session_args(
+                    args,
+                    session_id,
+                    next_model,
+                    current_effort,
+                )
                 selected = next_profile
                 model_override = next_override
                 current_model = next_model
@@ -410,10 +650,62 @@ def run_supervised(binary: str, args: list[str]) -> int:
                 handoff = True
                 break
             if not handoff:
-                return child.wait()
+                state = read_router_state(state_path)
+                session_id = state.get("session_id") or session_id
+                if session_id != watched_session_id:
+                    watched_session_id = session_id
+                    transcript_path = session_transcript_path(watched_session_id)
+                    transcript_offset = 0
+                    transcript_not_before = child_started_at
+                elif transcript_path is None:
+                    transcript_path = session_transcript_path(watched_session_id)
+                rendered_model = state.get("model")
+                if rendered_model:
+                    current_model = model_name(args, rendered_model)
+                    current_family = (
+                        "fable" if current_model == "fable" else "general"
+                    )
+                rendered_effort = state.get("effort")
+                if isinstance(rendered_effort, str) and rendered_effort:
+                    current_effort = rendered_effort
+                if transcript_path is not None:
+                    limited, transcript_offset = read_new_session_limit(
+                        transcript_path,
+                        transcript_offset,
+                        not_before=transcript_not_before,
+                    )
+                    if limited and not limit_rejected:
+                        limit_rejected = True
+                        accounts.mark_session_limit(
+                            selected["email"],
+                            selected["org_uuid"],
+                        )
+                if limit_rejected:
+                    limit_route = session_limit_route(
+                        selected,
+                        current_family,
+                        router_pid,
+                    )
+                if not limit_rejected or limit_route is None:
+                    return child.wait()
+                next_profile, next_override = limit_route
+                next_model = next_override or current_model
+                launch_args = resume_session_args(
+                    args,
+                    session_id,
+                    next_model,
+                    current_effort,
+                )
+                selected = next_profile
+                model_override = next_override
+                current_model = next_model
+                current_family = (
+                    model_family(["--model", next_model])
+                    if next_model
+                    else current_family
+                )
+                handoff = True
     finally:
-        if output_frozen:
-            set_synchronized_output(False)
         accounts.remove_session_lease(router_pid)
         state_path.unlink(missing_ok=True)
 
