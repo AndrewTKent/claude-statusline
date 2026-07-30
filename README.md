@@ -33,7 +33,7 @@ Four tools, one repo, shared data files:
 - **Token scanning & redaction** (`bin/scan-tokens*`) — attribute every token, redact before sharing
 
 ```
-model   Fable 5.max
+model   Fable 5.ultracode
 time    ⏱ 2:29:20
 account you@example.com
 repo    my-project main (v1.2.0*)
@@ -133,7 +133,7 @@ dispatch to the renderer; anything else launches Codex). `codex-top` monitors ex
 
 | Row | Shown when | What it shows |
 |-----|-----------|----------------|
-| `model` | always | Model + effort suffix (`.low`/`.medium`/`.high`/`.xhigh`/`.max`) + `⚡fast` when Settings' fast mode is on |
+| `model` | always | Model + effort suffix (`.low`/`.medium`/`.high`/`.xhigh`/`.max`/`.ultracode`) + `⚡fast` when Settings' fast mode is on |
 | `time` | session duration available | Wall-clock (`⏱ 24:12`); adds `idle Nm` after 30s with no user turn |
 | `account` | account resolved | Tag from `ACCOUNT_LABELS`, colored per `LABEL_COLORS` |
 | `repo` | always | Dir name, `worktree`/`primary` tag, branch (dirty `*`, `↑`/`↓` ahead/behind), PR badge |
@@ -282,11 +282,21 @@ Credentials and entitlement caches are isolated; projects, transcripts, settings
 skills, and plugins are shared. Interactive sessions remain first-party
 `claude.ai` subscription sessions instead of API/setup-token sessions.
 
+Install the router from a local checkout:
+
+```bash
+./install-account-router.sh
+```
+
+The installer leaves Claude's native binary at `~/.local/bin/claude`, installs
+the router tools under `~/.local/bin`, and prepends a supervised launcher from
+`~/.accounts/bin` in new zsh sessions.
+
 | Command | What it does |
 |---------|---------------|
-| `accounts set <label>` | Prefer `<label>` while it has safe quota headroom |
-| `accounts auto` | Route sessions to the freshest account |
-| `accounts fable` | Prefer a Fable-capable account |
+| `accounts set <label>` | Force every supervised session onto `<label>` |
+| `accounts auto` | Route supervised sessions to the freshest account |
+| `accounts fable` | Switch live supervised sessions to Fable while headroom is available |
 | `accounts status` | Mode + per-account 5h headroom + ⚠login flags |
 | `accounts poll` | Refresh dormant file-backed profiles, then poll every routable account |
 | `accounts refresh [label]` | Refresh stale file-backed credentials without a browser |
@@ -298,8 +308,9 @@ skills, and plugins are shared. Interactive sessions remain first-party
 `claude-router.py` supervises interactive sessions. It reserves the selected
 account, watches the active model's quota windows, and resumes the exact session
 under another isolated profile before a window is exhausted. The shell never
-regains control during a handoff. If every Fable-capable account is gated, the
-same session resumes on Opus using the safest general-model account.
+regains control during a handoff. Changing to Fable mode also moves running
+supervised sessions to Fable in place. If every Fable-capable account is gated,
+the same session resumes on Opus using the safest general-model account.
 Minted long-lived tokens remain outside `~/.claude`
 (`~/.accounts/vault.json`); archival copies only session JSONLs from
 `~/.claude/projects`.
