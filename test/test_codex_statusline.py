@@ -104,100 +104,1461 @@ class CodexStatuslineTest(unittest.TestCase):
                 6.0,
             )
 
-    def test_rollout_cache_finishes_partial_appends_without_duplicates(self) -> None:
-        codex_statusline.ROLLOUT_CACHE.clear()
-        first = {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "one"}}
-        second = {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "one"}}
-        encoded_second = json.dumps(second).encode()
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "rollout.jsonl"
-            path.write_bytes(json.dumps(first).encode() + b"\n" + encoded_second[:20])
-            self.assertEqual(codex_statusline.read_rollout_events(str(path)), [first])
-
-            with path.open("ab") as stream:
-                stream.write(encoded_second[20:] + b"\n")
-
-            self.assertEqual(codex_statusline.read_rollout_events(str(path)), [first, second])
-            self.assertEqual(codex_statusline.read_rollout_events(str(path)), [first, second])
-
-    def test_rollout_cache_evicts_old_paths(self) -> None:
-        codex_statusline.ROLLOUT_CACHE.clear()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            for index in range(codex_statusline.MAX_ROLLOUT_CACHE + 3):
-                path = Path(tmpdir) / f"{index}.jsonl"
-                path.write_text(json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}) + "\n")
-                codex_statusline.read_rollout_events(str(path))
-
-        self.assertEqual(len(codex_statusline.ROLLOUT_CACHE), codex_statusline.MAX_ROLLOUT_CACHE)
-        codex_statusline.ROLLOUT_CACHE.clear()
-
-    def test_rollout_cache_discards_unread_entries_when_open_fails(self) -> None:
-        codex_statusline.ROLLOUT_CACHE.clear()
-        event = {"type": "event_msg", "payload": {"type": "task_started"}}
-        partial_event = {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "one"}}
-        with tempfile.TemporaryDirectory() as tmpdir:
-            paths = []
-            for index in range(codex_statusline.MAX_ROLLOUT_CACHE + 7):
-                path = Path(tmpdir) / f"{index}.jsonl"
-                path.write_text(json.dumps(event) + "\n")
-                paths.append(str(path))
-            seeded = paths[0]
-            with Path(seeded).open("ab") as stream:
-                stream.write(json.dumps(partial_event).encode())
-            self.assertEqual(codex_statusline.read_rollout_events(seeded), [event, partial_event])
-
-            with mock.patch.object(codex_statusline.Path, "open", side_effect=OSError):
-                for path in paths[1:]:
-                    self.assertEqual(codex_statusline.read_rollout_events(path), [])
-                self.assertEqual(codex_statusline.read_rollout_events(seeded), [event, partial_event])
-
-        self.assertEqual(list(codex_statusline.ROLLOUT_CACHE), [seeded])
-        codex_statusline.ROLLOUT_CACHE.clear()
-
-    def test_rollout_cache_does_not_retain_oversized_event_history(self) -> None:
-        codex_statusline.ROLLOUT_CACHE.clear()
+    def test_rollout_consumers_decode_large_history_once_then_only_appends(self) -> None:
+        codex_statusline.ROLLOUT_STATE_CACHE.clear()
         events = [
-            {"type": "event_msg", "payload": {"type": "task_started", "turn_id": str(index)}}
+            {
+                "timestamp": f"2026-07-29T12:00:0{index}Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": {"total_tokens": index + 1}},
+                },
+            }
             for index in range(5)
         ]
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "large.jsonl"
             path.write_text("\n".join(json.dumps(event) for event in events) + "\n")
-            with mock.patch.object(codex_statusline, "MAX_ROLLOUT_CACHE_EVENTS", 3):
-                first = codex_statusline.read_rollout_events(str(path))
-                self.assertNotIn(str(path), codex_statusline.ROLLOUT_CACHE)
-                second = codex_statusline.read_rollout_events(str(path))
+            thread = codex_statusline.Thread(
+                id="thread",
+                source="cli",
+                rollout_path=str(path),
+                created_at=0,
+                updated_at=int(datetime(2026, 7, 29, 12, 0, 4).timestamp()),
+                cwd="/tmp",
+                title="",
+                tokens_used=5,
+                model="",
+                reasoning_effort="",
+                sandbox_policy="",
+                approval_mode="",
+                git_branch="",
+                archived=0,
+            )
+            original_decode = codex_statusline.decode_rollout_line
+            decoded_lines = 0
 
-        self.assertEqual(first, events)
-        self.assertEqual(second, events)
-        self.assertNotIn(str(path), codex_statusline.ROLLOUT_CACHE)
+            def counted_decode(line: bytes):
+                nonlocal decoded_lines
+                decoded_lines += 1
+                return original_decode(line)
 
-    def test_rollout_cache_recovers_oversized_partial_event_after_completion(self) -> None:
-        codex_statusline.ROLLOUT_CACHE.clear()
+            with mock.patch.object(
+                codex_statusline,
+                "decode_rollout_line",
+                side_effect=counted_decode,
+            ):
+                codex_statusline.rollout_activity(
+                    thread,
+                    datetime(2026, 7, 29, 12, 0, 5),
+                )
+                self.assertEqual(decoded_lines, len(events))
+
+                self.assertEqual(
+                    codex_statusline.latest_token_count(str(path))["info"]["total_token_usage"]["total_tokens"],
+                    5,
+                )
+                codex_statusline.rollout_activity(
+                    thread,
+                    datetime(2026, 7, 29, 12, 0, 6),
+                )
+                self.assertEqual(decoded_lines, len(events))
+
+                appended = {
+                    "timestamp": "2026-07-29T12:00:05Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {"total_token_usage": {"total_tokens": 6}},
+                    },
+                }
+                with path.open("a") as stream:
+                    stream.write(json.dumps(appended) + "\n")
+
+                self.assertEqual(
+                    codex_statusline.latest_token_count(str(path))["info"]["total_token_usage"]["total_tokens"],
+                    6,
+                )
+                codex_statusline.rollout_activity(
+                    thread,
+                    datetime(2026, 7, 29, 12, 0, 7),
+                )
+
+        self.assertEqual(decoded_lines, len(events) + 1)
+
+    def test_rollout_state_streams_without_unbounded_reads(self) -> None:
+        codex_statusline.ROLLOUT_STATE_CACHE.clear()
+        record = (
+            b'{"timestamp":"2026-07-29T12:00:00Z","type":"compacted",'
+            b'"payload":{"text":"' + b"x" * (2 * 1024 * 1024) + b'"}}\n'
+        )
+        read_sizes: list[int] = []
+
+        class BoundedReader:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return self.stream.__exit__(*args)
+
+            def __iter__(self):
+                raise AssertionError("rollout iteration can materialize an entire record")
+
+            def readline(self, _size=-1):
+                raise AssertionError("rollout readline can materialize an entire record")
+
+            def read(self, size=-1):
+                self.assert_bounded(size)
+                read_sizes.append(size)
+                return self.stream.read(size)
+
+            def seek(self, *args):
+                return self.stream.seek(*args)
+
+            def fileno(self):
+                return self.stream.fileno()
+
+            @staticmethod
+            def assert_bounded(size):
+                if size < 0:
+                    raise AssertionError("unbounded rollout read")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "streamed.jsonl"
+            path.write_bytes(record)
+            original_open = codex_statusline.Path.open
+
+            def bounded_open(target, *args, **kwargs):
+                return BoundedReader(original_open(target, *args, **kwargs))
+
+            with mock.patch.object(
+                codex_statusline.Path,
+                "open",
+                autospec=True,
+                side_effect=bounded_open,
+            ):
+                state = codex_statusline.read_rollout_state(str(path))
+
+        self.assertEqual(state.activity.compactions, 1)
+        self.assertTrue(read_sizes)
+        self.assertLessEqual(max(read_sizes), codex_statusline.ROLLOUT_READ_BYTES)
+
+    def test_rollout_state_keeps_repeated_completed_turn_closed(self) -> None:
+        state = codex_statusline.new_rollout_state(1, None)
+        for payload in (
+            {"type": "task_started", "turn_id": "turn", "started_at": 100},
+            {"type": "task_complete", "turn_id": "turn"},
+            {"type": "task_started", "turn_id": "turn", "started_at": 200},
+        ):
+            codex_statusline.update_activity_state(
+                state,
+                {"type": "event_msg", "payload": payload},
+            )
+
+        self.assertEqual(state.activity.turns_started, 2)
+        self.assertEqual(state.activity.turns_completed, 1)
+        self.assertEqual(state.activity.started_turns, {})
+        self.assertIn("turn", state.activity.recent_closed_turns)
+
+    def test_rollout_state_cache_stable_257_path_sweep_replays_one_path(self) -> None:
+        codex_statusline.ROLLOUT_STATE_CACHE.clear()
+        original_decode = codex_statusline.decode_rollout_line
+        decoded_lines = 0
+
+        def counted_decode(line: bytes):
+            nonlocal decoded_lines
+            decoded_lines += 1
+            return original_decode(line)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = []
+            for index in range(codex_statusline.MAX_ROLLOUT_STATE_CACHE + 1):
+                path = Path(tmpdir) / f"{index}.jsonl"
+                path.write_text(
+                    json.dumps(
+                        {
+                            "type": "event_msg",
+                            "payload": {
+                                "type": "token_count",
+                                "info": {
+                                    "total_token_usage": {
+                                        "total_tokens": index,
+                                    }
+                                },
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+                paths.append(str(path))
+
+            with mock.patch.object(
+                codex_statusline,
+                "decode_rollout_line",
+                side_effect=counted_decode,
+            ):
+                with codex_statusline.rollout_state_sweep():
+                    for path in paths:
+                        codex_statusline.read_rollout_state(path)
+                        codex_statusline.read_rollout_state(path)
+                first_sweep_decodes = decoded_lines
+                with codex_statusline.rollout_state_sweep():
+                    for path in paths:
+                        codex_statusline.read_rollout_state(path)
+                        codex_statusline.read_rollout_state(path)
+
+        self.assertEqual(first_sweep_decodes, len(paths))
+        self.assertEqual(decoded_lines - first_sweep_decodes, 1)
+        self.assertEqual(
+            len(codex_statusline.ROLLOUT_STATE_CACHE),
+            codex_statusline.MAX_ROLLOUT_STATE_CACHE,
+        )
+
+    def test_rollout_state_sweep_bounds_encountered_paths(self) -> None:
+        with codex_statusline.rollout_state_sweep():
+            for index in range(20_000):
+                codex_statusline.cached_rollout_state(f"/tmp/{index}.jsonl")
+            self.assertEqual(
+                len(codex_statusline.ACTIVE_ROLLOUT_STATE_SWEEP.encountered),
+                codex_statusline.MAX_ROLLOUT_STATE_CACHE,
+            )
+
+    def test_rollout_append_reads_only_delta_and_fixed_probes(self) -> None:
+        codex_statusline.ROLLOUT_STATE_CACHE.clear()
+        history = (
+            b'{"timestamp":"2026-07-29T12:00:00Z","type":"compacted",'
+            b'"payload":{"text":"' + b"x" * (2 * 1024 * 1024) + b'"}}\n'
+        )
+        appended = (
+            json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {
+                                "total_tokens": 7,
+                            }
+                        },
+                    },
+                }
+            ).encode()
+            + b"\n"
+        )
+        bytes_read = 0
+
+        class CountingReader:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return self.stream.__exit__(*args)
+
+            def read(self, size=-1):
+                nonlocal bytes_read
+                if size < 0:
+                    raise AssertionError("unbounded rollout read")
+                chunk = self.stream.read(size)
+                bytes_read += len(chunk)
+                return chunk
+
+            def seek(self, *args):
+                return self.stream.seek(*args)
+
+            def fileno(self):
+                return self.stream.fileno()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "append.jsonl"
+            path.write_bytes(history)
+            codex_statusline.read_rollout_state(str(path))
+            with path.open("ab") as stream:
+                stream.write(appended)
+
+            original_open = codex_statusline.Path.open
+
+            def counting_open(target, *args, **kwargs):
+                return CountingReader(original_open(target, *args, **kwargs))
+
+            with mock.patch.object(
+                codex_statusline.Path,
+                "open",
+                autospec=True,
+                side_effect=counting_open,
+            ):
+                state = codex_statusline.read_rollout_state(str(path))
+
+        self.assertEqual(
+            state.latest_token["info"]["total_token_usage"]["total_tokens"],
+            7,
+        )
+        self.assertLessEqual(
+            bytes_read,
+            len(appended) + 4 * codex_statusline.ROLLOUT_PROBE_BYTES,
+        )
+
+    def test_streamed_compacted_payload_shapes_and_malformed_records(self) -> None:
+        codex_statusline.ROLLOUT_STATE_CACHE.clear()
+        valid_payloads = (
+            b"{}",
+            b"[]",
+            b'"text"',
+            b"-12.5e+3",
+            b"true",
+            b"false",
+            b"null",
+            '{"emoji":"😀","escape":"\\u263a"}'.encode(),
+        )
+        malformed_payloads = (
+            b'{"bad_escape":"\\q"}',
+            b'{"bad_number":01}',
+            b'{"trailing":[1,]}',
+            b'{"unfinished":"x}',
+            b'{"raw":"\xff"}',
+            b"truX",
+            b"[" * (codex_statusline.MAX_JSON_DEPTH + 1)
+            + b"0"
+            + b"]" * (codex_statusline.MAX_JSON_DEPTH + 1),
+        )
+        prefix = (
+            b'{"timestamp":"2026-07-29T12:00:00Z","type":"compacted",'
+            b'"payload":'
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                mock.patch.object(
+                    codex_statusline,
+                    "MAX_BUFFERED_ROLLOUT_LINE_BYTES",
+                    len(prefix),
+                ),
+                mock.patch.object(codex_statusline, "ROLLOUT_READ_BYTES", 1),
+            ):
+                for index, payload in enumerate(valid_payloads):
+                    with self.subTest(valid=payload):
+                        path = Path(tmpdir) / f"valid-{index}.jsonl"
+                        path.write_bytes(prefix + payload + b"}" + b" " * 200 + b"\r\n")
+                        codex_statusline.ROLLOUT_STATE_CACHE.clear()
+                        state = codex_statusline.read_rollout_state(str(path))
+                        self.assertEqual(state.activity.compactions, 1)
+                for index, payload in enumerate(malformed_payloads):
+                    with self.subTest(invalid=payload):
+                        path = Path(tmpdir) / f"invalid-{index}.jsonl"
+                        path.write_bytes(prefix + payload + b"}" + b" " * 200 + b"\n")
+                        codex_statusline.ROLLOUT_STATE_CACHE.clear()
+                    state = codex_statusline.read_rollout_state(str(path))
+                    self.assertEqual(state.activity.compactions, 0)
+
+    def test_rollout_state_streams_oversized_tool_call(self) -> None:
+        codex_statusline.ROLLOUT_STATE_CACHE.clear()
+        event = {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "call_id": "call-1",
+                "name": "exec_command",
+                "arguments": json.dumps(
+                    {
+                        "padding": "x" * (2 * 1024 * 1024),
+                        "cmd": "printf done",
+                        "nested": {"session_id": "session-1"},
+                    }
+                ),
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "large-tool-call.jsonl"
+            path.write_text(json.dumps(event) + "\n")
+            state = codex_statusline.read_rollout_state(str(path))
+
+        self.assertEqual(state.activity.tool_calls, 1)
+        self.assertEqual(state.activity.shell_calls, 1)
+        self.assertEqual(state.activity.last_command, "printf done")
+        self.assertEqual(state.activity.pending_tools, {"call-1": "exec_command"})
+        self.assertEqual(state.activity.tool_sessions, {"call-1": "session-1"})
+
+    def test_rollout_state_streams_oversized_tool_output(self) -> None:
+        codex_statusline.ROLLOUT_STATE_CACHE.clear()
+        events = (
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "call_id": "start",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "sleep 30"}),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "start",
+                    "output": json.dumps({"session_id": "session-1"}),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "call_id": "poll",
+                    "name": "write_stdin",
+                    "arguments": json.dumps({"session_id": "session-1"}),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "poll",
+                    "output": json.dumps(
+                        {
+                            "padding": "x" * (2 * 1024 * 1024),
+                            "exit_code": 0,
+                        }
+                    ),
+                },
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "large-tool-output.jsonl"
+            path.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+            state = codex_statusline.read_rollout_state(str(path))
+
+        activity = codex_statusline.activity_from_state(
+            state.activity,
+            mock.Mock(updated_at=int(datetime.now().timestamp())),
+            datetime.now(),
+            900,
+        )
+        self.assertEqual(state.activity.tool_calls, 2)
+        self.assertEqual(activity.active_tools, 0)
+        self.assertEqual(activity.active_shells, 0)
+
+    def test_rollout_state_streams_session_from_malformed_oversized_arguments(
+        self,
+    ) -> None:
+        codex_statusline.ROLLOUT_STATE_CACHE.clear()
+        events = (
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "call_id": "start",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "sleep 30"}),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "start",
+                    "output": json.dumps({"session_id": "session-1"}),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "call_id": "poll",
+                    "name": "write_stdin",
+                    "arguments": (
+                        '{"session_id":"session-1",' + "x" * (2 * 1024 * 1024)
+                    ),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "poll",
+                    "output": json.dumps({"exit_code": 0}),
+                },
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "large-malformed-arguments.jsonl"
+            path.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+            state = codex_statusline.read_rollout_state(str(path))
+
+        self.assertEqual(state.activity.pending_tools, {})
+        self.assertEqual(state.activity.running_shells, {})
+
+    def test_rollout_state_streams_spaced_session_from_malformed_arguments(
+        self,
+    ) -> None:
+        codex_statusline.ROLLOUT_STATE_CACHE.clear()
+        events = (
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "call_id": "start",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "sleep 30"}),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "start",
+                    "output": json.dumps({"session_id": "session-1"}),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "call_id": "poll",
+                    "name": "write_stdin",
+                    "arguments": (
+                        '{"session_id"'
+                        + " " * 2048
+                        + ":"
+                        + " " * 2048
+                        + '"session-1",'
+                        + "x" * (2 * 1024 * 1024)
+                    ),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "poll",
+                    "output": json.dumps({"exit_code": 0}),
+                },
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "large-spaced-malformed-arguments.jsonl"
+            path.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+            state = codex_statusline.read_rollout_state(str(path))
+
+        self.assertEqual(state.activity.pending_tools, {})
+        self.assertEqual(state.activity.running_shells, {})
+
+    def test_streaming_tool_session_handles_escaped_value_across_chunks(
+        self,
+    ) -> None:
+        nested = (
+            '{"session_id"'
+            + " " * 2048
+            + ":"
+            + " " * 2048
+            + '"session\\u002d1",'
+        )
+        encoded = json.dumps(nested)[1:-1].encode()
+        capture = codex_statusline.EmbeddedJsonStringCapture(
+            session_any_depth=True,
+        )
+
+        for value in encoded:
+            capture.feed(bytes((value,)))
+
+        self.assertEqual(capture.finish()["session_id"], "session-1")
+
+    def test_rollout_state_streams_oversized_token_count(self) -> None:
+        codex_statusline.ROLLOUT_STATE_CACHE.clear()
         event = {
             "type": "event_msg",
-            "payload": {"type": "task_started", "turn_id": "x" * 200},
+            "payload": {
+                "padding": "x" * (2 * 1024 * 1024),
+                "type": "token_count",
+                "info": {
+                    "model_context_window": 1_000_000,
+                    "total_token_usage": {"total_tokens": 123},
+                },
+                "rate_limits": {"plan_type": "pro"},
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "large-token-count.jsonl"
+            path.write_text(json.dumps(event) + "\n")
+            state = codex_statusline.read_rollout_state(str(path))
+
+        self.assertEqual(
+            state.latest_token["info"]["total_token_usage"]["total_tokens"],
+            123,
+        )
+        self.assertEqual(state.latest_token["info"]["model_context_window"], 1_000_000)
+        self.assertEqual(state.latest_token["rate_limits"]["plan_type"], "pro")
+
+    def test_rollout_state_rejects_oversized_malformed_record_and_continues(self) -> None:
+        codex_statusline.ROLLOUT_STATE_CACHE.clear()
+        malformed = (
+            b'{"type":"response_item","payload":{"type":"custom_tool_call",'
+            b'"arguments":"' + b"x" * (2 * 1024 * 1024) + b'\\q"}}\n'
+        )
+        valid = (
+            json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_started",
+                        "turn_id": "valid",
+                        "started_at": 1,
+                    },
+                }
+            ).encode()
+            + b"\n"
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "malformed-then-valid.jsonl"
+            path.write_bytes(malformed + valid)
+            state = codex_statusline.read_rollout_state(str(path))
+
+        self.assertEqual(state.activity.turns_started, 1)
+        self.assertEqual(state.activity.started_turns, {"valid": 1})
+        self.assertEqual(state.activity.tool_calls, 0)
+
+    def test_compacted_canonical_record_validates_without_materializing_payload(self) -> None:
+        line = (
+            b'{"timestamp":"2026-07-29T12:00:00Z","type":"compacted",'
+            b'"payload":{"message":"large"}}'
+        )
+
+        with mock.patch.object(
+            codex_statusline.json,
+            "loads",
+            side_effect=AssertionError("canonical compacted line reached JSON"),
+        ):
+            decoded = codex_statusline.decode_rollout_line(line)
+
+        self.assertEqual(
+            decoded,
+            {"type": "compacted", "timestamp": "2026-07-29T12:00:00Z"},
+        )
+
+    def test_compacted_records_reject_nested_and_accept_alternate_shapes(self) -> None:
+        nested = json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "message": (
+                        '{"timestamp":"2026-07-29T12:00:00Z",'
+                        '"type":"compacted","payload":{}}'
+                    ),
+                },
+            },
+            separators=(",", ":"),
+        ).encode()
+        alternate = (
+            b'{"type":"compacted","timestamp":"2026-07-29T12:00:00Z",'
+            b'"payload":{}}'
+        )
+
+        with mock.patch.object(
+            codex_statusline.json,
+            "loads",
+            wraps=json.loads,
+        ) as loads:
+            nested_decoded = codex_statusline.decode_rollout_line(nested)
+            alternate_decoded = codex_statusline.decode_rollout_line(alternate)
+
+        self.assertEqual(loads.call_count, 2)
+        self.assertEqual(nested_decoded["payload"]["type"], "agent_message")
+        self.assertEqual(
+            alternate_decoded,
+            {"type": "compacted", "timestamp": "2026-07-29T12:00:00Z"},
+        )
+
+    def test_compacted_prefix_does_not_accept_malformed_json(self) -> None:
+        malformed_payloads = (
+            b'{"unfinished":}',
+            b'{"bad_escape":"\\q"}',
+            b'{"bad_number":01}',
+            b'{"unfinished_string":"x}',
+        )
+
+        for payload in malformed_payloads:
+            line = (
+                b'{"timestamp":"2026-07-29T12:00:00Z","type":"compacted",'
+                b'"payload":' + payload + b"}"
+            )
+            with self.subTest(payload=payload):
+                self.assertIsNone(codex_statusline.decode_rollout_line(line))
+
+    def test_rollout_consumers_preserve_trailing_line_without_reapplying_it(self) -> None:
+        codex_statusline.ROLLOUT_STATE_CACHE.clear()
+        event = {
+            "timestamp": "2026-07-29T12:00:00Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": {"total_tokens": 7}},
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "partial.jsonl"
+            path.write_text(json.dumps(event))
+            original_decode = codex_statusline.decode_rollout_line
+            decoded_lines = 0
+
+            def counted_decode(line: bytes):
+                nonlocal decoded_lines
+                decoded_lines += 1
+                return original_decode(line)
+
+            with mock.patch.object(
+                codex_statusline,
+                "decode_rollout_line",
+                side_effect=counted_decode,
+            ):
+                self.assertEqual(
+                    codex_statusline.latest_token_count(str(path))["info"]["total_token_usage"]["total_tokens"],
+                    7,
+                )
+
+                with path.open("a") as stream:
+                    stream.write("\n")
+
+                self.assertEqual(
+                    codex_statusline.latest_token_count(str(path))["info"]["total_token_usage"]["total_tokens"],
+                    7,
+                )
+
+        self.assertEqual(decoded_lines, 1)
+
+    def test_rollout_consumers_finish_incomplete_trailing_line_incrementally(self) -> None:
+        codex_statusline.ROLLOUT_STATE_CACHE.clear()
+        event = {
+            "timestamp": "2026-07-29T12:00:00Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": {"total_tokens": 7}},
+            },
         }
         encoded = json.dumps(event).encode()
-        split_at = len(encoded) - 10
-
+        split_at = len(encoded) // 2
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "partial.jsonl"
             path.write_bytes(encoded[:split_at])
-            with mock.patch.object(codex_statusline, "MAX_ROLLOUT_CACHE_PARTIAL_BYTES", 64):
-                self.assertEqual(codex_statusline.read_rollout_events(str(path)), [])
-                self.assertNotIn(str(path), codex_statusline.ROLLOUT_CACHE)
 
-                with path.open("ab") as stream:
-                    stream.write(encoded[split_at:] + b"\n")
+            self.assertEqual(codex_statusline.latest_token_count(str(path)), {})
 
-                completed = codex_statusline.read_rollout_events(str(path))
-                repeated = codex_statusline.read_rollout_events(str(path))
+            with path.open("ab") as stream:
+                stream.write(encoded[split_at:])
 
-        self.assertEqual(completed, [event])
-        self.assertEqual(repeated, [event])
-        self.assertEqual(completed.count(event), 1)
+            self.assertEqual(
+                codex_statusline.latest_token_count(str(path))["info"]["total_token_usage"]["total_tokens"],
+                7,
+            )
+
+    def test_token_boundary_state_decodes_only_new_lines(self) -> None:
+        codex_statusline.ROLLOUT_STATE_CACHE.clear()
+        events = [
+            {
+                "timestamp": datetime.fromtimestamp(timestamp).astimezone().isoformat(),
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": {"total_tokens": total}},
+                },
+            }
+            for timestamp, total in ((100, 100), (200, 200))
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "tokens.jsonl"
+            path.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+            original_decode = codex_statusline.decode_rollout_line
+            decoded_lines = 0
+
+            def counted_decode(line: bytes):
+                nonlocal decoded_lines
+                decoded_lines += 1
+                return original_decode(line)
+
+            with mock.patch.object(
+                codex_statusline,
+                "decode_rollout_line",
+                side_effect=counted_decode,
+            ):
+                self.assertEqual(codex_statusline.tokens_since_boundary(str(path), 250, 150), 150)
+                self.assertEqual(codex_statusline.tokens_since_boundary(str(path), 250, 150), 150)
+                self.assertEqual(decoded_lines, 2)
+
+                appended = {
+                    "timestamp": datetime.fromtimestamp(125).astimezone().isoformat(),
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {"total_token_usage": {"total_tokens": 120}},
+                    },
+                }
+                with path.open("a") as stream:
+                    stream.write(json.dumps(appended) + "\n")
+
+                self.assertEqual(codex_statusline.tokens_since_boundary(str(path), 260, 150), 140)
+
+        self.assertEqual(decoded_lines, 3)
+
+    def test_token_boundary_pruning_preserves_file_order(self) -> None:
+        codex_statusline.ROLLOUT_STATE_CACHE.clear()
+        events = [
+            {
+                "timestamp": datetime.fromtimestamp(timestamp).astimezone().isoformat(),
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": {"total_tokens": total}},
+                },
+            }
+            for timestamp, total in ((500, 1), (100, 2))
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "out-of-order-tokens.jsonl"
+            path.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+
+            codex_statusline.tokens_since_boundary(str(path), 2, 400)
+            value = codex_statusline.tokens_since_boundary(str(path), 2, 600)
+
+        self.assertEqual(value, 0)
+
+    def test_rollout_state_resets_after_truncation_and_replacement(self) -> None:
+        codex_statusline.ROLLOUT_STATE_CACHE.clear()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "rollout.jsonl"
+            started = {
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "one", "started_at": 100},
+            }
+            path.write_text(json.dumps(started) + "\n")
+            thread = codex_statusline.Thread(
+                id="thread",
+                source="cli",
+                rollout_path=str(path),
+                created_at=100,
+                updated_at=100,
+                cwd="/tmp",
+                title="",
+                tokens_used=0,
+                model="",
+                reasoning_effort="",
+                sandbox_policy="",
+                approval_mode="",
+                git_branch="",
+                archived=0,
+            )
+
+            initial = codex_statusline.rollout_activity(thread, datetime.fromtimestamp(110))
+            path.write_text(
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {"type": "task_complete", "turn_id": "different"},
+                    }
+                )
+                + "\n"
+            )
+            truncated = codex_statusline.rollout_activity(thread, datetime.fromtimestamp(111))
+
+            replacement = Path(tmpdir) / "replacement.jsonl"
+            replacement.write_text(
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {"type": "agent_message", "message": "replacement"},
+                    }
+                )
+                + "\n"
+            )
+            replacement.replace(path)
+            replaced = codex_statusline.rollout_activity(thread, datetime.fromtimestamp(112))
+
+        self.assertEqual(initial.turns_started, 1)
+        self.assertEqual(truncated.turns_started, 0)
+        self.assertEqual(truncated.turns_completed, 1)
+        self.assertEqual(replaced.turns_completed, 0)
+        self.assertEqual(replaced.last_agent_message, "replacement")
+
+    def test_rollout_state_resets_same_size_rewrite_with_preserved_tail(self) -> None:
+        codex_statusline.ROLLOUT_STATE_CACHE.clear()
+        old_token = {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": {"total_tokens": 111}},
+            },
+        }
+        new_token = {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": {"total_tokens": 222}},
+            },
+        }
+        preserved_tail = json.dumps({"ignored": "x" * 600}) + "\n"
+        old_content = json.dumps(old_token) + "\n" + preserved_tail
+        new_content = json.dumps(new_token) + "\n" + preserved_tail
+        self.assertEqual(len(old_content), len(new_content))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "rewritten.jsonl"
+            path.write_text(old_content)
+            first = codex_statusline.latest_token_count(str(path))
+            original_inode = path.stat().st_ino
+
+            path.write_text(new_content)
+            self.assertEqual(path.stat().st_ino, original_inode)
+            second = codex_statusline.latest_token_count(str(path))
+
+        self.assertEqual(first["info"]["total_token_usage"]["total_tokens"], 111)
+        self.assertEqual(second["info"]["total_token_usage"]["total_tokens"], 222)
+
+    def test_rollout_state_resets_after_truncate_and_regrow(self) -> None:
+        codex_statusline.ROLLOUT_STATE_CACHE.clear()
+        old_token = {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": {"total_tokens": 111}},
+            },
+        }
+        new_token = {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": {"total_tokens": 222}},
+            },
+        }
+        old_content = json.dumps(old_token) + "\n" + json.dumps({"ignored": "x" * 600}) + "\n"
+        new_content = json.dumps(new_token) + "\n" + json.dumps({"ignored": "y" * 800}) + "\n"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "regrown.jsonl"
+            path.write_text(old_content)
+            codex_statusline.latest_token_count(str(path))
+            original_inode = path.stat().st_ino
+
+            path.write_text(new_content)
+            self.assertEqual(path.stat().st_ino, original_inode)
+            refreshed = codex_statusline.latest_token_count(str(path))
+
+        self.assertEqual(refreshed["info"]["total_token_usage"]["total_tokens"], 222)
+
+    def test_rollout_state_resets_growth_after_prior_tail_rewrite(self) -> None:
+        codex_statusline.ROLLOUT_STATE_CACHE.clear()
+        old_token = {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": {"total_tokens": 111}},
+            },
+        }
+        new_token = {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": {"total_tokens": 222}},
+            },
+        }
+        prefix = json.dumps({"ignored": "a" * 4096}) + "\n"
+        old_suffix = json.dumps({"ignored": "b" * 4096}) + "\n"
+        new_suffix = json.dumps({"ignored": "c" * 4096}) + "\n"
+        old_content = prefix + json.dumps(old_token) + "\n" + old_suffix
+        new_content = (
+            prefix
+            + json.dumps(new_token)
+            + "\n"
+            + new_suffix
+            + json.dumps({"ignored": "growth"})
+            + "\n"
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "middle-rewrite.jsonl"
+            path.write_text(old_content)
+            first = codex_statusline.latest_token_count(str(path))
+            original_inode = path.stat().st_ino
+
+            path.write_text(new_content)
+            self.assertEqual(path.stat().st_ino, original_inode)
+            refreshed = codex_statusline.latest_token_count(str(path))
+
+        self.assertEqual(first["info"]["total_token_usage"]["total_tokens"], 111)
+        self.assertEqual(refreshed["info"]["total_token_usage"]["total_tokens"], 222)
+
+    def test_rollout_state_returns_fresh_state_when_reset_open_fails(self) -> None:
+        codex_statusline.ROLLOUT_STATE_CACHE.clear()
+        event = {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": {"total_tokens": 111}},
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "unreadable.jsonl"
+            path.write_text(json.dumps(event) + "\n")
+            self.assertTrue(codex_statusline.latest_token_count(str(path)))
+
+            path.write_text("")
+            with mock.patch.object(
+                codex_statusline.Path,
+                "open",
+                side_effect=OSError("unreadable"),
+            ):
+                refreshed = codex_statusline.read_rollout_state(str(path))
+
+        self.assertEqual(refreshed.latest_token, {})
+        self.assertEqual(refreshed.activity.turns_started, 0)
+
+    def test_rollout_state_replays_when_subagent_boundary_changes(self) -> None:
+        codex_statusline.ROLLOUT_STATE_CACHE.clear()
+        events = [
+            {
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "first", "started_at": 10},
+            },
+            {
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "first"},
+            },
+            {
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "second", "started_at": 20},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "shared.jsonl"
+            path.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+            base = codex_statusline.Thread(
+                id="first-child",
+                source='{"subagent":{}}',
+                rollout_path=str(path),
+                created_at=10,
+                updated_at=20,
+                cwd="/tmp",
+                title="",
+                tokens_used=0,
+                model="",
+                reasoning_effort="",
+                sandbox_policy="",
+                approval_mode="",
+                git_branch="",
+                archived=0,
+            )
+            renamed = dataclasses.replace(base, id="second-child")
+            later = dataclasses.replace(renamed, created_at=20)
+            original_decode = codex_statusline.decode_rollout_line
+            decoded_lines = 0
+
+            def counted_decode(line: bytes):
+                nonlocal decoded_lines
+                decoded_lines += 1
+                return original_decode(line)
+
+            with mock.patch.object(
+                codex_statusline,
+                "decode_rollout_line",
+                side_effect=counted_decode,
+            ):
+                first = codex_statusline.rollout_activity(base, datetime.fromtimestamp(30))
+                same_boundary = codex_statusline.rollout_activity(
+                    renamed,
+                    datetime.fromtimestamp(30),
+                )
+                later_boundary = codex_statusline.rollout_activity(
+                    later,
+                    datetime.fromtimestamp(30),
+                )
+                repeated = codex_statusline.rollout_activity(
+                    later,
+                    datetime.fromtimestamp(31),
+                )
+
+        self.assertEqual(first.turns_started, 2)
+        self.assertEqual(first.turns_completed, 1)
+        self.assertEqual(same_boundary.turns_started, 2)
+        self.assertEqual(later_boundary.turns_started, 1)
+        self.assertEqual(later_boundary.turns_completed, 0)
+        self.assertEqual(repeated.turns_started, 1)
+        self.assertEqual(decoded_lines, len(events) * 3)
+
+    def test_rollout_state_bounds_completed_turn_history(self) -> None:
+        codex_statusline.ROLLOUT_STATE_CACHE.clear()
+        events = []
+        for index in range(2000):
+            turn_id = f"turn-{index}"
+            events.extend(
+                [
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "task_started",
+                            "turn_id": turn_id,
+                            "started_at": index + 1,
+                        },
+                    },
+                    {
+                        "type": "event_msg",
+                        "payload": {"type": "task_complete", "turn_id": turn_id},
+                    },
+                ]
+            )
+        events.append(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "turn_id": "open",
+                    "started_at": 3000,
+                },
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "turns.jsonl"
+            path.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+            thread = codex_statusline.Thread(
+                id="thread",
+                source="cli",
+                rollout_path=str(path),
+                created_at=0,
+                updated_at=3000,
+                cwd="/tmp",
+                title="",
+                tokens_used=0,
+                model="",
+                reasoning_effort="",
+                sandbox_policy="",
+                approval_mode="",
+                git_branch="",
+                archived=0,
+            )
+
+            activity = codex_statusline.rollout_activity(thread, datetime.fromtimestamp(3010))
+            state = codex_statusline.ROLLOUT_STATE_CACHE[str(path)].activity
+
+        self.assertEqual(activity.turns_started, 2001)
+        self.assertEqual(activity.turns_completed, 2000)
+        self.assertEqual(activity.active_turn_seconds, 10)
+        self.assertEqual(state.started_turns, {"open": 3000})
+        self.assertEqual(
+            len(state.recent_closed_turns),
+            codex_statusline.MAX_RECENT_CLOSED_TURN_IDS,
+        )
+        self.assertNotIn("turn-0", state.recent_closed_turns)
+        self.assertIn("turn-1999", state.recent_closed_turns)
+
+    def test_rollout_state_consumes_out_of_order_turn_close(self) -> None:
+        state = codex_statusline.new_rollout_state(1, None)
+
+        codex_statusline.update_activity_state(
+            state,
+            {
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": "turn"},
+            },
+        )
+        self.assertIn("turn", state.activity.recent_closed_turns)
+
+        codex_statusline.update_activity_state(
+            state,
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "turn_id": "turn",
+                    "started_at": 100,
+                },
+            },
+        )
+
+        self.assertEqual(state.activity.turns_started, 1)
+        self.assertEqual(state.activity.turns_completed, 1)
+        self.assertEqual(state.activity.started_turns, {})
+        self.assertIn("turn", state.activity.recent_closed_turns)
+
+    def test_rollout_state_bounds_twenty_thousand_unmatched_turn_closures(self) -> None:
+        state = codex_statusline.new_rollout_state(1, None)
+        for index in range(20_000):
+            codex_statusline.update_activity_state(
+                state,
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete",
+                        "turn_id": f"turn-{index}",
+                    },
+                },
+            )
+
+        self.assertEqual(state.activity.turns_completed, 20_000)
+        self.assertEqual(
+            len(state.activity.recent_closed_turns),
+            codex_statusline.MAX_RECENT_CLOSED_TURN_IDS,
+        )
+        self.assertNotIn("turn-0", state.activity.recent_closed_turns)
+        self.assertIn("turn-19999", state.activity.recent_closed_turns)
+
+    def test_rollout_state_bounds_twenty_thousand_unmatched_turn_starts(self) -> None:
+        state = codex_statusline.new_rollout_state(1, None)
+        for index in range(20_000):
+            codex_statusline.update_activity_state(
+                state,
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_started",
+                        "turn_id": f"turn-{index}",
+                        "started_at": index + 1,
+                    },
+                },
+            )
+
+        self.assertEqual(state.activity.turns_started, 20_000)
+        self.assertEqual(
+            len(state.activity.started_turns),
+            codex_statusline.MAX_OPEN_TURN_IDS,
+        )
+        self.assertNotIn("turn-0", state.activity.started_turns)
+        self.assertIn("turn-19999", state.activity.started_turns)
+
+    def test_rollout_state_bounds_unmatched_tool_and_shell_state(self) -> None:
+        state = codex_statusline.new_rollout_state(1, None)
+        for index in range(20_000):
+            call_id = f"call-{index}"
+            codex_statusline.update_activity_state(
+                state,
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": "exec_command",
+                        "arguments": json.dumps({"session_id": f"session-{index}"}),
+                    },
+                },
+            )
+            codex_statusline.update_activity_state(
+                state,
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": f"missing-{index}",
+                        "output": json.dumps({"session_id": f"running-{index}"}),
+                    },
+                },
+            )
+
+        activity = state.activity
+        self.assertEqual(len(activity.pending_tools), codex_statusline.MAX_ACTIVE_TOOL_CALLS)
+        self.assertEqual(len(activity.tool_sessions), codex_statusline.MAX_ACTIVE_TOOL_CALLS)
+        self.assertEqual(len(activity.pending_shells), 0)
+        self.assertEqual(len(activity.running_shells), codex_statusline.MAX_RUNNING_SHELLS)
+        self.assertNotIn("call-0", activity.pending_tools)
+        self.assertIn("call-19999", activity.pending_tools)
+        self.assertNotIn("running-0", activity.running_shells)
+        self.assertIn("running-19999", activity.running_shells)
+
+    def test_rollout_state_falls_back_from_malformed_started_at(self) -> None:
+        root_state = codex_statusline.new_rollout_state(1, None)
+        codex_statusline.update_activity_state(
+            root_state,
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "turn_id": "root",
+                    "started_at": "bad",
+                },
+            },
+        )
+
+        subagent_state = codex_statusline.new_rollout_state(
+            1,
+            ("thread", True, 100),
+        )
+        codex_statusline.update_activity_state(
+            subagent_state,
+            {
+                "timestamp": datetime.fromtimestamp(120).astimezone().isoformat(),
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "turn_id": "subagent",
+                    "started_at": "bad",
+                },
+            },
+        )
+
+        self.assertEqual(root_state.activity.started_turns, {"root": 0})
+        self.assertTrue(subagent_state.activity.boundary_found)
+        self.assertEqual(subagent_state.activity.started_turns, {"subagent": 120})
+
+    def test_rollout_state_prunes_token_points_behind_cached_boundary(self) -> None:
+        codex_statusline.ROLLOUT_STATE_CACHE.clear()
+        events = [
+            {
+                "timestamp": datetime.fromtimestamp(index + 1).astimezone().isoformat(),
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": {"total_tokens": index + 1}},
+                },
+            }
+            for index in range(5000)
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "tokens.jsonl"
+            path.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+
+            value = codex_statusline.tokens_since_boundary(str(path), 5000, 10_000)
+            state = codex_statusline.ROLLOUT_STATE_CACHE[str(path)]
+
+        self.assertEqual(value, 0)
+        self.assertEqual(state.token_points, [(5000, 5000)])
+        self.assertEqual(len(state.token_baselines), 1)
+
+    def test_rollout_state_bounds_post_boundary_tokens_and_replays_old_boundary(self) -> None:
+        codex_statusline.ROLLOUT_STATE_CACHE.clear()
+        events = [
+            {
+                "timestamp": datetime.fromtimestamp(index).astimezone().isoformat(),
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": {"total_tokens": index}},
+                },
+            }
+            for index in range(1, 10_001)
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "bounded-tokens.jsonl"
+            path.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+
+            recent = codex_statusline.tokens_since_boundary(str(path), 10_000, 5_000)
+            old = codex_statusline.tokens_since_boundary(str(path), 10_000, 100)
+            state = codex_statusline.ROLLOUT_STATE_CACHE[str(path)]
+
+        self.assertEqual(recent, 5_001)
+        self.assertEqual(old, 9_901)
+        self.assertLessEqual(
+            len(state.token_points),
+            codex_statusline.MAX_TOKEN_POINTS,
+        )
+        self.assertEqual(len(state.token_baselines), 2)
+
+    def test_rollout_state_does_not_retain_oversized_valid_partial(self) -> None:
+        codex_statusline.ROLLOUT_STATE_CACHE.clear()
+        payload = (
+            b'{"timestamp":"2026-07-29T12:00:00Z","type":"compacted",'
+            b'"payload":{"text":"' + b"x" * (2 * 1024 * 1024) + b'"}}'
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "valid-partial.jsonl"
+            path.write_bytes(payload)
+            thread = codex_statusline.Thread(
+                id="thread",
+                source="cli",
+                rollout_path=str(path),
+                created_at=0,
+                updated_at=0,
+                cwd="/tmp",
+                title="",
+                tokens_used=0,
+                model="",
+                reasoning_effort="",
+                sandbox_policy="",
+                approval_mode="",
+                git_branch="",
+                archived=0,
+            )
+
+            first = codex_statusline.rollout_activity(thread, datetime.fromtimestamp(1))
+            repeated = codex_statusline.rollout_activity(thread, datetime.fromtimestamp(2))
+            with path.open("ab") as stream:
+                stream.write(b"\n")
+            completed = codex_statusline.rollout_activity(thread, datetime.fromtimestamp(3))
+            state = codex_statusline.ROLLOUT_STATE_CACHE[str(path)]
+
+        self.assertEqual(first.compactions, 1)
+        self.assertEqual(repeated.compactions, 1)
+        self.assertEqual(completed.compactions, 1)
+        self.assertLess(len(state.pending.buffer), 1024)
+
+    def test_rollout_state_resets_when_applied_partial_content_grows(self) -> None:
+        codex_statusline.ROLLOUT_STATE_CACHE.clear()
+        payload = (
+            b'{"timestamp":"2026-07-29T12:00:00Z","type":"compacted",'
+            b'"payload":{"text":"x"}}'
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "changed-valid-partial.jsonl"
+            path.write_bytes(payload)
+            first = codex_statusline.read_rollout_state(str(path))
+
+            with path.open("ab") as stream:
+                stream.write(b" ")
+            refreshed = codex_statusline.read_rollout_state(str(path))
+
+        self.assertEqual(first.activity.compactions, 1)
+        self.assertEqual(refreshed.activity.compactions, 1)
+        self.assertIs(first, refreshed)
+
+    def test_rollout_state_continues_oversized_partial_only_after_growth(self) -> None:
+        codex_statusline.ROLLOUT_STATE_CACHE.clear()
+        payload = (
+            b'{"timestamp":"2026-07-29T12:00:00Z","type":"compacted",'
+            b'"payload":{"text":"' + b"x" * (2 * 1024 * 1024) + b'"}'
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "incomplete-partial.jsonl"
+            path.write_bytes(payload)
+            self.assertEqual(codex_statusline.latest_token_count(str(path)), {})
+            first_state = codex_statusline.ROLLOUT_STATE_CACHE[str(path)]
+            self.assertEqual(codex_statusline.latest_token_count(str(path)), {})
+            with path.open("ab") as stream:
+                stream.write(b"}")
+            codex_statusline.latest_token_count(str(path))
+            state = codex_statusline.ROLLOUT_STATE_CACHE[str(path)]
+
+        self.assertEqual(state.activity.compactions, 1)
+        self.assertIs(first_state, state)
+        self.assertLess(len(state.pending.buffer), 1024)
+
+    def test_rollout_state_replays_invalid_continuation_after_applied_partial(self) -> None:
+        codex_statusline.ROLLOUT_STATE_CACHE.clear()
+        payload = (
+            b'{"timestamp":"2026-07-29T12:00:00Z","type":"compacted",'
+            b'"payload":{"text":"' + b"x" * (2 * 1024 * 1024) + b'"}}'
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "invalid-continuation.jsonl"
+            path.write_bytes(payload)
+            applied = codex_statusline.read_rollout_state(str(path))
+            with path.open("ab") as stream:
+                stream.write(b"x\n")
+            replayed = codex_statusline.read_rollout_state(str(path))
+
+        self.assertEqual(applied.activity.compactions, 1)
+        self.assertEqual(replayed.activity.compactions, 0)
+        self.assertIsNot(applied, replayed)
 
     def test_format_reset_same_day(self) -> None:
         now = datetime.fromtimestamp(1777428000).astimezone()
@@ -1174,6 +2535,60 @@ class CodexStatuslineTest(unittest.TestCase):
             conn.close()
 
         self.assertEqual({thread.id for thread in descendants}, {"child", "grandchild"})
+
+    def test_descendant_activity_summary_skips_stale_rollouts_but_keeps_total(self) -> None:
+        base = codex_statusline.Thread(
+            id="recent",
+            source='{"subagent":{}}',
+            rollout_path="/tmp/recent.jsonl",
+            created_at=900,
+            updated_at=950,
+            cwd="/tmp",
+            title="",
+            tokens_used=0,
+            model="",
+            reasoning_effort="",
+            sandbox_policy="",
+            approval_mode="",
+            git_branch="",
+            archived=0,
+        )
+        stale = dataclasses.replace(base, id="stale", rollout_path="/tmp/stale.jsonl", updated_at=100)
+        activity = codex_statusline.RolloutActivity(
+            turns_started=1,
+            turns_completed=0,
+            turns_aborted=0,
+            compactions=0,
+            tool_calls=1,
+            shell_calls=1,
+            patch_calls=0,
+            active_tools=1,
+            active_shells=1,
+            active_turn_seconds=50,
+            last_event="function_call",
+            last_command="sleep 30",
+            last_user_message="-",
+            last_agent_message="-",
+            active_tool="exec",
+            last_tool="exec",
+        )
+
+        with mock.patch.object(
+            codex_statusline,
+            "rollout_activity",
+            return_value=activity,
+        ) as rollout_activity:
+            summary = codex_statusline.descendant_activity_summary(
+                [base, stale],
+                datetime.fromtimestamp(1000),
+                100,
+            )
+
+        rollout_activity.assert_called_once_with(base, datetime.fromtimestamp(1000), 100)
+        self.assertEqual(
+            summary,
+            {"total": 2, "active": 1, "active_tools": 1, "active_shells": 1},
+        )
 
     def test_render_footer_shows_live_limits_and_workers_within_width(self) -> None:
         data = {
