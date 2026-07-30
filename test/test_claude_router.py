@@ -119,10 +119,18 @@ def test_explicit_effort_overrides_the_ultracode_default(args):
     assert claude_router.with_default_effort(args) == args
 
 
-def test_default_session_name_is_invisible():
+def test_default_session_name_is_invisible_but_not_trimmed_empty():
     args = claude_router.with_default_session_name(["--resume", "session-id"])
 
-    assert claude_router.option_value(args, "--name") == "\u2063"
+    assert claude_router.option_value(args, "--name") == "\u200b"
+
+
+def test_legacy_invisible_session_name_is_replaced():
+    args = claude_router.with_default_session_name(
+        ["--resume", "session-id", "--name", "\u2063"]
+    )
+
+    assert claude_router.option_value(args, "--name") == "\u200b"
 
 
 def test_explicit_session_name_is_preserved():
@@ -176,7 +184,7 @@ def test_handoff_preserves_flags_after_a_bare_optional_selector(selector):
 
     assert args == [
         "--name",
-        "\u2063",
+        "\u200b",
         "--effort",
         "xhigh",
         "--resume",
@@ -324,12 +332,43 @@ def test_transcript_cursor_only_accepts_a_new_structured_session_limit(tmp_path)
             + "\n"
         )
 
-    limited, next_offset = claude_router.read_new_session_limit(
+    limit_kind, next_offset = claude_router.read_new_session_limit(
         transcript,
         offset,
     )
 
-    assert limited is True
+    assert limit_kind == "session"
+    assert next_offset == transcript.stat().st_size
+
+
+def test_transcript_cursor_distinguishes_a_fable_limit(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "isApiErrorMessage": True,
+                "apiErrorStatus": 429,
+                "error": "rate_limit",
+                "message": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "You've reached your Fable 5 limit. "
+                                "Run /usage-credits to continue or switch models with /model."
+                            ),
+                        }
+                    ]
+                },
+            }
+        )
+        + "\n"
+    )
+
+    limit_kind, next_offset = claude_router.read_new_session_limit(transcript, 0)
+
+    assert limit_kind == "fable"
     assert next_offset == transcript.stat().st_size
 
 
@@ -338,10 +377,209 @@ def test_transcript_cursor_does_not_consume_a_partial_record(tmp_path):
     partial = b'{"type":"assistant","isApiErrorMessage":true'
     transcript.write_bytes(partial)
 
-    limited, next_offset = claude_router.read_new_session_limit(transcript, 0)
+    limit_kind, next_offset = claude_router.read_new_session_limit(transcript, 0)
 
-    assert limited is False
+    assert limit_kind is None
     assert next_offset == 0
+
+
+def test_fable_limit_marks_only_the_fable_window(monkeypatch):
+    selected = {
+        "email": "work@example.com",
+        "org_uuid": "org-work",
+    }
+    marked = []
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "mark_fable_limit",
+        lambda email, org_uuid: marked.append(("fable", email, org_uuid)),
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "mark_session_limit",
+        lambda email, org_uuid: marked.append(("session", email, org_uuid)),
+    )
+
+    claude_router.mark_detected_limit(selected, "fable")
+
+    assert marked == [("fable", "work@example.com", "org-work")]
+
+
+def test_fable_limit_can_fallback_to_opus_on_the_same_account(monkeypatch):
+    selected = {
+        "profile": "/profiles/first",
+        "label": "first",
+        "email": "first@example.com",
+        "org_uuid": "org-first",
+    }
+    selections = []
+
+    def select_profile(**kwargs):
+        selections.append(kwargs)
+        if kwargs.get("require_fable"):
+            return None
+        if kwargs.get("force_label") == "first":
+            return selected
+        return None
+
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "select_profile",
+        select_profile,
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "profile_general_exhausted",
+        lambda _label: False,
+    )
+
+    route = claude_router.session_limit_route(
+        selected,
+        "fable",
+        "fable",
+        123,
+    )
+
+    assert route == (selected, "opus")
+    assert selections[0]["avoid_labels"] == {"first"}
+    assert selections[0]["require_fable"] is True
+    assert selections[1]["avoid_labels"] == {"first"}
+    assert selections[1]["require_fable"] is False
+    assert selections[2]["force_label"] == "first"
+
+
+def test_fable_limit_does_not_fallback_to_known_exhausted_general_quota(
+    monkeypatch,
+):
+    selected = {
+        "profile": "/profiles/first",
+        "label": "first",
+        "email": "first@example.com",
+        "org_uuid": "org-first",
+    }
+    selections = []
+
+    def select_profile(**kwargs):
+        selections.append(kwargs)
+        return selected if kwargs.get("force_label") else None
+
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "select_profile",
+        select_profile,
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "profile_general_exhausted",
+        lambda _label: True,
+    )
+
+    assert (
+        claude_router.session_limit_route(
+            selected,
+            "fable",
+            "fable",
+            123,
+        )
+        is None
+    )
+    assert not any("force_label" in selection for selection in selections)
+
+
+def test_generic_session_limit_on_fable_falls_back_to_general(monkeypatch):
+    selected = {
+        "profile": "/profiles/first",
+        "label": "first",
+        "email": "first@example.com",
+        "org_uuid": "org-first",
+    }
+    second = {
+        "profile": "/profiles/second",
+        "label": "second",
+        "email": "second@example.com",
+        "org_uuid": "org-second",
+    }
+    selections = []
+
+    def select_profile(**kwargs):
+        selections.append(kwargs)
+        return None if kwargs.get("require_fable") else second
+
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "select_profile",
+        select_profile,
+    )
+
+    route = claude_router.session_limit_route(
+        selected,
+        "fable",
+        "session",
+        123,
+    )
+
+    assert route == (second, "opus")
+    assert selections == [
+        {
+            "avoid_labels": {"first"},
+            "require_fable": True,
+            "lease_pid": 123,
+        },
+        {
+            "avoid_labels": {"first"},
+            "require_fable": False,
+            "prefer_fable": False,
+            "lease_pid": 123,
+        },
+    ]
+
+
+def test_generic_limit_does_not_restart_the_same_forced_account(monkeypatch):
+    selected = {
+        "profile": "/profiles/first",
+        "label": "first",
+        "email": "first@example.com",
+        "org_uuid": "org-first",
+    }
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "select_profile",
+        lambda **_kwargs: selected,
+    )
+
+    assert (
+        claude_router.session_limit_route(
+            selected,
+            "fable",
+            "session",
+            123,
+        )
+        is None
+    )
+
+
+def test_fable_limit_does_not_reroute_an_opus_session(monkeypatch):
+    selected = {
+        "profile": "/profiles/first",
+        "label": "first",
+        "email": "first@example.com",
+        "org_uuid": "org-first",
+    }
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "select_profile",
+        lambda **_kwargs: pytest.fail("spent general quota for a Fable-only limit"),
+    )
+
+    assert (
+        claude_router.session_limit_route(
+            selected,
+            "general",
+            "fable",
+            123,
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -420,8 +658,8 @@ def test_api_session_limit_hands_off_the_same_conversation(
     )
     monkeypatch.setattr(
         claude_router.accounts,
-        "load_mode",
-        lambda: {"mode": "auto", "label": None},
+        "load_mode_snapshot",
+        lambda: ({"mode": "auto", "label": None}, (1, 1)),
     )
     monkeypatch.setattr(
         claude_router.accounts,
@@ -441,7 +679,7 @@ def test_api_session_limit_hands_off_the_same_conversation(
     monkeypatch.setattr(
         claude_router,
         "session_limit_route",
-        lambda _selected, family, _pid: (
+        lambda _selected, family, _kind, _pid: (
             route_families.append(family) or (second, None)
         ),
     )
@@ -468,11 +706,6 @@ def test_api_session_limit_hands_off_the_same_conversation(
             "model": "Fable 5",
             "effort": "high",
         },
-    )
-    monkeypatch.setattr(
-        claude_router,
-        "source_generation",
-        lambda: (1, 1),
     )
     monkeypatch.setattr(claude_router.subprocess, "Popen", launch)
     monkeypatch.setattr(claude_router.time, "sleep", lambda _seconds: None)
@@ -543,7 +776,7 @@ def test_session_limit_route_is_recomputed_until_a_later_set_target_exists(
         if sleep_count == 2:
             mode.update({"mode": "set", "label": "second"})
 
-    def route(_selected, _family, _pid):
+    def route(_selected, _family, _kind, _pid):
         route_modes.append(mode["mode"])
         return (second, None) if mode["mode"] == "set" else None
 
@@ -579,7 +812,11 @@ def test_session_limit_route_is_recomputed_until_a_later_set_target_exists(
         "initial_session_args",
         lambda args: ([*args, "--session-id", session_id], session_id),
     )
-    monkeypatch.setattr(claude_router.accounts, "load_mode", lambda: dict(mode))
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "load_mode_snapshot",
+        lambda: (dict(mode), (1, 1)),
+    )
     monkeypatch.setattr(
         claude_router.accounts,
         "select_profile",
@@ -615,7 +852,6 @@ def test_session_limit_route_is_recomputed_until_a_later_set_target_exists(
         },
     )
     monkeypatch.setattr(claude_router, "session_limit_route", route)
-    monkeypatch.setattr(claude_router, "source_generation", lambda: (1, 1))
     monkeypatch.setattr(
         claude_router.subprocess,
         "Popen",
@@ -735,8 +971,8 @@ def test_continue_catches_a_limit_written_before_the_session_id_is_known(
     monkeypatch.setattr(claude_router.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(
         claude_router.accounts,
-        "load_mode",
-        lambda: {"mode": "auto", "label": None},
+        "load_mode_snapshot",
+        lambda: ({"mode": "auto", "label": None}, (1, 1)),
     )
     monkeypatch.setattr(
         claude_router.accounts,
@@ -752,11 +988,6 @@ def test_continue_catches_a_limit_written_before_the_session_id_is_known(
         claude_router.accounts,
         "handoff_target",
         lambda *_args, **_kwargs: None,
-    )
-    monkeypatch.setattr(
-        claude_router.accounts,
-        "profile_has_headroom",
-        lambda *_args, **_kwargs: True,
     )
     monkeypatch.setattr(
         claude_router.accounts,
@@ -777,11 +1008,6 @@ def test_continue_catches_a_limit_written_before_the_session_id_is_known(
         claude_router,
         "read_router_state",
         lambda _path: {"session_id": session_id, "model": "Fable 5"},
-    )
-    monkeypatch.setattr(
-        claude_router,
-        "source_generation",
-        lambda: (1, 1),
     )
     monkeypatch.setattr(claude_router.subprocess, "Popen", launch)
     monkeypatch.setattr(claude_router, "stop_for_handoff", lambda _child: None)
@@ -807,13 +1033,6 @@ def test_continue_catches_a_limit_written_before_the_session_id_is_known(
 def test_rendered_model_name_maps_to_a_cli_alias():
     assert claude_router.model_name([], "Opus 5 (1M context)") == "opus"
     assert claude_router.model_name([], "Fable 5.max") == "fable"
-
-
-def test_source_generation_tracks_router_and_account_policy():
-    assert claude_router.source_generation() == (
-        Path(claude_router.__file__).stat().st_mtime_ns,
-        Path(claude_router.accounts.__file__).stat().st_mtime_ns,
-    )
 
 
 def test_handoff_finishes_synchronized_output_before_returning(monkeypatch):
@@ -887,18 +1106,7 @@ def test_handoff_brackets_timeout_kill_cleanup_on_a_pty(monkeypatch):
         os.close(master_fd)
 
 
-@pytest.mark.parametrize(
-    "generations",
-    [
-        iter([(1, 1), (2, 1)]),
-        iter([(1, 1), (1, 2)]),
-    ],
-    ids=["router-change", "account-policy-change"],
-)
-def test_running_supervisor_reexecs_new_routing_code(
-    generations,
-    monkeypatch,
-):
+def test_running_supervisor_ignores_advisory_quota_changes(monkeypatch):
     session_id = str(uuid.uuid4())
     selected = {
         "profile": "/profiles/first",
@@ -906,20 +1114,19 @@ def test_running_supervisor_reexecs_new_routing_code(
         "email": "first@example.com",
         "org_uuid": "org-first",
     }
-    exec_call = {}
-
-    class Reloaded(Exception):
-        pass
+    launches = []
 
     class Child:
-        def poll(self):
-            return None
+        def __init__(self):
+            self.polls = 0
 
-    monkeypatch.setattr(
-        claude_router,
-        "source_generation",
-        lambda: next(generations),
-    )
+        def poll(self):
+            self.polls += 1
+            return None if self.polls == 1 else 0
+
+        def wait(self):
+            return 0
+
     monkeypatch.setattr(
         claude_router,
         "initial_session_args",
@@ -940,7 +1147,23 @@ def test_running_supervisor_reexecs_new_routing_code(
         "remove_session_lease",
         lambda *_args: None,
     )
-    monkeypatch.setattr(claude_router.subprocess, "Popen", lambda *_args, **_kwargs: Child())
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "load_mode_snapshot",
+        lambda: ({"mode": "auto", "label": None}, (1, 1)),
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "handoff_target",
+        lambda *_args, **_kwargs: pytest.fail(
+            "quota-board refresh must not reroute an auto-mode live session"
+        ),
+    )
+    monkeypatch.setattr(
+        claude_router.subprocess,
+        "Popen",
+        lambda command, **_kwargs: launches.append(command) or Child(),
+    )
     monkeypatch.setattr(claude_router.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(
         claude_router,
@@ -951,28 +1174,116 @@ def test_running_supervisor_reexecs_new_routing_code(
             "effort": "max",
         },
     )
+
+    assert claude_router.run_supervised("/real/claude", []) == 0
+    assert len(launches) == 1
+
+
+@pytest.mark.parametrize("requested_mode", ["fable", "set"])
+def test_running_supervisor_retries_an_unavailable_human_route(
+    requested_mode,
+    monkeypatch,
+):
+    session_id = str(uuid.uuid4())
+    current = {
+        "profile": "/profiles/current",
+        "label": "current",
+        "email": "current@example.com",
+        "org_uuid": "org-current",
+    }
+    target = {
+        "profile": "/profiles/target",
+        "label": "target",
+        "email": "target@example.com",
+        "org_uuid": "org-target",
+    }
+    mode = {"mode": "auto", "label": None}
+    generation = {"value": (1, 1)}
+    launches = []
+    route_attempts = 0
+
+    class Child:
+        def __init__(self, first_launch):
+            self.first_launch = first_launch
+            self.polls = 0
+
+        def poll(self):
+            if not self.first_launch:
+                return 0
+            self.polls += 1
+            return None if self.polls <= 2 else 0
+
+        def wait(self):
+            return 0
+
+    def select_profile(**_kwargs):
+        nonlocal route_attempts
+        if not launches:
+            return current
+        route_attempts += 1
+        return target if route_attempts == 2 else None
+
+    def launch(command, **kwargs):
+        launches.append((command, kwargs))
+        if len(launches) == 1:
+            mode.update(
+                {
+                    "mode": requested_mode,
+                    "label": "target" if requested_mode == "set" else None,
+                }
+            )
+            generation["value"] = (2, 2)
+        return Child(first_launch=len(launches) == 1)
+
+    monkeypatch.setattr(
+        claude_router,
+        "initial_session_args",
+        lambda _args: (["--resume", session_id], session_id),
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "load_mode_snapshot",
+        lambda: (dict(mode), generation["value"]),
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "select_profile",
+        select_profile,
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "handoff_target",
+        lambda *_args, **_kwargs: "target",
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "upsert_session_lease",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "remove_session_lease",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        claude_router,
+        "read_router_state",
+        lambda _path: {
+            "session_id": session_id,
+            "model": "Fable 5" if len(launches) > 1 else "Opus 5",
+            "effort": "max",
+        },
+    )
+    monkeypatch.setattr(claude_router.subprocess, "Popen", launch)
+    monkeypatch.setattr(claude_router.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(claude_router, "stop_for_handoff", lambda _child: None)
-    monkeypatch.setattr(claude_router, "set_synchronized_output", lambda _enabled: True)
 
-    def fake_execv(binary, argv):
-        exec_call.update({"binary": binary, "argv": argv})
-        raise Reloaded
-
-    monkeypatch.setattr(claude_router.os, "execv", fake_execv)
-
-    with pytest.raises(Reloaded):
-        claude_router.run_supervised("/real/claude", [])
-
-    assert exec_call["binary"] == sys.executable
-    assert exec_call["argv"][
-        exec_call["argv"].index("--effort") + 1
-    ] == "max"
-    assert exec_call["argv"][-4:] == [
-        "--model",
-        "opus",
-        "--resume",
-        session_id,
-    ]
+    assert claude_router.run_supervised("/real/claude", []) == 0
+    assert route_attempts == 2
+    assert [
+        launch[1]["env"]["ACCOUNTS_ROUTED_LABEL"]
+        for launch in launches
+    ] == ["current", "target"]
 
 
 def test_fable_mode_launches_directly_on_fable(monkeypatch):
@@ -994,8 +1305,8 @@ def test_fable_mode_launches_directly_on_fable(monkeypatch):
 
     monkeypatch.setattr(
         claude_router.accounts,
-        "load_mode",
-        lambda: {"mode": "fable", "label": None},
+        "load_mode_snapshot",
+        lambda: ({"mode": "fable", "label": None}, (1, 1)),
     )
     monkeypatch.setattr(
         claude_router.accounts,
@@ -1023,7 +1334,7 @@ def test_fable_mode_launches_directly_on_fable(monkeypatch):
     assert selections[0]["require_fable"] is True
     assert launches[0][0][-2:] == ["--model", "fable"]
     assert claude_router.option_value(launches[0][0], "--effort") == "ultracode"
-    assert claude_router.option_value(launches[0][0], "--name") == "\u2063"
+    assert claude_router.option_value(launches[0][0], "--name") == "\u200b"
     assert "CLAUDE_CODE_EFFORT_LEVEL" not in launches[0][1]["env"]
     assert launches[0][1]["env"]["CLAUDE_ROUTER_ULTRACODE"] == "1"
 
@@ -1474,7 +1785,7 @@ def test_statusline_says_when_an_env_pin_is_bypassed(tmp_path):
     assert "pin preferred bypassed" in result.stdout
 
 
-def test_running_session_hands_off_without_returning_to_the_shell(tmp_path):
+def test_advisory_usage_update_does_not_handoff_a_running_session(tmp_path):
     home = tmp_path / "home"
     claude_dir = home / ".claude"
     accounts_dir = home / ".accounts"
@@ -1506,10 +1817,12 @@ def test_running_session_hands_off_without_returning_to_the_shell(tmp_path):
                 "first@example.com|org-first": {
                     "five_hour_pct": 10,
                     "seven_day_pct": 10,
+                    "last_seen": time.time(),
                 },
                 "second@example.com|org-second": {
                     "five_hour_pct": 20,
                     "seven_day_pct": 20,
+                    "last_seen": time.time(),
                 },
             }
         )
@@ -1532,8 +1845,7 @@ def test_running_session_hands_off_without_returning_to_the_shell(tmp_path):
         ")\n"
         "count = len(Path(os.environ['ROUTER_TEST_LOG']).read_text().splitlines())\n"
         "if count == 1:\n"
-        "    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n"
-        "    while True: time.sleep(0.05)\n"
+        "    time.sleep(0.5)\n"
     )
     fake_claude.chmod(0o755)
     env = os.environ.copy()
@@ -1564,10 +1876,12 @@ def test_running_session_hands_off_without_returning_to_the_shell(tmp_path):
                 "first@example.com|org-first": {
                     "five_hour_pct": 90,
                     "seven_day_pct": 10,
+                    "last_seen": time.time(),
                 },
                 "second@example.com|org-second": {
                     "five_hour_pct": 20,
                     "seven_day_pct": 20,
+                    "last_seen": time.time(),
                 },
             }
         )
@@ -1579,18 +1893,8 @@ def test_running_session_hands_off_without_returning_to_the_shell(tmp_path):
     assert process.returncode == 0
     assert stdout == ""
     assert stderr == ""
-    assert [launch["label"] for launch in launches] == ["first", "second"]
-    first_session = launches[0]["args"][-1]
+    assert [launch["label"] for launch in launches] == ["first"]
     assert launches[0]["args"][-2] == "--session-id"
-    assert launches[1]["args"][
-        launches[1]["args"].index("--effort") + 1
-    ] == "high"
-    assert launches[1]["args"][-4:] == [
-        "--model",
-        "opus",
-        "--resume",
-        first_session,
-    ]
 
 
 def test_running_opus_session_switches_to_fable_when_mode_changes(tmp_path):
@@ -1629,11 +1933,13 @@ def test_running_opus_session_switches_to_fable_when_mode_changes(tmp_path):
                     "five_hour_pct": 10,
                     "seven_day_pct": 10,
                     "fable_pct": 100,
+                    "last_seen": time.time(),
                 },
                 "fable@example.com|org-fable": {
                     "five_hour_pct": 20,
                     "seven_day_pct": 20,
                     "fable_pct": 20,
+                    "last_seen": time.time(),
                 },
             }
         )
@@ -1742,11 +2048,13 @@ def test_fable_session_falls_back_to_opus_when_no_fable_account_is_safe(tmp_path
                     "five_hour_pct": 10,
                     "seven_day_pct": 10,
                     "fable_pct": 10,
+                    "last_seen": time.time(),
                 },
                 "second@example.com|org-second": {
                     "five_hour_pct": 20,
                     "seven_day_pct": 20,
                     "fable_pct": 100,
+                    "last_seen": time.time(),
                 },
             }
         )
@@ -1804,11 +2112,13 @@ def test_fable_session_falls_back_to_opus_when_no_fable_account_is_safe(tmp_path
                     "five_hour_pct": 10,
                     "seven_day_pct": 10,
                     "fable_pct": 95,
+                    "last_seen": time.time(),
                 },
                 "second@example.com|org-second": {
                     "five_hour_pct": 20,
                     "seven_day_pct": 20,
                     "fable_pct": 100,
+                    "last_seen": time.time(),
                 },
             }
         )
