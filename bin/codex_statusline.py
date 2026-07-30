@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import argparse
 import base64
-from contextlib import closing
+import codecs
+from contextlib import closing, contextmanager
 import json
 import os
 import re
@@ -15,7 +16,7 @@ import subprocess
 import sys
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -50,9 +51,34 @@ def resolve_state_db(home: Path) -> Path:
 STATE_DB = resolve_state_db(CODEX_HOME)
 CONFIG_FILE = Path(os.environ.get("CODEX_STATUSLINE_CONFIG") or CODEX_HOME / "statusline.conf")
 DEFAULT_BAR_WIDTH = 15
-MAX_ROLLOUT_CACHE = 64
-MAX_ROLLOUT_CACHE_EVENTS = 20_000
-MAX_ROLLOUT_CACHE_PARTIAL_BYTES = 1_048_576
+MAX_ROLLOUT_STATE_CACHE = 256
+MAX_ROLLOUT_SWEEP_CACHE = MAX_ROLLOUT_STATE_CACHE + 1
+ROLLOUT_READ_BYTES = 64 * 1024
+MAX_BUFFERED_ROLLOUT_LINE_BYTES = 1_048_576
+ROLLOUT_PROBE_BYTES = 256
+MAX_JSON_DEPTH = 256
+MAX_OPEN_TURN_IDS = 256
+MAX_RECENT_CLOSED_TURN_IDS = 256
+MAX_ACTIVE_TOOL_CALLS = 256
+MAX_RUNNING_SHELLS = 256
+MAX_TOKEN_BOUNDARIES = 4
+MAX_TOKEN_POINTS = 64
+MAX_JSON_KEY_CHARS = 128
+MAX_PROJECTED_JSON_FIELDS = 256
+COMPACTED_ROLLOUT_PREFIX = re.compile(
+    rb'^\{"timestamp":"([0-9T:.+\-Z]{1,64})","type":"compacted","payload":'
+)
+JSON_NUMBER = re.compile(
+    rb'-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?'
+)
+JSON_STRING_SPECIAL = re.compile(rb'["\\\x00-\x1f\x80-\xff]')
+JSON_WHITESPACE = b" \t\r\n"
+JSON_HEX_DIGITS = frozenset(b"0123456789abcdefABCDEF")
+TOOL_SESSION_PATTERN = re.compile(
+    r"""session_id["']?\s*:\s*["']?([A-Za-z0-9_-]+)"""
+)
+TOOL_SESSION_VALUE_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
+NON_WHITESPACE_PATTERN = re.compile(r"\S")
 
 
 def terminal_size() -> os.terminal_size:
@@ -149,14 +175,1176 @@ class RolloutActivity:
 
 
 @dataclass
-class RolloutCacheEntry:
+class ActivityState:
+    boundary_found: bool = True
+    started_turns: OrderedDict[str, int] = field(default_factory=OrderedDict)
+    recent_closed_turns: OrderedDict[str, None] = field(default_factory=OrderedDict)
+    pending_tools: OrderedDict[str, str] = field(default_factory=OrderedDict)
+    pending_shells: set[str] = field(default_factory=set)
+    running_shells: OrderedDict[str, None] = field(default_factory=OrderedDict)
+    tool_sessions: dict[str, str] = field(default_factory=dict)
+    turns_started: int = 0
+    turns_completed: int = 0
+    turns_aborted: int = 0
+    compactions: int = 0
+    tool_calls: int = 0
+    shell_calls: int = 0
+    patch_calls: int = 0
+    last_event: str = ""
+    last_command: str = ""
+    last_user_message: str = ""
+    last_agent_message: str = ""
+    last_tool: str = ""
+
+
+@dataclass
+class JsonStringDecoder:
+    sink: Any
+    escaped: bool = False
+    unicode_digits: bytearray = field(default_factory=bytearray)
+    unicode_remaining: int = 0
+    pending_high_surrogate: int | None = None
+    utf8_decoder: Any = field(
+        default_factory=lambda: codecs.getincrementaldecoder("utf-8")("replace")
+    )
+
+    def emit_text(self, text: str) -> None:
+        if not text:
+            return
+        if self.pending_high_surrogate is not None:
+            self.sink("\ufffd")
+            self.pending_high_surrogate = None
+        self.sink(text)
+
+    def emit_codepoint(self, codepoint: int) -> None:
+        if self.pending_high_surrogate is not None:
+            if 0xDC00 <= codepoint <= 0xDFFF:
+                high = self.pending_high_surrogate
+                self.pending_high_surrogate = None
+                combined = 0x10000 + ((high - 0xD800) << 10) + (codepoint - 0xDC00)
+                self.sink(chr(combined))
+                return
+            self.sink("\ufffd")
+            self.pending_high_surrogate = None
+        if 0xD800 <= codepoint <= 0xDBFF:
+            self.pending_high_surrogate = codepoint
+        elif 0xDC00 <= codepoint <= 0xDFFF:
+            self.sink("\ufffd")
+        else:
+            self.sink(chr(codepoint))
+
+    def feed(self, data: bytes) -> None:
+        offset = 0
+        escapes = {
+            ord('"'): '"',
+            ord("\\"): "\\",
+            ord("/"): "/",
+            ord("b"): "\b",
+            ord("f"): "\f",
+            ord("n"): "\n",
+            ord("r"): "\r",
+            ord("t"): "\t",
+        }
+        while offset < len(data):
+            if self.unicode_remaining:
+                taken = min(self.unicode_remaining, len(data) - offset)
+                self.unicode_digits.extend(data[offset : offset + taken])
+                offset += taken
+                self.unicode_remaining -= taken
+                if not self.unicode_remaining:
+                    try:
+                        codepoint = int(self.unicode_digits, 16)
+                    except ValueError:
+                        codepoint = 0xFFFD
+                    self.emit_codepoint(codepoint)
+                    self.unicode_digits.clear()
+                continue
+            if self.escaped:
+                value = data[offset]
+                offset += 1
+                self.escaped = False
+                if value == ord("u"):
+                    self.unicode_digits.clear()
+                    self.unicode_remaining = 4
+                    continue
+                if self.pending_high_surrogate is not None:
+                    self.sink("\ufffd")
+                    self.pending_high_surrogate = None
+                escaped = escapes.get(value)
+                if escaped is not None:
+                    self.sink(escaped)
+                continue
+
+            slash = data.find(b"\\", offset)
+            end = len(data) if slash < 0 else slash
+            decoded = self.utf8_decoder.decode(data[offset:end], final=False)
+            self.emit_text(decoded)
+            offset = end
+            if slash < 0:
+                return
+            self.escaped = True
+            offset += 1
+
+    def finish(self) -> None:
+        self.emit_text(self.utf8_decoder.decode(b"", final=True))
+        if self.pending_high_surrogate is not None:
+            self.sink("\ufffd")
+            self.pending_high_surrogate = None
+
+
+@dataclass
+class BoundedJsonStringCapture:
+    limit: int
+    normalize_whitespace: bool = False
+    chars: list[str] = field(default_factory=list)
+    pending_space: bool = False
+    overflow: bool = False
+    decoder: JsonStringDecoder = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.decoder = JsonStringDecoder(self.accept_text)
+
+    def accept_text(self, text: str) -> None:
+        if self.overflow:
+            return
+        if not self.normalize_whitespace:
+            remaining = self.limit + 1 - len(self.chars)
+            self.chars.extend(text[:remaining])
+            self.overflow = len(text) > remaining or len(self.chars) > self.limit
+            return
+        for match in re.finditer(r"\s+|\S+", text):
+            value = match.group(0)
+            if value.isspace():
+                self.pending_space = bool(self.chars)
+                continue
+            if self.pending_space:
+                self.chars.append(" ")
+                self.pending_space = False
+            remaining = self.limit + 1 - len(self.chars)
+            self.chars.extend(value[:remaining])
+            if len(value) > remaining or len(self.chars) > self.limit:
+                self.overflow = True
+                return
+
+    def feed(self, data: bytes) -> None:
+        self.decoder.feed(data)
+
+    def finish(self) -> str:
+        self.decoder.finish()
+        value = "".join(self.chars)
+        if self.normalize_whitespace and (self.overflow or len(value) > self.limit):
+            return value[: self.limit - 1] + "…"
+        return value[: self.limit]
+
+
+@dataclass
+class JsonFrame:
+    kind: str
+    state: str
+    path: tuple[str | int, ...]
+    key: str = ""
+    index: int = 0
+
+
+@dataclass
+class JsonValueScanner:
+    observer: Any = None
+    stack: list[JsonFrame] = field(default_factory=list)
+    mode: str = ""
+    string_is_key: bool = False
+    string_path: tuple[str | int, ...] = ()
+    string_capture: Any = None
+    unicode_digits_remaining: int = 0
+    literal: bytes = b""
+    literal_index: int = 0
+    scalar_path: tuple[str | int, ...] = ()
+    number_state: str = ""
+    number_buffer: bytearray = field(default_factory=bytearray)
+    number_truncated: bool = False
+    utf8_remaining: int = 0
+    utf8_min: int = 0x80
+    utf8_max: int = 0xBF
+    complete: bool = False
+    invalid: bool = False
+
+    def next_value_path(self) -> tuple[str | int, ...]:
+        if not self.stack:
+            return ()
+        frame = self.stack[-1]
+        if frame.kind == "object":
+            return (*frame.path, frame.key)
+        return (*frame.path, frame.index)
+
+    def finish_value(self) -> None:
+        if not self.stack:
+            self.complete = True
+            return
+        frame = self.stack[-1]
+        if frame.kind == "object" and frame.state == "value":
+            frame.state = "comma_or_end"
+            frame.key = ""
+            return
+        if frame.kind == "array" and frame.state in {"value_or_end", "value"}:
+            frame.state = "comma_or_end"
+            frame.index += 1
+            return
+        self.invalid = True
+
+    def finish_string(self) -> None:
+        self.mode = ""
+        result = self.string_capture.finish() if self.string_capture is not None else None
+        capture = self.string_capture
+        self.string_capture = None
+        if self.string_is_key:
+            if not self.stack or self.stack[-1].kind != "object":
+                self.invalid = True
+                return
+            frame = self.stack[-1]
+            frame.key = (
+                result
+                if isinstance(result, str)
+                and not getattr(capture, "overflow", False)
+                else "\0"
+            )
+            frame.state = "colon"
+            return
+        if self.observer is not None and capture is not None:
+            self.observer.string_value(self.string_path, result)
+        self.finish_value()
+
+    def feed_capture(self, data: bytes) -> None:
+        if self.string_capture is not None and data:
+            self.string_capture.feed(data)
+
+    def start_utf8(self, value: int) -> None:
+        if 0xC2 <= value <= 0xDF:
+            self.utf8_remaining = 1
+            self.utf8_min, self.utf8_max = 0x80, 0xBF
+        elif value == 0xE0:
+            self.utf8_remaining = 2
+            self.utf8_min, self.utf8_max = 0xA0, 0xBF
+        elif 0xE1 <= value <= 0xEC or 0xEE <= value <= 0xEF:
+            self.utf8_remaining = 2
+            self.utf8_min, self.utf8_max = 0x80, 0xBF
+        elif value == 0xED:
+            self.utf8_remaining = 2
+            self.utf8_min, self.utf8_max = 0x80, 0x9F
+        elif value == 0xF0:
+            self.utf8_remaining = 3
+            self.utf8_min, self.utf8_max = 0x90, 0xBF
+        elif 0xF1 <= value <= 0xF3:
+            self.utf8_remaining = 3
+            self.utf8_min, self.utf8_max = 0x80, 0xBF
+        elif value == 0xF4:
+            self.utf8_remaining = 3
+            self.utf8_min, self.utf8_max = 0x80, 0x8F
+        else:
+            self.invalid = True
+
+    def feed_string(self, data: bytes, offset: int) -> int:
+        while offset < len(data) and not self.invalid and self.mode:
+            value = data[offset]
+            if self.utf8_remaining:
+                self.feed_capture(data[offset : offset + 1])
+                if not self.utf8_min <= value <= self.utf8_max:
+                    self.invalid = True
+                    break
+                self.utf8_remaining -= 1
+                self.utf8_min, self.utf8_max = 0x80, 0xBF
+                offset += 1
+                continue
+            if self.mode == "unicode":
+                self.feed_capture(data[offset : offset + 1])
+                if value not in JSON_HEX_DIGITS:
+                    self.invalid = True
+                    break
+                self.unicode_digits_remaining -= 1
+                offset += 1
+                if not self.unicode_digits_remaining:
+                    self.mode = "string"
+                continue
+            if self.mode == "escape":
+                self.feed_capture(data[offset : offset + 1])
+                offset += 1
+                if value in b'"\\/bfnrt':
+                    self.mode = "string"
+                elif value == ord("u"):
+                    self.mode = "unicode"
+                    self.unicode_digits_remaining = 4
+                else:
+                    self.invalid = True
+                continue
+
+            match = JSON_STRING_SPECIAL.search(data, offset)
+            if match is None:
+                self.feed_capture(data[offset:])
+                return len(data)
+            self.feed_capture(data[offset : match.start()])
+            offset = match.start()
+            value = data[offset]
+            offset += 1
+            if value == ord('"'):
+                self.finish_string()
+            elif value == ord("\\"):
+                self.feed_capture(b"\\")
+                self.mode = "escape"
+            elif value < 0x20:
+                self.invalid = True
+            else:
+                self.feed_capture(bytes((value,)))
+                self.start_utf8(value)
+        return offset
+
+    def feed_number(self, value: int) -> bool:
+        digit = ord("0") <= value <= ord("9")
+        if self.number_state == "sign":
+            if value == ord("0"):
+                self.number_state = "zero"
+            elif ord("1") <= value <= ord("9"):
+                self.number_state = "int"
+            else:
+                self.invalid = True
+            return True
+        if self.number_state == "zero":
+            if digit:
+                self.invalid = True
+                return True
+            if value == ord("."):
+                self.number_state = "dot"
+                return True
+            if value in b"eE":
+                self.number_state = "exp"
+                return True
+            return False
+        if self.number_state == "int":
+            if digit:
+                return True
+            if value == ord("."):
+                self.number_state = "dot"
+                return True
+            if value in b"eE":
+                self.number_state = "exp"
+                return True
+            return False
+        if self.number_state == "dot":
+            if digit:
+                self.number_state = "frac"
+            else:
+                self.invalid = True
+            return True
+        if self.number_state == "frac":
+            if digit:
+                return True
+            if value in b"eE":
+                self.number_state = "exp"
+                return True
+            return False
+        if self.number_state == "exp":
+            if value in b"+-":
+                self.number_state = "exp_sign"
+            elif digit:
+                self.number_state = "exp_digits"
+            else:
+                self.invalid = True
+            return True
+        if self.number_state == "exp_sign":
+            if digit:
+                self.number_state = "exp_digits"
+            else:
+                self.invalid = True
+            return True
+        if self.number_state == "exp_digits":
+            return digit
+        self.invalid = True
+        return True
+
+    def number_complete(self) -> bool:
+        return self.number_state in {"zero", "int", "frac", "exp_digits"}
+
+    def finish_number(self) -> None:
+        if self.observer is not None and not self.number_truncated:
+            try:
+                value = json.loads(self.number_buffer)
+            except (ValueError, json.JSONDecodeError):
+                value = None
+            else:
+                self.observer.scalar_value(self.scalar_path, value)
+        self.number_buffer.clear()
+        self.number_truncated = False
+        self.mode = ""
+        self.finish_value()
+
+    def start_value(self, value: int) -> None:
+        path = self.next_value_path()
+        if value == ord('"'):
+            self.mode = "string"
+            self.string_is_key = False
+            self.string_path = path
+            self.string_capture = (
+                self.observer.string_capture(path) if self.observer is not None else None
+            )
+            return
+        if value in {ord("{"), ord("[")}:
+            if len(self.stack) >= MAX_JSON_DEPTH:
+                self.invalid = True
+                return
+            kind = "object" if value == ord("{") else "array"
+            state = "key_or_end" if kind == "object" else "value_or_end"
+            if self.observer is not None:
+                self.observer.start_container(path, kind)
+            self.stack.append(JsonFrame(kind, state, path))
+            return
+        self.scalar_path = path
+        if value == ord("-"):
+            self.mode = "number"
+            self.number_state = "sign"
+        elif value == ord("0"):
+            self.mode = "number"
+            self.number_state = "zero"
+        elif ord("1") <= value <= ord("9"):
+            self.mode = "number"
+            self.number_state = "int"
+        else:
+            literals = {
+                ord("t"): b"true",
+                ord("f"): b"false",
+                ord("n"): b"null",
+            }
+            if value not in literals:
+                self.invalid = True
+                return
+            self.mode = "literal"
+            self.literal = literals[value]
+            self.literal_index = 1
+            return
+        self.number_buffer = bytearray((value,))
+        self.number_truncated = False
+
+    def close_container(self) -> None:
+        frame = self.stack.pop()
+        if self.observer is not None:
+            self.observer.end_container(frame.path, frame.kind)
+        self.finish_value()
+
+    def feed(self, data: bytes) -> int:
+        offset = 0
+        while offset < len(data) and not self.complete and not self.invalid:
+            if self.mode in {"string", "escape", "unicode"}:
+                offset = self.feed_string(data, offset)
+                continue
+            if self.mode == "literal":
+                value = data[offset]
+                if (
+                    self.literal_index >= len(self.literal)
+                    or value != self.literal[self.literal_index]
+                ):
+                    self.invalid = True
+                    break
+                self.literal_index += 1
+                offset += 1
+                if self.literal_index == len(self.literal):
+                    if self.observer is not None:
+                        literal_value = {
+                            b"true": True,
+                            b"false": False,
+                            b"null": None,
+                        }[self.literal]
+                        self.observer.scalar_value(self.scalar_path, literal_value)
+                    self.mode = ""
+                    self.finish_value()
+                continue
+            if self.mode == "number":
+                value = data[offset]
+                if self.feed_number(value):
+                    if len(self.number_buffer) < 128:
+                        self.number_buffer.append(value)
+                    else:
+                        self.number_truncated = True
+                    offset += 1
+                    continue
+                if not self.number_complete():
+                    self.invalid = True
+                    break
+                self.finish_number()
+                continue
+
+            if not self.stack:
+                while offset < len(data) and data[offset] in JSON_WHITESPACE:
+                    offset += 1
+                if offset < len(data):
+                    self.start_value(data[offset])
+                    offset += 1
+                continue
+
+            frame = self.stack[-1]
+            while offset < len(data) and data[offset] in JSON_WHITESPACE:
+                offset += 1
+            if offset >= len(data):
+                break
+            value = data[offset]
+
+            if frame.kind == "object" and frame.state in {"key_or_end", "key"}:
+                if frame.state == "key_or_end" and value == ord("}"):
+                    self.close_container()
+                    offset += 1
+                elif value == ord('"'):
+                    self.mode = "string"
+                    self.string_is_key = True
+                    self.string_capture = BoundedJsonStringCapture(MAX_JSON_KEY_CHARS)
+                    offset += 1
+                else:
+                    self.invalid = True
+                continue
+            if frame.kind == "object" and frame.state == "colon":
+                if value != ord(":"):
+                    self.invalid = True
+                else:
+                    frame.state = "value"
+                    offset += 1
+                continue
+            if frame.state == "comma_or_end":
+                closing_byte = ord("}") if frame.kind == "object" else ord("]")
+                if value == closing_byte:
+                    self.close_container()
+                    offset += 1
+                elif value == ord(","):
+                    frame.state = "key" if frame.kind == "object" else "value"
+                    offset += 1
+                else:
+                    self.invalid = True
+                continue
+            if frame.kind == "array" and frame.state == "value_or_end" and value == ord("]"):
+                self.close_container()
+                offset += 1
+                continue
+            self.start_value(value)
+            offset += 1
+
+        if self.complete and self.observer is not None:
+            self.observer.finish()
+        return offset
+
+
+@dataclass
+class EmbeddedToolProjection:
+    session_any_depth: bool = False
+    root_kind: str = ""
+    values: dict[tuple[str | int, ...], Any] = field(default_factory=dict)
+    command_parts: dict[str, list[str]] = field(
+        default_factory=lambda: {"cmd": [], "command": []}
+    )
+    command_seen: set[str] = field(default_factory=set)
+
+    def start_container(self, path: tuple[str | int, ...], kind: str) -> None:
+        if not path:
+            self.root_kind = kind
+        if len(path) == 1 and path[0] in self.command_parts:
+            self.command_seen.add(str(path[0]))
+
+    def end_container(self, path: tuple[str | int, ...], kind: str) -> None:
+        return
+
+    def finish(self) -> None:
+        return
+
+    def string_capture(
+        self,
+        path: tuple[str | int, ...],
+    ) -> BoundedJsonStringCapture | None:
+        if path in {("cmd",), ("command",), ("session_id",)} or (
+            self.session_any_depth and path and path[-1] == "session_id"
+        ):
+            limit = 1024 if path[0] in {"cmd", "command"} else 256
+            return BoundedJsonStringCapture(limit)
+        if (
+            len(path) == 2
+            and path[0] in {"cmd", "command"}
+            and isinstance(path[1], int)
+        ):
+            return BoundedJsonStringCapture(1024)
+        return None
+
+    def append_command_part(self, key: str, value: Any) -> None:
+        self.command_seen.add(key)
+        parts = self.command_parts[key]
+        if (
+            len(parts) >= MAX_PROJECTED_JSON_FIELDS
+            or sum(len(part) for part in parts) >= 1024
+        ):
+            return
+        parts.append(str(value))
+
+    def string_value(self, path: tuple[str | int, ...], value: Any) -> None:
+        self.scalar_value(path, value)
+
+    def scalar_value(self, path: tuple[str | int, ...], value: Any) -> None:
+        if self.session_any_depth and path and path[-1] == "session_id":
+            self.values[("session_id",)] = value
+            return
+        if path in {("session_id",), ("exit_code",), ("cmd",), ("command",)}:
+            self.values[path] = value
+            if path[0] in {"cmd", "command"}:
+                self.command_seen.add(str(path[0]))
+            return
+        if (
+            len(path) == 2
+            and path[0] in {"cmd", "command"}
+            and isinstance(path[1], int)
+        ):
+            self.append_command_part(str(path[0]), value)
+
+    def result(self) -> dict[str, Any] | None:
+        if self.root_kind != "object":
+            return None
+        result: dict[str, Any] = {}
+        for key in ("session_id", "exit_code"):
+            path = (key,)
+            if path in self.values:
+                result[key] = self.values[path]
+        command_key = "cmd" if "cmd" in self.command_seen else "command"
+        command = self.values.get((command_key,))
+        if isinstance(command, str):
+            result["command"] = command
+        elif self.command_parts[command_key]:
+            result["command"] = " ".join(self.command_parts[command_key])
+        return result
+
+
+@dataclass
+class StreamingToolSessionCapture:
+    state: str = "search"
+    search_tail: str = ""
+    value_chars: list[str] = field(default_factory=list)
+    quote: str = ""
+    unicode_digits: str = ""
+    session_id: str = ""
+
+    def reset_candidate(self) -> None:
+        self.state = "search"
+        self.search_tail = ""
+        self.value_chars.clear()
+        self.quote = ""
+        self.unicode_digits = ""
+
+    def append_value(self, value: str) -> None:
+        remaining = 256 - len(self.value_chars)
+        if remaining > 0:
+            self.value_chars.extend(value[:remaining])
+
+    def finish_candidate(self) -> None:
+        if self.value_chars:
+            self.session_id = "".join(self.value_chars)
+            self.state = "done"
+        else:
+            self.reset_candidate()
+
+    def feed(self, text: str) -> None:
+        offset = 0
+        key = "session_id"
+        while offset < len(text) and not self.session_id:
+            if self.state == "search":
+                if self.search_tail:
+                    tail_size = len(self.search_tail)
+                    candidate = self.search_tail + text[offset:]
+                    found = candidate.find(key)
+                    if found < 0:
+                        self.search_tail = candidate[-(len(key) - 1) :]
+                        return
+                    offset += found + len(key) - tail_size
+                    self.search_tail = ""
+                else:
+                    found = text.find(key, offset)
+                    if found < 0:
+                        self.search_tail = text[offset:][-(len(key) - 1) :]
+                        return
+                    offset = found + len(key)
+                self.state = "after_key"
+                continue
+
+            if self.state == "after_key":
+                if text[offset] in "\"'":
+                    offset += 1
+                self.state = "before_colon"
+                continue
+
+            if self.state in {"before_colon", "before_value"}:
+                match = NON_WHITESPACE_PATTERN.search(text, offset)
+                if match is None:
+                    return
+                offset = match.start()
+                if self.state == "before_colon":
+                    if text[offset] != ":":
+                        self.reset_candidate()
+                        continue
+                    offset += 1
+                    self.state = "before_value"
+                    continue
+                if text[offset] in "\"'":
+                    self.quote = text[offset]
+                    offset += 1
+                self.state = "value"
+                continue
+
+            if self.state == "value":
+                match = TOOL_SESSION_VALUE_PATTERN.match(text, offset)
+                if match is not None:
+                    self.append_value(match.group(0))
+                    offset = match.end()
+                    if offset == len(text):
+                        return
+                value = text[offset]
+                if self.quote and value == "\\":
+                    offset += 1
+                    self.state = "escape"
+                    continue
+                if self.quote and value == self.quote:
+                    offset += 1
+                    self.finish_candidate()
+                    continue
+                self.finish_candidate()
+                if not self.session_id:
+                    offset += 1
+                continue
+
+            if self.state == "escape":
+                value = text[offset]
+                offset += 1
+                if value == "u":
+                    self.unicode_digits = ""
+                    self.state = "unicode"
+                    continue
+                decoded = {
+                    '"': '"',
+                    "\\": "\\",
+                    "/": "/",
+                    "b": "\b",
+                    "f": "\f",
+                    "n": "\n",
+                    "r": "\r",
+                    "t": "\t",
+                }.get(value)
+                if decoded is not None and TOOL_SESSION_VALUE_PATTERN.fullmatch(decoded):
+                    self.append_value(decoded)
+                    self.state = "value"
+                    continue
+                self.finish_candidate()
+                continue
+
+            needed = 4 - len(self.unicode_digits)
+            taken = min(needed, len(text) - offset)
+            self.unicode_digits += text[offset : offset + taken]
+            offset += taken
+            if len(self.unicode_digits) < 4:
+                return
+            try:
+                decoded = chr(int(self.unicode_digits, 16))
+            except ValueError:
+                decoded = ""
+            if TOOL_SESSION_VALUE_PATTERN.fullmatch(decoded):
+                self.append_value(decoded)
+                self.state = "value"
+                continue
+            self.finish_candidate()
+
+    def finish(self) -> str:
+        if (
+            not self.session_id
+            and self.value_chars
+            and self.state in {"value", "escape", "unicode"}
+        ):
+            self.finish_candidate()
+        return self.session_id
+
+
+@dataclass
+class EmbeddedJsonStringCapture:
+    session_any_depth: bool = False
+    projection: EmbeddedToolProjection = field(init=False)
+    scanner: JsonValueScanner = field(init=False)
+    decoder: JsonStringDecoder = field(init=False)
+    raw_fallback: BoundedJsonStringCapture = field(init=False)
+    raw_session: StreamingToolSessionCapture = field(init=False)
+    trailing_invalid: bool = False
+
+    def __post_init__(self) -> None:
+        self.projection = EmbeddedToolProjection(self.session_any_depth)
+        self.scanner = JsonValueScanner(observer=self.projection)
+        self.decoder = JsonStringDecoder(self.accept_text)
+        self.raw_fallback = BoundedJsonStringCapture(
+            512,
+            normalize_whitespace=True,
+        )
+        self.raw_session = StreamingToolSessionCapture()
+
+    def accept_text(self, text: str) -> None:
+        if self.session_any_depth:
+            self.raw_fallback.accept_text(text)
+            self.raw_session.feed(text)
+        data = text.encode("utf-8")
+        if self.scanner.complete:
+            if any(value not in JSON_WHITESPACE for value in data):
+                self.trailing_invalid = True
+            return
+        consumed = self.scanner.feed(data)
+        if consumed < len(data) and any(
+            value not in JSON_WHITESPACE for value in data[consumed:]
+        ):
+            self.trailing_invalid = True
+
+    def feed(self, data: bytes) -> None:
+        self.decoder.feed(data)
+
+    def finish(self) -> dict[str, Any] | None:
+        self.decoder.finish()
+        valid = not (
+            self.trailing_invalid
+            or self.scanner.invalid
+            or not self.scanner.complete
+        )
+        result = self.projection.result() if valid else None
+        if not self.session_any_depth:
+            return result
+        raw_session_id = self.raw_session.finish()
+        if result is None:
+            result = {}
+            fallback = self.raw_fallback.finish()
+            if fallback:
+                result["command"] = fallback
+        if raw_session_id and "session_id" not in result:
+            result["session_id"] = raw_session_id
+        return result or None
+
+
+@dataclass
+class RolloutEventProjection:
+    root_kind: str = ""
+    values: dict[tuple[str | int, ...], Any] = field(default_factory=dict)
+    embedded_seen: set[str] = field(default_factory=set)
+    embedded_inputs: dict[str, dict[str, Any] | None] = field(default_factory=dict)
+    output_result: dict[str, Any] | None = None
+    command_parts: list[Any] = field(default_factory=list)
+    command_seen: bool = False
+    command_is_array: bool = False
+
+    def start_container(self, path: tuple[str | int, ...], kind: str) -> None:
+        if not path:
+            self.root_kind = kind
+        if path == ("payload", "command"):
+            self.command_seen = True
+            self.command_is_array = kind == "array"
+
+    def end_container(self, path: tuple[str | int, ...], kind: str) -> None:
+        return
+
+    def finish(self) -> None:
+        return
+
+    def is_embedded_path(self, path: tuple[str | int, ...]) -> bool:
+        if path in {
+            ("payload", "input"),
+            ("payload", "arguments"),
+            ("payload", "output"),
+        }:
+            return True
+        return (
+            len(path) == 4
+            and path[:2] == ("payload", "output")
+            and isinstance(path[2], int)
+            and path[3] == "text"
+        )
+
+    def string_capture(self, path: tuple[str | int, ...]) -> Any:
+        if self.is_embedded_path(path):
+            return EmbeddedJsonStringCapture(
+                session_any_depth=path
+                in {("payload", "input"), ("payload", "arguments")}
+            )
+        plain_limits = {
+            ("type",): 128,
+            ("timestamp",): 128,
+            ("payload", "type"): 128,
+            ("payload", "call_id"): 512,
+            ("payload", "name"): 128,
+            ("payload", "turn_id"): 512,
+            ("payload", "started_at"): 64,
+            ("payload", "output", "session_id"): 256,
+        }
+        if path in plain_limits:
+            return BoundedJsonStringCapture(plain_limits[path])
+        if path == ("payload", "message"):
+            return BoundedJsonStringCapture(256, normalize_whitespace=True)
+        if path == ("payload", "command") or (
+            len(path) == 3
+            and path[:2] == ("payload", "command")
+            and isinstance(path[2], int)
+        ):
+            return BoundedJsonStringCapture(512)
+        if (
+            len(path) == 4
+            and path[:3]
+            in {
+                ("payload", "rate_limits", "primary"),
+                ("payload", "rate_limits", "secondary"),
+            }
+        ):
+            return BoundedJsonStringCapture(512)
+        if path == ("payload", "rate_limits", "plan_type"):
+            return BoundedJsonStringCapture(64, normalize_whitespace=True)
+        return None
+
+    def set_value(self, path: tuple[str | int, ...], value: Any) -> None:
+        if path in self.values or len(self.values) < MAX_PROJECTED_JSON_FIELDS:
+            self.values[path] = value
+
+    def append_command_part(self, value: Any) -> None:
+        self.command_seen = True
+        if (
+            len(self.command_parts) < MAX_PROJECTED_JSON_FIELDS
+            and sum(len(str(part)) for part in self.command_parts) < 1024
+        ):
+            self.command_parts.append(value)
+
+    def string_value(self, path: tuple[str | int, ...], value: Any) -> None:
+        if self.is_embedded_path(path):
+            if path in {("payload", "input"), ("payload", "arguments")}:
+                key = str(path[-1])
+                self.embedded_seen.add(key)
+                self.embedded_inputs[key] = value
+            elif isinstance(value, dict):
+                self.output_result = value
+            return
+        self.scalar_value(path, value)
+
+    def scalar_value(self, path: tuple[str | int, ...], value: Any) -> None:
+        direct_paths = {
+            ("type",),
+            ("timestamp",),
+            ("payload", "type"),
+            ("payload", "call_id"),
+            ("payload", "name"),
+            ("payload", "turn_id"),
+            ("payload", "started_at"),
+            ("payload", "message"),
+            ("payload", "output", "session_id"),
+            ("payload", "output", "exit_code"),
+            ("payload", "info", "model_context_window"),
+            ("payload", "rate_limits", "plan_type"),
+        }
+        if path in direct_paths:
+            self.set_value(path, value)
+            return
+        if path == ("payload", "command"):
+            self.command_seen = True
+            self.set_value(path, value)
+            return
+        if (
+            len(path) == 3
+            and path[:2] == ("payload", "command")
+            and isinstance(path[2], int)
+        ):
+            self.append_command_part(value)
+            return
+        if (
+            len(path) == 4
+            and path[:3]
+            in {
+                ("payload", "info", "last_token_usage"),
+                ("payload", "info", "total_token_usage"),
+            }
+            and isinstance(value, (int, float))
+        ):
+            self.set_value(path, value)
+            return
+        if (
+            len(path) == 4
+            and path[:3]
+            in {
+                ("payload", "rate_limits", "primary"),
+                ("payload", "rate_limits", "secondary"),
+            }
+            and (isinstance(value, (int, float, str, bool)) or value is None)
+        ):
+            self.set_value(path, value)
+
+    def nested_values(self, prefix: tuple[str, ...]) -> dict[str, Any]:
+        return {
+            str(path[-1]): value
+            for path, value in self.values.items()
+            if len(path) == len(prefix) + 1 and path[:-1] == prefix
+        }
+
+    def compact_event(self) -> dict[str, Any] | None:
+        if self.root_kind != "object":
+            return None
+        item: dict[str, Any] = {"type": self.values.get(("type",), "")}
+        timestamp = self.values.get(("timestamp",))
+        if isinstance(timestamp, str):
+            item["timestamp"] = timestamp
+        payload: dict[str, Any] = {
+            "type": self.values.get(("payload", "type"), "")
+        }
+        for key in ("call_id", "name", "turn_id", "started_at", "message"):
+            path = ("payload", key)
+            if path in self.values:
+                payload[key] = self.values[path]
+
+        command = self.values.get(("payload", "command"))
+        if isinstance(command, str):
+            payload["command"] = command
+        elif self.command_is_array:
+            payload["command"] = self.command_parts.copy()
+
+        input_key = "input" if "input" in self.embedded_seen else "arguments"
+        input_result = self.embedded_inputs.get(input_key)
+        if isinstance(input_result, dict):
+            nested_command = input_result.get("command")
+            if "command" not in payload and isinstance(nested_command, str):
+                payload["command"] = nested_command
+            session_id = input_result.get("session_id")
+            if session_id is not None:
+                payload["input"] = json.dumps({"session_id": str(session_id)})
+
+        output = self.output_result.copy() if self.output_result is not None else {}
+        for key in ("session_id", "exit_code"):
+            path = ("payload", "output", key)
+            if path in self.values:
+                output[key] = self.values[path]
+        if output:
+            payload["output"] = output
+
+        info: dict[str, Any] = {}
+        model_window = self.values.get(("payload", "info", "model_context_window"))
+        if model_window is not None:
+            info["model_context_window"] = model_window
+        for key in ("last_token_usage", "total_token_usage"):
+            info[key] = self.nested_values(("payload", "info", key))
+        if info:
+            payload["info"] = info
+
+        rate_limits: dict[str, Any] = {}
+        for key in ("primary", "secondary"):
+            rate_limits[key] = self.nested_values(("payload", "rate_limits", key))
+        plan_type = self.values.get(("payload", "rate_limits", "plan_type"))
+        if plan_type is not None:
+            rate_limits["plan_type"] = plan_type
+        if rate_limits:
+            payload["rate_limits"] = rate_limits
+
+        item["payload"] = payload
+        return compact_rollout_event(item)
+
+
+@dataclass
+class SelectiveRolloutRecordScanner:
+    projection: RolloutEventProjection = field(default_factory=RolloutEventProjection)
+    value: JsonValueScanner = field(init=False)
+    invalid: bool = False
+
+    def __post_init__(self) -> None:
+        self.value = JsonValueScanner(observer=self.projection)
+
+    def feed(self, data: bytes) -> None:
+        if self.invalid:
+            return
+        if self.value.complete:
+            if any(value not in JSON_WHITESPACE for value in data):
+                self.invalid = True
+            return
+        consumed = self.value.feed(data)
+        if self.value.invalid:
+            self.invalid = True
+            return
+        if consumed < len(data) and any(
+            value not in JSON_WHITESPACE for value in data[consumed:]
+        ):
+            self.invalid = True
+
+    def complete(self) -> bool:
+        return self.value.complete and not self.invalid
+
+    def item(self) -> dict[str, Any] | None:
+        return self.projection.compact_event() if self.complete() else None
+
+
+@dataclass
+class CompactedRecordScanner:
+    timestamp: str
+    value: JsonValueScanner = field(default_factory=JsonValueScanner)
+    phase: str = "payload"
+    invalid: bool = False
+
+    def feed(self, data: bytes) -> None:
+        offset = 0
+        while offset < len(data) and not self.invalid:
+            if self.phase == "payload":
+                consumed = self.value.feed(data[offset:])
+                offset += consumed
+                if self.value.invalid:
+                    self.invalid = True
+                    return
+                if not self.value.complete:
+                    return
+                self.phase = "outer"
+                continue
+            if self.phase == "outer":
+                while offset < len(data) and data[offset] in JSON_WHITESPACE:
+                    offset += 1
+                if offset >= len(data):
+                    return
+                if data[offset] != ord("}"):
+                    self.invalid = True
+                    return
+                self.phase = "trailing"
+                offset += 1
+                continue
+            if any(value not in JSON_WHITESPACE for value in data[offset:]):
+                self.invalid = True
+            return
+
+    def complete(self) -> bool:
+        return self.phase == "trailing" and not self.invalid
+
+
+@dataclass
+class PendingRolloutLine:
+    size: int = 0
+    buffer: bytearray = field(default_factory=bytearray)
+    compacted: CompactedRecordScanner | None = None
+    selective: SelectiveRolloutRecordScanner | None = None
+    trailing_only: bool = False
+    discarded: bool = False
+    applied: bool = False
+    applied_size: int = 0
+
+
+@dataclass
+class RolloutStateEntry:
     inode: int
-    offset: int
-    partial: bytes
-    events: list[dict[str, Any]]
+    offset: int = 0
+    mtime_ns: int = 0
+    head_probe: bytes = b""
+    probe_offset: int = 0
+    probe: bytes = b""
+    pending: PendingRolloutLine = field(default_factory=PendingRolloutLine)
+    activity_key: tuple[str, bool, int] = ("", False, 0)
+    activity: ActivityState = field(default_factory=ActivityState)
+    latest_token: dict[str, Any] = field(default_factory=dict)
+    token_points: list[tuple[int, int]] = field(default_factory=list)
+    token_history_dropped: bool = False
+    token_count_seen: bool = False
+    token_baselines: OrderedDict[int, int] = field(default_factory=OrderedDict)
 
 
-ROLLOUT_CACHE: OrderedDict[str, RolloutCacheEntry] = OrderedDict()
+ROLLOUT_STATE_CACHE: OrderedDict[str, RolloutStateEntry] = OrderedDict()
+
+
+@dataclass
+class RolloutStateSweep:
+    encountered: OrderedDict[str, None] = field(default_factory=OrderedDict)
+    spill: OrderedDict[str, RolloutStateEntry] = field(default_factory=OrderedDict)
+
+
+ACTIVE_ROLLOUT_STATE_SWEEP: RolloutStateSweep | None = None
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -271,10 +1459,6 @@ def snapshot_activity_ms(data: dict[str, Any], multi: bool) -> int:
 
 
 def floor_multi_session_sleep(sleep_s: float, multi: bool) -> float:
-    """--top/--all re-read every rollout each tick, so the now-live refresh
-    interval would thrash the re-reading cache; hold multi-session views at the
-    idle cadence. The footer (single session) stays live. Lift this once the
-    cache stops re-reading cold files."""
     return max(sleep_s, IDLE_POLL_SECONDS) if multi else sleep_s
 
 
@@ -596,24 +1780,58 @@ def week_start(now: datetime) -> int:
     return int(start.timestamp())
 
 
+def token_values_since_boundaries(
+    rollout_path: str,
+    current_total: int,
+    boundaries: tuple[int, ...],
+) -> dict[int, int]:
+    requested_boundaries = tuple(dict.fromkeys(boundaries))
+    if rollout_path in ROLLOUT_STATE_CACHE:
+        state = read_rollout_state(rollout_path)
+    else:
+        state = read_rollout_state(
+            rollout_path,
+            token_boundaries=requested_boundaries[-MAX_TOKEN_BOUNDARIES:],
+        )
+    unresolved: list[int] = []
+    for boundary in requested_boundaries:
+        if boundary in state.token_baselines:
+            state.token_baselines.move_to_end(boundary)
+            continue
+        baseline = 0
+        found = False
+        for timestamp, value in state.token_points:
+            if timestamp < boundary:
+                baseline = value
+                found = True
+        if found or not state.token_history_dropped:
+            state.token_baselines[boundary] = baseline
+        else:
+            unresolved.append(boundary)
+
+    if unresolved:
+        requested = list(state.token_baselines)
+        for boundary in unresolved:
+            if boundary in requested:
+                requested.remove(boundary)
+            requested.append(boundary)
+        state = read_rollout_state(rollout_path, token_boundaries=tuple(requested))
+
+    for boundary in requested_boundaries:
+        state.token_baselines.move_to_end(boundary)
+    while len(state.token_baselines) > MAX_TOKEN_BOUNDARIES:
+        state.token_baselines.popitem(last=False)
+    prune_token_points(state)
+    if not state.token_count_seen:
+        return {boundary: 0 for boundary in boundaries}
+    return {
+        boundary: max(0, current_total - state.token_baselines[boundary])
+        for boundary in boundaries
+    }
+
+
 def tokens_since_boundary(rollout_path: str, current_total: int, boundary: int) -> int:
-    baseline = 0
-    saw_token_count = False
-    for item in read_rollout_events(rollout_path):
-        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
-        if item.get("type") != "event_msg" or payload.get("type") != "token_count":
-            continue
-        info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
-        total = info.get("total_token_usage") if isinstance(info.get("total_token_usage"), dict) else {}
-        value = total.get("total_tokens")
-        if not isinstance(value, int):
-            continue
-        saw_token_count = True
-        if event_timestamp(item) < boundary:
-            baseline = value
-    if not saw_token_count:
-        return 0
-    return max(0, current_total - baseline)
+    return token_values_since_boundaries(rollout_path, current_total, (boundary,))[boundary]
 
 
 def token_summary(conn: sqlite3.Connection, thread: Thread, now: datetime) -> TokenSummary:
@@ -643,10 +1861,18 @@ def token_summary(conn: sqlite3.Connection, thread: Thread, now: datetime) -> To
         updated_at = int(older_thread["updated_at"] or 0)
         current_total = int(older_thread["tokens_used"] or 0)
         rollout_path = str(older_thread["rollout_path"] or "")
-        if created_at < today_start and updated_at >= today_start:
-            today += tokens_since_boundary(rollout_path, current_total, today_start)
+        boundaries = []
         if created_at < week_start_ts:
-            week += tokens_since_boundary(rollout_path, current_total, week_start_ts)
+            boundaries.append(week_start_ts)
+        if created_at < today_start and updated_at >= today_start:
+            boundaries.append(today_start)
+        values = token_values_since_boundaries(
+            rollout_path,
+            current_total,
+            tuple(boundaries),
+        )
+        week += values.get(week_start_ts, 0)
+        today += values.get(today_start, 0)
     return TokenSummary(
         session=thread.tokens_used,
         today=today,
@@ -658,13 +1884,7 @@ def token_summary(conn: sqlite3.Connection, thread: Thread, now: datetime) -> To
 
 
 def latest_token_count(rollout_path: str) -> dict[str, Any]:
-    for item in reversed(read_rollout_events(rollout_path)):
-        payload = item.get("payload")
-        if not isinstance(payload, dict):
-            continue
-        if item.get("type") == "event_msg" and payload.get("type") == "token_count":
-            return payload
-    return {}
+    return read_rollout_state(rollout_path).latest_token
 
 
 def compact_rollout_event(item: dict[str, Any]) -> dict[str, Any] | None:
@@ -763,80 +1983,118 @@ def compact_rollout_event(item: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def skip_json_whitespace(data: bytes, offset: int) -> int:
+    while offset < len(data) and data[offset] in JSON_WHITESPACE:
+        offset += 1
+    return offset
+
+
+def json_string_end(data: bytes, offset: int) -> int | None:
+    if offset >= len(data) or data[offset] != ord('"'):
+        return None
+    offset += 1
+    while match := JSON_STRING_SPECIAL.search(data, offset):
+        special = data[match.start()]
+        if special == ord('"'):
+            return match.end()
+        if special != ord("\\"):
+            return None
+        offset = match.end()
+        if offset >= len(data):
+            return None
+        escaped = data[offset]
+        if escaped in b'"\\/bfnrt':
+            offset += 1
+            continue
+        if escaped != ord("u") or offset + 4 >= len(data):
+            return None
+        if any(value not in JSON_HEX_DIGITS for value in data[offset + 1 : offset + 5]):
+            return None
+        offset += 5
+    return None
+
+
+def json_value_end(data: bytes, offset: int) -> int | None:
+    offset = skip_json_whitespace(data, offset)
+    if offset >= len(data):
+        return None
+    value = data[offset]
+    if value == ord('"'):
+        return json_string_end(data, offset)
+    if value in b"-0123456789":
+        number = JSON_NUMBER.match(data, offset)
+        return number.end() if number is not None else None
+    for literal in (b"true", b"false", b"null"):
+        if data.startswith(literal, offset):
+            return offset + len(literal)
+    if value == ord("["):
+        offset = skip_json_whitespace(data, offset + 1)
+        if offset < len(data) and data[offset] == ord("]"):
+            return offset + 1
+        while True:
+            offset = json_value_end(data, offset)
+            if offset is None:
+                return None
+            offset = skip_json_whitespace(data, offset)
+            if offset >= len(data):
+                return None
+            if data[offset] == ord("]"):
+                return offset + 1
+            if data[offset] != ord(","):
+                return None
+            offset += 1
+    if value != ord("{"):
+        return None
+    offset = skip_json_whitespace(data, offset + 1)
+    if offset < len(data) and data[offset] == ord("}"):
+        return offset + 1
+    while True:
+        offset = json_string_end(data, offset)
+        if offset is None:
+            return None
+        offset = skip_json_whitespace(data, offset)
+        if offset >= len(data) or data[offset] != ord(":"):
+            return None
+        offset = json_value_end(data, offset + 1)
+        if offset is None:
+            return None
+        offset = skip_json_whitespace(data, offset)
+        if offset >= len(data):
+            return None
+        if data[offset] == ord("}"):
+            return offset + 1
+        if data[offset] != ord(","):
+            return None
+        offset = skip_json_whitespace(data, offset + 1)
+
+
+def canonical_compacted_timestamp(line: bytes) -> str:
+    compacted = COMPACTED_ROLLOUT_PREFIX.match(line)
+    if compacted is None:
+        return ""
+    try:
+        payload_end = json_value_end(line, compacted.end())
+    except RecursionError:
+        return ""
+    if payload_end is None:
+        return ""
+    closing = skip_json_whitespace(line, payload_end)
+    if closing >= len(line) or line[closing] != ord("}"):
+        return ""
+    if skip_json_whitespace(line, closing + 1) != len(line):
+        return ""
+    return compacted.group(1).decode("ascii")
+
+
 def decode_rollout_line(line: bytes) -> dict[str, Any] | None:
+    compacted_timestamp = canonical_compacted_timestamp(line)
+    if compacted_timestamp:
+        return {"type": "compacted", "timestamp": compacted_timestamp}
     try:
         item = json.loads(line.decode("utf-8", errors="replace"))
     except json.JSONDecodeError:
         return None
     return compact_rollout_event(item) if isinstance(item, dict) else None
-
-
-def cached_events(entry: RolloutCacheEntry) -> list[dict[str, Any]]:
-    if not entry.partial:
-        return entry.events
-    item = decode_rollout_line(entry.partial)
-    return [*entry.events, item] if item is not None else entry.events
-
-
-def trim_rollout_cache(current_path: str) -> None:
-    while len(ROLLOUT_CACHE) > MAX_ROLLOUT_CACHE:
-        ROLLOUT_CACHE.popitem(last=False)
-    retained_events = sum(len(entry.events) for entry in ROLLOUT_CACHE.values())
-    while retained_events > MAX_ROLLOUT_CACHE_EVENTS and ROLLOUT_CACHE:
-        path, entry = ROLLOUT_CACHE.popitem(last=False)
-        retained_events -= len(entry.events)
-        if path == current_path:
-            break
-    retained_partial_bytes = sum(len(entry.partial) for entry in ROLLOUT_CACHE.values())
-    while retained_partial_bytes > MAX_ROLLOUT_CACHE_PARTIAL_BYTES and ROLLOUT_CACHE:
-        path, entry = ROLLOUT_CACHE.popitem(last=False)
-        retained_partial_bytes -= len(entry.partial)
-        if path == current_path:
-            break
-
-
-def read_rollout_events(rollout_path: str) -> list[dict[str, Any]]:
-    path = Path(rollout_path)
-    try:
-        stat = path.stat()
-    except OSError:
-        return []
-
-    entry = ROLLOUT_CACHE.get(rollout_path)
-    fresh = entry is None or entry.inode != stat.st_ino or stat.st_size < entry.offset
-    if fresh:
-        entry = RolloutCacheEntry(stat.st_ino, 0, b"", [])
-        ROLLOUT_CACHE[rollout_path] = entry
-    ROLLOUT_CACHE.move_to_end(rollout_path)
-
-    try:
-        with path.open("rb") as stream:
-            stream.seek(entry.offset)
-            chunk = stream.read()
-            entry.offset = stream.tell()
-    except OSError:
-        if fresh:
-            ROLLOUT_CACHE.pop(rollout_path, None)
-        return cached_events(entry)
-
-    if not chunk:
-        events = cached_events(entry)
-        trim_rollout_cache(rollout_path)
-        return events
-
-    data = entry.partial + chunk
-    lines = data.split(b"\n")
-    entry.partial = lines.pop()
-
-    for line in lines:
-        if not line:
-            continue
-        item = decode_rollout_line(line)
-        if item is not None:
-            entry.events.append(item)
-    events = cached_events(entry)
-    trim_rollout_cache(rollout_path)
-    return events
 
 
 def short_text(value: str, max_len: int = 90) -> str:
@@ -854,6 +2112,18 @@ def event_timestamp(item: dict[str, Any]) -> int:
         return int(datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp())
     except ValueError:
         return 0
+
+
+def event_started_at(payload: dict[str, Any], item: dict[str, Any]) -> int:
+    raw = payload.get("started_at")
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str) and re.fullmatch(r"-?[0-9]+", raw):
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    return event_timestamp(item)
 
 
 def tool_arguments(payload: dict[str, Any]) -> str:
@@ -891,7 +2161,7 @@ def tool_input_session(payload: dict[str, Any]) -> str:
     raw_input = tool_arguments(payload)
     if not raw_input:
         return ""
-    match = re.search(r"session_id[\"']?\s*:\s*[\"']?([A-Za-z0-9_-]+)", raw_input)
+    match = TOOL_SESSION_PATTERN.search(raw_input)
     return match.group(1) if match else ""
 
 
@@ -931,152 +2201,535 @@ def agent_label(thread: Thread) -> str:
     return "root"
 
 
-def rollout_activity(thread: Thread, now: datetime, active_window_seconds: int = 900) -> RolloutActivity:
-    events = read_rollout_events(thread.rollout_path)
-    if is_subagent_thread(thread):
-        child_start = next(
-            (
-                index
-                for index, item in enumerate(events)
-                if isinstance(item.get("payload"), dict)
-                and item["payload"].get("type") == "task_started"
-                and int(item["payload"].get("started_at") or 0) >= thread.created_at
-            ),
-            len(events),
+def activity_key(thread: Thread) -> tuple[str, bool, int]:
+    return (thread.id, is_subagent_thread(thread), thread.created_at)
+
+
+def new_rollout_state(
+    inode: int,
+    key: tuple[str, bool, int] | None,
+    token_boundaries: tuple[int, ...] = (),
+) -> RolloutStateEntry:
+    selected_key = key or ("", False, 0)
+    state = RolloutStateEntry(
+        inode=inode,
+        activity_key=selected_key,
+        activity=ActivityState(boundary_found=not selected_key[1]),
+    )
+    for boundary in dict.fromkeys(token_boundaries):
+        state.token_baselines[boundary] = 0
+    while len(state.token_baselines) > MAX_TOKEN_BOUNDARIES:
+        state.token_baselines.popitem(last=False)
+    return state
+
+
+def update_token_state(state: RolloutStateEntry, item: dict[str, Any]) -> None:
+    raw_payload = item.get("payload")
+    payload: dict[str, Any] = raw_payload if isinstance(raw_payload, dict) else {}
+    if item.get("type") != "event_msg" or payload.get("type") != "token_count":
+        return
+    state.latest_token = payload
+    raw_info = payload.get("info")
+    info: dict[str, Any] = raw_info if isinstance(raw_info, dict) else {}
+    raw_total = info.get("total_token_usage")
+    total: dict[str, Any] = raw_total if isinstance(raw_total, dict) else {}
+    value = total.get("total_tokens")
+    if not isinstance(value, int):
+        return
+    state.token_count_seen = True
+    timestamp = event_timestamp(item)
+    state.token_points.append((timestamp, value))
+    if len(state.token_points) > MAX_TOKEN_POINTS:
+        del state.token_points[: len(state.token_points) - MAX_TOKEN_POINTS]
+        state.token_history_dropped = True
+    for boundary in state.token_baselines:
+        if timestamp < boundary:
+            state.token_baselines[boundary] = value
+
+
+def prune_token_points(state: RolloutStateEntry) -> None:
+    if not state.token_baselines or not state.token_points:
+        return
+    original_count = len(state.token_points)
+    oldest_boundary = min(state.token_baselines)
+    last_before_index = -1
+    for index, point in enumerate(state.token_points):
+        if point[0] < oldest_boundary:
+            last_before_index = index
+    state.token_points = [
+        point
+        for index, point in enumerate(state.token_points)
+        if index == last_before_index or point[0] >= oldest_boundary
+    ]
+    if len(state.token_points) > MAX_TOKEN_POINTS:
+        state.token_points = state.token_points[-MAX_TOKEN_POINTS:]
+    if len(state.token_points) < original_count:
+        state.token_history_dropped = True
+
+
+def retain_recent_turn(
+    turns: OrderedDict[str, Any],
+    turn_id: str,
+    value: Any,
+    limit: int,
+) -> None:
+    turns[turn_id] = value
+    turns.move_to_end(turn_id)
+    while len(turns) > limit:
+        turns.popitem(last=False)
+
+
+def update_activity_state(state: RolloutStateEntry, item: dict[str, Any]) -> None:
+    activity = state.activity
+    raw_payload = item.get("payload")
+    payload: dict[str, Any] = raw_payload if isinstance(raw_payload, dict) else {}
+    item_type = str(item.get("type", ""))
+    payload_type = str(payload.get("type", ""))
+    started_at = event_started_at(payload, item)
+    if not activity.boundary_found:
+        if (
+            payload_type == "task_started"
+            and started_at >= state.activity_key[2]
+        ):
+            activity.boundary_found = True
+        else:
+            return
+
+    activity.last_event = payload_type or item_type
+    if item_type == "compacted" or payload_type == "context_compacted":
+        activity.compactions += 1
+
+    if payload_type == "task_started":
+        turn_id = str(payload.get("turn_id") or "")
+        activity.turns_started += 1
+        if turn_id:
+            if turn_id in activity.recent_closed_turns:
+                activity.recent_closed_turns.move_to_end(turn_id)
+                return
+            retain_recent_turn(
+                activity.started_turns,
+                turn_id,
+                started_at,
+                MAX_OPEN_TURN_IDS,
+            )
+        return
+
+    if payload_type == "task_complete":
+        turn_id = str(payload.get("turn_id") or "")
+        activity.turns_completed += 1
+        if turn_id:
+            activity.started_turns.pop(turn_id, None)
+            retain_recent_turn(
+                activity.recent_closed_turns,
+                turn_id,
+                None,
+                MAX_RECENT_CLOSED_TURN_IDS,
+            )
+        return
+
+    if payload_type == "turn_aborted":
+        turn_id = str(payload.get("turn_id") or "")
+        activity.turns_aborted += 1
+        if turn_id:
+            activity.started_turns.pop(turn_id, None)
+            retain_recent_turn(
+                activity.recent_closed_turns,
+                turn_id,
+                None,
+                MAX_RECENT_CLOSED_TURN_IDS,
+            )
+        return
+
+    if payload_type == "user_message":
+        message = payload.get("message")
+        if isinstance(message, str) and message:
+            activity.last_user_message = short_text(message)
+        return
+
+    if payload_type == "agent_message":
+        message = payload.get("message")
+        if isinstance(message, str) and message:
+            activity.last_agent_message = short_text(message)
+        return
+
+    if payload_type in {"function_call", "custom_tool_call"}:
+        call_id = str(payload.get("call_id") or "")
+        name = str(payload.get("name") or "")
+        if call_id:
+            activity.pending_tools[call_id] = name
+            activity.pending_tools.move_to_end(call_id)
+            activity.pending_shells.discard(call_id)
+            activity.tool_sessions.pop(call_id, None)
+            while len(activity.pending_tools) > MAX_ACTIVE_TOOL_CALLS:
+                expired_call_id, _ = activity.pending_tools.popitem(last=False)
+                activity.pending_shells.discard(expired_call_id)
+                activity.tool_sessions.pop(expired_call_id, None)
+        activity.tool_calls += 1
+        activity.last_tool = name
+        session_id = tool_input_session(payload)
+        if call_id and session_id:
+            activity.tool_sessions[call_id] = session_id
+        if name in {"exec", "exec_command"}:
+            activity.shell_calls += 1
+            if call_id and not session_id:
+                activity.pending_shells.add(call_id)
+        if name == "apply_patch":
+            activity.patch_calls += 1
+        command = command_text(payload)
+        if command:
+            activity.last_command = short_text(command)
+        return
+
+    if payload_type in {"function_call_output", "custom_tool_call_output", "patch_apply_end"}:
+        call_id = str(payload.get("call_id") or "")
+        activity.pending_tools.pop(call_id, None)
+        activity.pending_shells.discard(call_id)
+        input_session = activity.tool_sessions.pop(call_id, "")
+        result = tool_result(payload)
+        result_session = str(result.get("session_id") or "")
+        if input_session and "exit_code" in result:
+            activity.running_shells.pop(input_session, None)
+        elif result_session:
+            retain_recent_turn(
+                activity.running_shells,
+                result_session,
+                None,
+                MAX_RUNNING_SHELLS,
+            )
+        return
+
+    if payload_type == "exec_command_end":
+        call_id = str(payload.get("call_id") or "")
+        activity.pending_tools.pop(call_id, None)
+        activity.pending_shells.discard(call_id)
+        command = command_text(payload)
+        if command:
+            activity.last_command = short_text(command)
+
+
+def trim_rollout_state_cache() -> None:
+    while len(ROLLOUT_STATE_CACHE) > MAX_ROLLOUT_STATE_CACHE:
+        ROLLOUT_STATE_CACHE.popitem(last=False)
+
+
+def cached_rollout_state(rollout_path: str) -> RolloutStateEntry | None:
+    if ACTIVE_ROLLOUT_STATE_SWEEP is not None:
+        if len(ACTIVE_ROLLOUT_STATE_SWEEP.encountered) < MAX_ROLLOUT_STATE_CACHE:
+            ACTIVE_ROLLOUT_STATE_SWEEP.encountered.setdefault(rollout_path, None)
+        entry = ROLLOUT_STATE_CACHE.get(rollout_path)
+        if entry is not None:
+            return entry
+        return ACTIVE_ROLLOUT_STATE_SWEEP.spill.get(rollout_path)
+    entry = ROLLOUT_STATE_CACHE.get(rollout_path)
+    if entry is not None:
+        ROLLOUT_STATE_CACHE.move_to_end(rollout_path)
+    return entry
+
+
+def cache_rollout_state(rollout_path: str, entry: RolloutStateEntry) -> None:
+    if rollout_path in ROLLOUT_STATE_CACHE:
+        ROLLOUT_STATE_CACHE[rollout_path] = entry
+        return
+    if ACTIVE_ROLLOUT_STATE_SWEEP is not None:
+        if rollout_path in ACTIVE_ROLLOUT_STATE_SWEEP.spill:
+            ACTIVE_ROLLOUT_STATE_SWEEP.spill[rollout_path] = entry
+            return
+        if len(ACTIVE_ROLLOUT_STATE_SWEEP.spill) < MAX_ROLLOUT_SWEEP_CACHE:
+            ACTIVE_ROLLOUT_STATE_SWEEP.spill[rollout_path] = entry
+        return
+    ROLLOUT_STATE_CACHE[rollout_path] = entry
+    ROLLOUT_STATE_CACHE.move_to_end(rollout_path)
+    trim_rollout_state_cache()
+
+
+def drop_rollout_state(rollout_path: str) -> None:
+    ROLLOUT_STATE_CACHE.pop(rollout_path, None)
+    if ACTIVE_ROLLOUT_STATE_SWEEP is not None:
+        ACTIVE_ROLLOUT_STATE_SWEEP.spill.pop(rollout_path, None)
+
+
+@contextmanager
+def rollout_state_sweep():
+    global ACTIVE_ROLLOUT_STATE_SWEEP
+    if ACTIVE_ROLLOUT_STATE_SWEEP is not None:
+        yield
+        return
+
+    sweep = RolloutStateSweep()
+    ACTIVE_ROLLOUT_STATE_SWEEP = sweep
+    try:
+        yield
+    finally:
+        retained: OrderedDict[str, RolloutStateEntry] = OrderedDict()
+        for rollout_path in sweep.encountered:
+            entry = ROLLOUT_STATE_CACHE.get(rollout_path)
+            if entry is None:
+                entry = sweep.spill.get(rollout_path)
+            if entry is not None:
+                retained[rollout_path] = entry
+            if len(retained) == MAX_ROLLOUT_STATE_CACHE:
+                break
+        if len(retained) < MAX_ROLLOUT_STATE_CACHE:
+            for rollout_path, entry in ROLLOUT_STATE_CACHE.items():
+                retained.setdefault(rollout_path, entry)
+                if len(retained) == MAX_ROLLOUT_STATE_CACHE:
+                    break
+        ROLLOUT_STATE_CACHE.clear()
+        ROLLOUT_STATE_CACHE.update(retained)
+        ACTIVE_ROLLOUT_STATE_SWEEP = None
+
+
+def feed_pending_rollout_line(pending: PendingRolloutLine, data: bytes) -> None:
+    if not data:
+        return
+    pending.size += len(data)
+    if pending.discarded:
+        return
+    if pending.trailing_only:
+        if any(value not in JSON_WHITESPACE for value in data):
+            pending.discarded = True
+        return
+    if pending.compacted is not None:
+        pending.compacted.feed(data)
+        return
+    if pending.selective is not None:
+        pending.selective.feed(data)
+        return
+    if len(pending.buffer) + len(data) <= MAX_BUFFERED_ROLLOUT_LINE_BYTES:
+        pending.buffer.extend(data)
+        return
+
+    buffered = min(
+        len(data),
+        MAX_BUFFERED_ROLLOUT_LINE_BYTES - len(pending.buffer),
+    )
+    pending.buffer.extend(data[:buffered])
+    remainder = data[buffered:]
+    compacted = COMPACTED_ROLLOUT_PREFIX.match(pending.buffer)
+    if compacted is not None:
+        scanner = CompactedRecordScanner(compacted.group(1).decode("ascii"))
+        scanner.feed(bytes(pending.buffer[compacted.end() :]))
+        pending.buffer.clear()
+        pending.compacted = scanner
+        scanner.feed(remainder)
+        return
+
+    if pending.applied and decode_rollout_line(bytes(pending.buffer)) is not None:
+        pending.buffer.clear()
+        pending.trailing_only = True
+        if any(value not in JSON_WHITESPACE for value in remainder):
+            pending.discarded = True
+        return
+
+    scanner = SelectiveRolloutRecordScanner()
+    scanner.feed(bytes(pending.buffer))
+    pending.buffer.clear()
+    pending.selective = scanner
+    scanner.feed(remainder)
+
+
+def pending_rollout_item(
+    pending: PendingRolloutLine,
+) -> tuple[bool, dict[str, Any] | None]:
+    if pending.discarded:
+        return False, None
+    if pending.trailing_only:
+        return pending.applied, None
+    if pending.compacted is not None:
+        if not pending.compacted.complete():
+            return False, None
+        return True, {
+            "type": "compacted",
+            "timestamp": pending.compacted.timestamp,
+        }
+    if pending.selective is not None:
+        if not pending.selective.complete():
+            return False, None
+        return True, pending.selective.item()
+    if not pending.buffer:
+        return False, None
+    item = decode_rollout_line(bytes(pending.buffer))
+    return item is not None, item
+
+
+def apply_pending_rollout_line(entry: RolloutStateEntry) -> bool:
+    if (
+        entry.pending.applied
+        and entry.pending.size == entry.pending.applied_size
+    ):
+        return False
+    valid, item = pending_rollout_item(entry.pending)
+    if entry.pending.applied:
+        if valid:
+            entry.pending.applied_size = entry.pending.size
+        return not valid
+    if not valid or item is None:
+        return False
+    update_token_state(entry, item)
+    update_activity_state(entry, item)
+    entry.pending.applied = True
+    entry.pending.applied_size = entry.pending.size
+    return False
+
+
+def consume_rollout_stream(stream, entry: RolloutStateEntry) -> bool:
+    stream.seek(entry.offset)
+    current_offset = entry.offset
+    while chunk := stream.read(ROLLOUT_READ_BYTES):
+        chunk_offset = 0
+        while chunk_offset < len(chunk):
+            newline = chunk.find(b"\n", chunk_offset)
+            segment_end = len(chunk) if newline < 0 else newline
+            segment = chunk[chunk_offset:segment_end]
+            feed_pending_rollout_line(entry.pending, segment)
+            current_offset += len(segment)
+            if newline < 0:
+                break
+            current_offset += 1
+            if apply_pending_rollout_line(entry):
+                return True
+            entry.pending = PendingRolloutLine()
+            chunk_offset = newline + 1
+        entry.offset = current_offset
+    entry.offset = current_offset
+    return bool(entry.pending.size and apply_pending_rollout_line(entry))
+
+
+def update_rollout_probes(stream, entry: RolloutStateEntry) -> None:
+    head_size = min(entry.offset, ROLLOUT_PROBE_BYTES)
+    stream.seek(0)
+    entry.head_probe = stream.read(head_size)
+    entry.probe_offset = max(0, entry.offset - ROLLOUT_PROBE_BYTES)
+    stream.seek(entry.probe_offset)
+    entry.probe = stream.read(entry.offset - entry.probe_offset)
+
+
+def read_rollout_state(
+    rollout_path: str,
+    thread: Thread | None = None,
+    token_boundaries: tuple[int, ...] = (),
+) -> RolloutStateEntry:
+    path = Path(rollout_path)
+    requested_key = activity_key(thread) if thread is not None else None
+    try:
+        stat = path.stat()
+    except OSError:
+        return new_rollout_state(0, requested_key, token_boundaries)
+
+    entry = cached_rollout_state(rollout_path)
+    seeded_boundaries = list(entry.token_baselines) if entry is not None else []
+    for boundary in token_boundaries:
+        if boundary in seeded_boundaries:
+            seeded_boundaries.remove(boundary)
+        seeded_boundaries.append(boundary)
+    seeded_boundaries = seeded_boundaries[-MAX_TOKEN_BOUNDARIES:]
+    token_replay = entry is not None and any(
+        boundary not in entry.token_baselines for boundary in token_boundaries
+    )
+    reset = (
+        entry is None
+        or entry.inode != stat.st_ino
+        or stat.st_size < entry.offset
+        or token_replay
+        or (
+            stat.st_size == entry.offset
+            and entry.mtime_ns > 0
+            and stat.st_mtime_ns != entry.mtime_ns
         )
-        events = events[child_start:]
-    started_turns: dict[str, int] = {}
-    closed_turns: set[str] = set()
-    pending_tools: dict[str, str] = {}
-    pending_shells: set[str] = set()
-    running_shells: set[str] = set()
-    tool_sessions: dict[str, str] = {}
+    )
+    if entry is not None and requested_key is not None and entry.activity_key != requested_key:
+        if entry.activity_key == ("", False, 0) and not requested_key[1]:
+            entry.activity_key = requested_key
+        else:
+            reset = True
 
-    turns_started = 0
-    turns_completed = 0
-    turns_aborted = 0
-    compactions = 0
-    tool_calls = 0
-    shell_calls = 0
-    patch_calls = 0
-    last_event = ""
-    last_command = ""
-    last_user_message = ""
-    last_agent_message = ""
-    last_tool = ""
+    growth = entry is not None and stat.st_size > entry.offset
+    try:
+        with path.open("rb") as stream:
+            if not reset and entry is not None:
+                if entry.head_probe:
+                    stream.seek(0)
+                    reset = stream.read(len(entry.head_probe)) != entry.head_probe
+                if not reset and entry.probe:
+                    stream.seek(entry.probe_offset)
+                    reset = stream.read(len(entry.probe)) != entry.probe
+            if reset:
+                entry = new_rollout_state(
+                    stat.st_ino,
+                    requested_key,
+                    tuple(seeded_boundaries),
+                )
+                cache_rollout_state(rollout_path, entry)
+            assert entry is not None
+            if (reset or growth) and consume_rollout_stream(stream, entry):
+                reset = True
+                entry = new_rollout_state(
+                    stat.st_ino,
+                    requested_key,
+                    tuple(seeded_boundaries),
+                )
+                cache_rollout_state(rollout_path, entry)
+                consume_rollout_stream(stream, entry)
+            final_stat = os.fstat(stream.fileno())
+            entry.mtime_ns = final_stat.st_mtime_ns
+            update_rollout_probes(stream, entry)
+    except OSError:
+        if reset or growth:
+            drop_rollout_state(rollout_path)
+            return new_rollout_state(
+                stat.st_ino,
+                requested_key,
+                tuple(seeded_boundaries),
+            )
+        return entry or new_rollout_state(
+            stat.st_ino,
+            requested_key,
+            tuple(seeded_boundaries),
+        )
 
-    for item in events:
-        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
-        item_type = str(item.get("type", ""))
-        payload_type = str(payload.get("type", ""))
-        last_event = payload_type or item_type
+    cache_rollout_state(rollout_path, entry)
+    return entry
 
-        if item_type == "compacted" or payload_type == "context_compacted":
-            compactions += 1
 
-        if payload_type == "task_started":
-            turn_id = str(payload.get("turn_id") or "")
-            turns_started += 1
-            if turn_id:
-                started_turns[turn_id] = int(payload.get("started_at") or event_timestamp(item) or 0)
-            continue
-
-        if payload_type == "task_complete":
-            turn_id = str(payload.get("turn_id") or "")
-            turns_completed += 1
-            if turn_id:
-                closed_turns.add(turn_id)
-            continue
-
-        if payload_type == "turn_aborted":
-            turn_id = str(payload.get("turn_id") or "")
-            turns_aborted += 1
-            if turn_id:
-                closed_turns.add(turn_id)
-            continue
-
-        if payload_type == "user_message":
-            message = payload.get("message")
-            if isinstance(message, str) and message:
-                last_user_message = short_text(message)
-            continue
-
-        if payload_type == "agent_message":
-            message = payload.get("message")
-            if isinstance(message, str) and message:
-                last_agent_message = short_text(message)
-            continue
-
-        if payload_type in {"function_call", "custom_tool_call"}:
-            call_id = str(payload.get("call_id") or "")
-            name = str(payload.get("name") or "")
-            if call_id:
-                pending_tools[call_id] = name
-            tool_calls += 1
-            last_tool = name
-            session_id = tool_input_session(payload)
-            if call_id and session_id:
-                tool_sessions[call_id] = session_id
-            if name in {"exec", "exec_command"}:
-                shell_calls += 1
-                if call_id and not session_id:
-                    pending_shells.add(call_id)
-            if name == "apply_patch":
-                patch_calls += 1
-            command = command_text(payload)
-            if command:
-                last_command = short_text(command)
-            continue
-
-        if payload_type in {"function_call_output", "custom_tool_call_output", "patch_apply_end"}:
-            call_id = str(payload.get("call_id") or "")
-            pending_tools.pop(call_id, None)
-            pending_shells.discard(call_id)
-            input_session = tool_sessions.pop(call_id, "")
-            result = tool_result(payload)
-            result_session = str(result.get("session_id") or "")
-            if input_session and "exit_code" in result:
-                running_shells.discard(input_session)
-            elif result_session:
-                running_shells.add(result_session)
-            continue
-
-        if payload_type == "exec_command_end":
-            call_id = str(payload.get("call_id") or "")
-            pending_tools.pop(call_id, None)
-            pending_shells.discard(call_id)
-            command = command_text(payload)
-            if command:
-                last_command = short_text(command)
-
+def activity_from_state(
+    state: ActivityState,
+    thread: Thread,
+    now: datetime,
+    active_window_seconds: int,
+) -> RolloutActivity:
+    active_starts = [started_at for started_at in state.started_turns.values() if started_at > 0]
     active_turn_seconds = 0
-    active_starts = [started_at for turn_id, started_at in started_turns.items() if turn_id not in closed_turns and started_at > 0]
     if active_starts:
         active_turn_seconds = max(0, int(now.timestamp()) - max(active_starts))
-    if int(now.timestamp()) - thread.updated_at > active_window_seconds:
+    stale = int(now.timestamp()) - thread.updated_at > active_window_seconds
+    pending_tools = {} if stale else state.pending_tools
+    active_shells = 0 if stale else len(state.pending_shells) + len(state.running_shells)
+    if stale:
         active_turn_seconds = 0
-        pending_tools.clear()
-        pending_shells.clear()
-        running_shells.clear()
 
     return RolloutActivity(
-        turns_started=turns_started,
-        turns_completed=turns_completed,
-        turns_aborted=turns_aborted,
-        compactions=compactions,
-        tool_calls=tool_calls,
-        shell_calls=shell_calls,
-        patch_calls=patch_calls,
+        turns_started=state.turns_started,
+        turns_completed=state.turns_completed,
+        turns_aborted=state.turns_aborted,
+        compactions=state.compactions,
+        tool_calls=state.tool_calls,
+        shell_calls=state.shell_calls,
+        patch_calls=state.patch_calls,
         active_tools=len(pending_tools),
-        active_shells=len(pending_shells) + len(running_shells),
+        active_shells=active_shells,
         active_turn_seconds=active_turn_seconds,
-        last_event=last_event or "-",
-        last_command=last_command or "-",
-        last_user_message=last_user_message or "-",
-        last_agent_message=last_agent_message or "-",
+        last_event=state.last_event or "-",
+        last_command=state.last_command or "-",
+        last_user_message=state.last_user_message or "-",
+        last_agent_message=state.last_agent_message or "-",
         active_tool=next(reversed(pending_tools.values()), "-"),
-        last_tool=last_tool or "-",
+        last_tool=state.last_tool or "-",
     )
+
+
+def rollout_activity(thread: Thread, now: datetime, active_window_seconds: int = 900) -> RolloutActivity:
+    state = read_rollout_state(thread.rollout_path, thread)
+    return activity_from_state(state.activity, thread, now, active_window_seconds)
 
 
 def usage_from_rollout(thread: Thread) -> CodexUsage:
@@ -1364,8 +3017,8 @@ def snapshot_for_thread(
 ) -> dict[str, Any]:
     model = thread.model or str(codex_config.get("model", ""))
     effort = thread.reasoning_effort or str(codex_config.get("model_reasoning_effort", ""))
-    usage = usage_from_rollout(thread)
     activity = rollout_activity(thread, now, active_window_seconds)
+    usage = usage_from_rollout(thread)
     tokens.session = usage.session_total
     repo_cwd = thread.cwd if prefer_thread_cwd else (cwd if paths_related(cwd, thread.cwd) else thread.cwd)
     repo, branch = git_info(repo_cwd, thread.git_branch, int(now.timestamp() // GIT_INFO_TTL_SECONDS))
@@ -1396,116 +3049,131 @@ def snapshot_for_thread(
     }
 
 
-def snapshot(args: argparse.Namespace) -> dict[str, Any]:
-    account_label.cache_clear()
-    model_info.cache_clear()
-    read_codex_config.cache_clear()
-    config = parse_shell_config(Path(args.config) if args.config else CONFIG_FILE)
-    codex_config = read_codex_config()
-    cwd = args.cwd or os.getcwd()
-    thread_id = args.thread_id
-
-    if not STATE_DB.exists():
-        raise RuntimeError(f"missing Codex state database: {STATE_DB}")
-
-    with closing(sqlite_connect(STATE_DB)) as conn:
-        if not thread_id and args.owner_pid_file:
-            thread_id = select_owner_thread_id(conn, args.owner_pid_file)
-            if not thread_id:
-                raise RuntimeError("no Codex threads found")
-        created_after_ms = args.bind_after_ms or args.bind_after * 1000
-        thread = select_thread(
-            conn,
-            thread_id,
-            cwd,
-            created_after_ms=created_after_ms,
-            updated_after_ms=args.bind_updated_after_ms,
-        )
-        if thread is None:
-            raise RuntimeError("no Codex threads found")
-        now = datetime.now(timezone.utc)
-        tokens = token_summary(conn, thread, now)
-        agent_activities = [
-            rollout_activity(agent, now, args.active_window)
-            for agent in select_descendant_threads(conn, thread.id)
-        ]
-
-    data = snapshot_for_thread(thread, tokens, codex_config, cwd, now)
-    data["agents"] = {
-        "total": len(agent_activities),
+def descendant_activity_summary(
+    descendants: list[Thread],
+    now: datetime,
+    active_window_seconds: int,
+) -> dict[str, int]:
+    activities = [
+        rollout_activity(thread, now, active_window_seconds)
+        for thread in descendants
+        if int(now.timestamp()) - thread.updated_at <= active_window_seconds
+    ]
+    return {
+        "total": len(descendants),
         "active": sum(
             1
-            for activity in agent_activities
+            for activity in activities
             if activity.active_turn_seconds > 0 or activity.active_tools > 0
         ),
-        "active_tools": sum(activity.active_tools for activity in agent_activities),
-        "active_shells": sum(activity.active_shells for activity in agent_activities),
+        "active_tools": sum(activity.active_tools for activity in activities),
+        "active_shells": sum(activity.active_shells for activity in activities),
     }
-    goals = {
-        "session": int_setting("SESSION_TOKEN_GOAL", config, 1_000_000),
-        "today": int_setting("DAILY_TOKEN_GOAL", config, 2_000_000),
-        "week": int_setting("WEEKLY_TOKEN_GOAL", config, 10_000_000),
-        "lifetime": int_setting("LIFETIME_TOKEN_GOAL", config, 100_000_000),
-    }
-    data["goals"] = goals
-    return data
+
+
+def snapshot(args: argparse.Namespace) -> dict[str, Any]:
+    with rollout_state_sweep():
+        account_label.cache_clear()
+        model_info.cache_clear()
+        read_codex_config.cache_clear()
+        config = parse_shell_config(Path(args.config) if args.config else CONFIG_FILE)
+        codex_config = read_codex_config()
+        cwd = args.cwd or os.getcwd()
+        thread_id = args.thread_id
+
+        if not STATE_DB.exists():
+            raise RuntimeError(f"missing Codex state database: {STATE_DB}")
+
+        with closing(sqlite_connect(STATE_DB)) as conn:
+            if not thread_id and args.owner_pid_file:
+                thread_id = select_owner_thread_id(conn, args.owner_pid_file)
+                if not thread_id:
+                    raise RuntimeError("no Codex threads found")
+            created_after_ms = args.bind_after_ms or args.bind_after * 1000
+            thread = select_thread(
+                conn,
+                thread_id,
+                cwd,
+                created_after_ms=created_after_ms,
+                updated_after_ms=args.bind_updated_after_ms,
+            )
+            if thread is None:
+                raise RuntimeError("no Codex threads found")
+            now = datetime.now(timezone.utc)
+            tokens = token_summary(conn, thread, now)
+            descendants = select_descendant_threads(conn, thread.id)
+
+        data = snapshot_for_thread(thread, tokens, codex_config, cwd, now)
+        data["agents"] = descendant_activity_summary(
+            descendants,
+            now,
+            args.active_window,
+        )
+        goals = {
+            "session": int_setting("SESSION_TOKEN_GOAL", config, 1_000_000),
+            "today": int_setting("DAILY_TOKEN_GOAL", config, 2_000_000),
+            "week": int_setting("WEEKLY_TOKEN_GOAL", config, 10_000_000),
+            "lifetime": int_setting("LIFETIME_TOKEN_GOAL", config, 100_000_000),
+        }
+        data["goals"] = goals
+        return data
 
 
 def all_sessions_snapshot(args: argparse.Namespace) -> dict[str, Any]:
-    account_label.cache_clear()
-    model_info.cache_clear()
-    read_codex_config.cache_clear()
-    codex_config = read_codex_config()
-    cwd = args.cwd or os.getcwd()
-    if not STATE_DB.exists():
-        raise RuntimeError(f"missing Codex state database: {STATE_DB}")
+    with rollout_state_sweep():
+        account_label.cache_clear()
+        model_info.cache_clear()
+        read_codex_config.cache_clear()
+        codex_config = read_codex_config()
+        cwd = args.cwd or os.getcwd()
+        if not STATE_DB.exists():
+            raise RuntimeError(f"missing Codex state database: {STATE_DB}")
 
-    now = datetime.now(timezone.utc)
-    with closing(sqlite_connect(STATE_DB)) as conn:
-        if args.top and not args.show_inactive and not args.include_archived:
-            threads = select_top_threads(conn, args.sessions)
-        else:
-            threads = select_threads(conn, args.sessions, args.include_archived)
-        if args.top and not args.include_agents:
-            threads = [thread for thread in threads if not is_subagent_thread(thread)]
-        totals = token_summary(conn, threads[0], now) if threads else TokenSummary(0, 0, 0, 0, 0, 0)
-        sessions = []
-        for thread in threads:
-            thread_tokens = TokenSummary(
-                session=thread.tokens_used,
-                today=totals.today,
-                week=totals.week,
-                lifetime=totals.lifetime,
-                threads_today=totals.threads_today,
-                threads_total=totals.threads_total,
-            )
-            sessions.append(
-                snapshot_for_thread(
-                    thread,
-                    thread_tokens,
-                    codex_config,
-                    cwd,
-                    now,
-                    prefer_thread_cwd=True,
-                    active_window_seconds=args.active_window,
+        now = datetime.now(timezone.utc)
+        with closing(sqlite_connect(STATE_DB)) as conn:
+            if args.top and not args.show_inactive and not args.include_archived:
+                threads = select_top_threads(conn, args.sessions)
+            else:
+                threads = select_threads(conn, args.sessions, args.include_archived)
+            if args.top and not args.include_agents:
+                threads = [thread for thread in threads if not is_subagent_thread(thread)]
+            totals = token_summary(conn, threads[0], now) if threads else TokenSummary(0, 0, 0, 0, 0, 0)
+            sessions = []
+            for thread in threads:
+                thread_tokens = TokenSummary(
+                    session=thread.tokens_used,
+                    today=totals.today,
+                    week=totals.week,
+                    lifetime=totals.lifetime,
+                    threads_today=totals.threads_today,
+                    threads_total=totals.threads_total,
                 )
-            )
+                sessions.append(
+                    snapshot_for_thread(
+                        thread,
+                        thread_tokens,
+                        codex_config,
+                        cwd,
+                        now,
+                        prefer_thread_cwd=True,
+                        active_window_seconds=args.active_window,
+                    )
+                )
 
-    newest_rate_limits: dict[str, Any] = {}
-    for session in sessions:
-        rate_limits = session["usage"].get("rate_limits") or {}
-        # Fresh sessions compact null limits into empty primary/secondary placeholders.
-        if rate_limits.get("primary") or rate_limits.get("secondary"):
-            newest_rate_limits = rate_limits
-            break
+        newest_rate_limits: dict[str, Any] = {}
+        for session in sessions:
+            rate_limits = session["usage"].get("rate_limits") or {}
+            if rate_limits.get("primary") or rate_limits.get("secondary"):
+                newest_rate_limits = rate_limits
+                break
 
-    return {
-        "account": account_label(),
-        "sessions": sessions,
-        "session_count": len(sessions),
-        "rate_limits": newest_rate_limits,
-        "generated_at": int(now.timestamp()),
-    }
+        return {
+            "account": account_label(),
+            "sessions": sessions,
+            "session_count": len(sessions),
+            "rate_limits": newest_rate_limits,
+            "generated_at": int(now.timestamp()),
+        }
 
 
 def render_default(data: dict[str, Any], width: int, p: Palette) -> str:
