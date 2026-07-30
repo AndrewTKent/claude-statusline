@@ -283,7 +283,7 @@ class TestPickProfileRoute:
 
     def test_forced_pin_ignores_quota_and_exclusions(self):
         rows = [
-            accounts_row("gmail", 5.0, seven_day=5.0),
+            accounts_row("safe", 5.0, seven_day=5.0),
             accounts_row("work", 100.0, seven_day=100.0, fable=100.0),
         ]
 
@@ -318,13 +318,13 @@ class TestPickProfileRoute:
 class TestSessionRouting:
     def test_parallel_launches_share_the_freshest_account(self):
         rows = [
-            accounts_row("gmail", 10.0, seven_day=10.0),
+            accounts_row("safe", 10.0, seven_day=10.0),
             accounts_row("work", 20.0, seven_day=20.0),
         ]
 
         ranked = accounts.rank_profile_rows(rows)
 
-        assert [row["label"] for row in ranked] == ["gmail", "work"]
+        assert [row["label"] for row in ranked] == ["safe", "work"]
 
     def test_equal_general_rank_breaks_on_label(self):
         rows = [
@@ -1167,7 +1167,7 @@ class TestCmdStatus:
             accounts,
             "route_rows",
             lambda blobs, active, now: [
-                accounts_row("gmail", 5.0, seven_day=5.0),
+                accounts_row("safe", 5.0, seven_day=5.0),
                 accounts_row(
                     "work",
                     100.0,
@@ -1634,16 +1634,16 @@ class TestBindingPct:
 class TestPickEnvFable:
     NOW = 1_784_000_000.0
     VAULT = {"tokens": {
-        "gmail": {"token": "sk-gmail", "expires_at": NOW + 1000},
-        "brown": {"token": "sk-brown", "expires_at": NOW + 1000},
-        "ymail": {"token": "sk-ymail", "expires_at": NOW + 1000},
+        "alpha": {"token": "sk-alpha", "expires_at": NOW + 1000},
+        "bravo": {"token": "sk-bravo", "expires_at": NOW + 1000},
+        "charlie": {"token": "sk-charlie", "expires_at": NOW + 1000},
     }}
 
     def test_fable_first_orders_eligible_by_fable_utilization(self):
-        rows = [accounts_row("gmail", 10.0, fable=80.0),
-                accounts_row("brown", 50.0, fable=10.0),
-                accounts_row("ymail", 20.0, fable=40.0)]
-        assert [r["label"] for r in accounts._fable_first(rows)] == ["brown", "ymail", "gmail"]
+        rows = [accounts_row("alpha", 10.0, fable=80.0),
+                accounts_row("bravo", 50.0, fable=10.0),
+                accounts_row("charlie", 20.0, fable=40.0)]
+        assert [r["label"] for r in accounts._fable_first(rows)] == ["bravo", "charlie", "alpha"]
 
     def test_equal_binding_breaks_on_fable(self):
         # Both bind at 50 (their 5h); the fresher fable axis wins the tie.
@@ -1652,42 +1652,36 @@ class TestPickEnvFable:
         assert [r["label"] for r in accounts._fable_first(rows)] == ["B", "A"]
 
     def test_lowest_fable_wins_when_rate_windows_are_usable(self):
-        rows = [accounts_row("ymail", 21.0, fable=12.0, seven_day=79.0),
-                accounts_row("coram-work", 30.0, fable=19.0, seven_day=19.0)]
+        rows = [accounts_row("alpha", 21.0, fable=12.0, seven_day=79.0),
+                accounts_row("bravo", 30.0, fable=19.0, seven_day=19.0)]
         assert accounts.pick_profile_route(
             accounts._fable_first(rows),
             set(),
             None,
             require_fable=True,
-        ) == "ymail"
+        ) == "alpha"
 
     def test_prefers_fable_over_headroom(self):
-        # gmail is best 5h (5) but fable-capped; brown worse 5h (50) but fable @10.
-        rows = [accounts_row("gmail", 5.0, fable=100.0), accounts_row("brown", 50.0, fable=10.0)]
+        rows = [accounts_row("alpha", 5.0, fable=100.0), accounts_row("bravo", 50.0, fable=10.0)]
         picked = accounts.pick_route(accounts._fable_first(rows), self.VAULT, set(), self.NOW, None)
-        assert picked == ("brown", "sk-brown")
+        assert picked == ("bravo", "sk-bravo")
 
     def test_falls_back_to_headroom_when_none_eligible(self):
-        # all fable-capped → _fable_first keeps headroom order → best 5h (gmail) wins
-        rows = [accounts_row("gmail", 5.0, fable=100.0), accounts_row("brown", 50.0, fable=100.0)]
+        rows = [accounts_row("alpha", 5.0, fable=100.0), accounts_row("bravo", 50.0, fable=100.0)]
         picked = accounts.pick_route(accounts._fable_first(rows), self.VAULT, set(), self.NOW, None)
-        assert picked == ("gmail", "sk-gmail")
+        assert picked == ("alpha", "sk-alpha")
 
     def test_skips_eligible_without_token(self):
-        # brown is the freshest fable but has NO token → fall through to the next
-        # eligible tokened account (ymail).
-        vault = {"tokens": {"ymail": {"token": "sk-ymail", "expires_at": self.NOW + 1000}}}
-        rows = [accounts_row("brown", 20.0, fable=10.0), accounts_row("ymail", 30.0, fable=40.0)]
+        vault = {"tokens": {"bravo": {"token": "sk-bravo", "expires_at": self.NOW + 1000}}}
+        rows = [accounts_row("alpha", 20.0, fable=10.0), accounts_row("bravo", 30.0, fable=40.0)]
         picked = accounts.pick_route(accounts._fable_first(rows), vault, set(), self.NOW, None)
-        assert picked == ("ymail", "sk-ymail")
+        assert picked == ("bravo", "sk-bravo")
 
     def test_skips_weekly_maxed_fable_account(self):
-        # gmail: freshest fable but weekly (7d) maxed → _fable_first drops it below
-        # brown (headroom on fable AND weekly), so pick_route lands on brown.
-        rows = [accounts_row("gmail", 0.0, fable=8.0, seven_day=100.0),
-                accounts_row("brown", 34.0, fable=41.0, seven_day=52.0)]
+        rows = [accounts_row("alpha", 0.0, fable=8.0, seven_day=100.0),
+                accounts_row("bravo", 34.0, fable=41.0, seven_day=52.0)]
         picked = accounts.pick_route(accounts._fable_first(rows), self.VAULT, set(), self.NOW, None)
-        assert picked == ("brown", "sk-brown")
+        assert picked == ("bravo", "sk-bravo")
 
 
 class TestRouteRowsStale:
@@ -2041,7 +2035,7 @@ class TestStatuslineAccountBoard:
             'SHOW_ACCOUNT_RESETS=1\n'
             'MAX_COLS=200\n'
             'ACCOUNT_LABELS="current:current@example.com|current-org '
-            'poynting:poynting@example.com|poynting-org"\n'
+            'forced:forced@example.com|forced-org"\n'
         )
         now = int(time.time())
         resets = {
@@ -2052,9 +2046,9 @@ class TestStatuslineAccountBoard:
                 "seven_day_pct": 1,
                 "last_seen": now,
             },
-            "poynting@example.com|poynting-org": {
-                "email": "poynting@example.com",
-                "org_uuid": "poynting-org",
+            "forced@example.com|forced-org": {
+                "email": "forced@example.com",
+                "org_uuid": "forced-org",
                 "five_hour_pct": 100,
                 "five_hour_reset": datetime.fromtimestamp(
                     now - 3600, tz=timezone.utc
@@ -2094,18 +2088,18 @@ class TestStatuslineAccountBoard:
             check=True,
         )
         rendered = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
-        return next(line for line in rendered.splitlines() if "Poynting" in line)
+        return next(line for line in rendered.splitlines() if "Forced" in line)
 
     def test_unconfirmed_reset_keeps_last_confirmed_utilization(self, tmp_path):
         row = self._render_reset_row(tmp_path, int(time.time()) - 7200)
 
-        assert re.search(r"Poynting\s+100%(?:\s|$)", row)
+        assert re.search(r"Forced\s+100%(?:\s|$)", row)
         assert "reset pending" in row
 
     def test_post_reset_poll_confirms_empty_window(self, tmp_path):
         row = self._render_reset_row(tmp_path, int(time.time()) - 1800)
 
-        assert re.search(r"Poynting\s+0%(?:\s|$)", row)
+        assert re.search(r"Forced\s+0%(?:\s|$)", row)
         assert "reset pending" not in row
 
     def test_fresher_account_ledger_replaces_stale_usage_cache(self, tmp_path):

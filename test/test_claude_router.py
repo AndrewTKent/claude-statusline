@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import select
 import subprocess
 import sys
 import time
@@ -19,6 +20,20 @@ SPEC = importlib.util.spec_from_file_location(
 assert SPEC and SPEC.loader
 claude_router = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(claude_router)
+
+
+def read_exact(fd, size):
+    data = bytearray()
+    deadline = time.monotonic() + 1
+    while len(data) < size:
+        timeout = deadline - time.monotonic()
+        assert timeout > 0
+        ready, _, _ = select.select([fd], [], [], timeout)
+        assert ready
+        chunk = os.read(fd, size - len(data))
+        assert chunk
+        data.extend(chunk)
+    return bytes(data)
 
 
 def test_router_uses_native_binary_when_path_points_to_the_launcher(
@@ -831,9 +846,8 @@ def test_synchronized_output_emits_dec_control_bytes_on_a_pty(monkeypatch):
         assert claude_router.set_synchronized_output(True) is True
         assert claude_router.set_synchronized_output(False) is True
 
-        assert os.read(master_fd, 1024) == (
-            claude_router.SYNC_OUTPUT_ON + claude_router.SYNC_OUTPUT_OFF
-        )
+        expected = claude_router.SYNC_OUTPUT_ON + claude_router.SYNC_OUTPUT_OFF
+        assert read_exact(master_fd, len(expected)) == expected
     finally:
         stdout.close()
         os.close(slave_fd)
@@ -861,11 +875,12 @@ def test_handoff_brackets_timeout_kill_cleanup_on_a_pty(monkeypatch):
 
         claude_router.stop_for_handoff(Child())
 
-        assert os.read(master_fd, 1024) == (
+        expected = (
             claude_router.SYNC_OUTPUT_ON
             + b"terminatewaitkillwait"
             + claude_router.SYNC_OUTPUT_OFF
         )
+        assert read_exact(master_fd, len(expected)) == expected
     finally:
         stdout.close()
         os.close(slave_fd)
