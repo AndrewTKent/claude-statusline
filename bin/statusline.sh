@@ -2287,11 +2287,19 @@ if [ -n "$_routed_label" ]; then
     fi
 fi
 
+# The router exports ACCOUNTS_ROUTER_STATE into sessions it launches; absence
+# on a router-equipped machine = no supervisor owns this session.
+UNSUP_BADGE=""
+if [ -x "$HOME/.accounts/bin/claude" ] && [ -n "$SESSION_ID" ] &&
+    [[ "${ACCOUNTS_ROUTER_STATE:-}" != /tmp/claude/account-router-*.json ]]; then
+    UNSUP_BADGE="${red}UNSUPERVISED${reset}"
+fi
+
 # ── Render: default (multi-line) ──────────────────────────
 render_default() {
     # Labeled identity block — one fact per row, consistent with
     # context/left/usage rows below.
-    printf "${white}%-7s${reset} %b\n" "model"   "${blue}${MODEL}${reset}${EFFORT}${FAST_MODE}"
+    printf "${white}%-7s${reset} %b\n" "model"   "${blue}${MODEL}${reset}${EFFORT}${FAST_MODE}${UNSUP_BADGE:+ ${UNSUP_BADGE}}"
     [ -n "$SESSION_TIME" ] && \
         printf "${white}%-7s${reset} %b\n" "time"    "${dim}⏱${reset} ${white}${SESSION_TIME}${reset}${IDLE_DISPLAY}"
     [ -n "$ACCT_EMAIL" ] && \
@@ -2352,7 +2360,7 @@ render_default() {
 
 # ── Render: compact (context + used only) ─────────────────
 render_compact() {
-    ctx_line="${white}$(printf "%-7s" "context")${reset} ${CTX_BAR} ${CTX_COLOR}$(fmt_pct "${CONTEXT_PCT:-$CONTEXT_INT}")${reset}"
+    ctx_line="${white}$(printf "%-7s" "context")${reset} ${CTX_BAR} ${CTX_COLOR}$(fmt_pct "${CONTEXT_PCT:-$CONTEXT_INT}")${reset}${UNSUP_BADGE:+ ${UNSUP_BADGE}}"
     printf "%b" "$ctx_line"
 
     if [ -n "${five_hour_pct:-}" ]; then
@@ -2377,7 +2385,7 @@ render_narrow() {
     [ "$COLS" -ge 50 ] 2>/dev/null && bar_w=8
 
     # Identity line: model + effort + fast (no label — it's the obvious row).
-    printf "%b" "${blue}${MODEL}${reset}${EFFORT}${FAST_MODE}"
+    printf "%b" "${blue}${MODEL}${reset}${EFFORT}${FAST_MODE}${UNSUP_BADGE:+ ${UNSUP_BADGE}}"
 
     # Repo + short branch + dirty marker. Reuse SHORT_GIT_INFO when it fits,
     # else fall back to TINY_GIT_INFO (already capped via MAX_BRANCH).

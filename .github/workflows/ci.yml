@@ -62,6 +62,8 @@ jobs:
         run: bash test/test_install_account_router.sh
       - name: Test ledger functions
         run: bash test/test_ledger.sh
+      - name: Test unsupervised badge
+        run: bash test/test_unsupervised_badge.sh
       - name: Test transcript backups
         run: bash test/test_backup_scripts.sh
       - name: Test Codex monitor
