@@ -305,6 +305,10 @@ the router tools under `~/.local/bin`, and prepends a supervised launcher from
 | `accounts sync` | Converge the token vault with a second machine |
 | `accounts pick-env` | Emit `CLAUDE_CONFIG_DIR` and account metadata |
 
+Inside Claude Code, prefix these with `!` (for example,
+`!accounts set coram-max`). Set `"respondToBashCommands": false` in
+`~/.claude/settings.json` so the switch does not trigger an LLM response.
+
 `claude-router.py` supervises interactive sessions. It reserves the selected
 account, watches the active model's quota windows, and resumes the exact session
 under another isolated profile before a window is exhausted. The shell never

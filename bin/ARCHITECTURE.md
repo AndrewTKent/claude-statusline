@@ -190,7 +190,7 @@ Every request gets two labels:
 ```bash
 macos/launchd/install-daemon.sh            # install / reload
 macos/launchd/install-daemon.sh --remove   # unload and delete plist
-macos/launchd/install-accounts-poll.sh     # account-board poller (30m); --remove to drop
+macos/launchd/install-accounts-poll.sh     # account-board poller (1m); --remove to drop
 ```
 
 ## Testing

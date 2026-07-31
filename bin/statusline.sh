@@ -606,6 +606,19 @@ get_oauth_token() {
     fi
 
     if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+        if command -v security >/dev/null 2>&1; then
+            local profile_hash keychain_blob keychain_token
+            profile_hash=$(printf '%s' "$CLAUDE_CONFIG_DIR" | shasum -a 256 2>/dev/null | cut -c1-8)
+            keychain_blob=$(timeout 2 security find-generic-password \
+                -s "Claude Code-credentials-${profile_hash}" -w 2>/dev/null || \
+                security find-generic-password \
+                -s "Claude Code-credentials-${profile_hash}" -w 2>/dev/null)
+            keychain_token=$(echo "$keychain_blob" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
+            if [ -n "$keychain_token" ] && [ "$keychain_token" != "null" ]; then
+                echo "$keychain_token"
+                return 0
+            fi
+        fi
         local profile_creds="${CLAUDE_CONFIG_DIR}/.credentials.json"
         if [ -f "$profile_creds" ]; then
             local profile_token

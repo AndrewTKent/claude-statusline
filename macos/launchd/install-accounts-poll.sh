@@ -29,8 +29,8 @@ install() {
         echo "template missing: $TEMPLATE" >&2
         exit 1
     fi
-    if [ ! -x "$REPO_ROOT/bin/accounts.py" ]; then
-        echo "accounts.py missing or not executable" >&2
+    if [ ! -x "$HOME/.local/bin/accounts" ]; then
+        echo "installed accounts launcher missing or not executable" >&2
         exit 1
     fi
 
@@ -40,18 +40,18 @@ install() {
     # Render template with escaped substitutions — avoids issues if HOME
     # contains characters special to sed.
     tmp=$(mktemp "$PLIST.XXXXXX")
-    python3 - "$TEMPLATE" "$tmp" "$REPO_ROOT" "$HOME" <<'PY'
+    python3 - "$TEMPLATE" "$tmp" "$HOME" <<'PY'
 import sys, pathlib
-src, dst, repo_root, home = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+src, dst, home = sys.argv[1], sys.argv[2], sys.argv[3]
 content = pathlib.Path(src).read_text()
-content = content.replace("__REPO_ROOT__", repo_root).replace("__HOME__", home)
+content = content.replace("__HOME__", home)
 pathlib.Path(dst).write_text(content)
 PY
     mv "$tmp" "$PLIST"
     launchctl load "$PLIST"
     echo "Installed and loaded $LABEL"
     echo "  plist:   $PLIST"
-    echo "  poll:    $REPO_ROOT/bin/accounts.py poll (every 30m)"
+    echo "  poll:    $HOME/.local/bin/accounts poll (every 1m)"
     echo "  logs:    $HOME/.claude/accounts-poll-std{out,err}.log"
 }
 

@@ -1897,7 +1897,7 @@ def test_advisory_usage_update_does_not_handoff_a_running_session(tmp_path):
     assert launches[0]["args"][-2] == "--session-id"
 
 
-def test_running_opus_session_switches_to_fable_when_mode_changes(tmp_path):
+def test_mode_change_before_first_transcript_reuses_the_new_session_id(tmp_path):
     home = tmp_path / "home"
     claude_dir = home / ".claude"
     accounts_dir = home / ".accounts"
@@ -2007,12 +2007,12 @@ def test_running_opus_session_switches_to_fable_when_mode_changes(tmp_path):
     assert launches[1]["args"][-4:] == [
         "--model",
         "fable",
-        "--resume",
+        "--session-id",
         first_session,
     ]
 
 
-def test_fable_session_falls_back_to_opus_when_no_fable_account_is_safe(tmp_path):
+def test_fable_ignores_general_ceilings_until_fable_usage_is_full(tmp_path):
     home = tmp_path / "home"
     claude_dir = home / ".claude"
     accounts_dir = home / ".accounts"
@@ -2045,8 +2045,8 @@ def test_fable_session_falls_back_to_opus_when_no_fable_account_is_safe(tmp_path
         json.dumps(
             {
                 "first@example.com|org-first": {
-                    "five_hour_pct": 10,
-                    "seven_day_pct": 10,
+                    "five_hour_pct": 100,
+                    "seven_day_pct": 100,
                     "fable_pct": 10,
                     "last_seen": time.time(),
                 },
@@ -2109,9 +2109,9 @@ def test_fable_session_falls_back_to_opus_when_no_fable_account_is_safe(tmp_path
         json.dumps(
             {
                 "first@example.com|org-first": {
-                    "five_hour_pct": 10,
-                    "seven_day_pct": 10,
-                    "fable_pct": 95,
+                    "five_hour_pct": 100,
+                    "seven_day_pct": 100,
+                    "fable_pct": 100,
                     "last_seen": time.time(),
                 },
                 "second@example.com|org-second": {
@@ -2130,7 +2130,7 @@ def test_fable_session_falls_back_to_opus_when_no_fable_account_is_safe(tmp_path
     assert process.returncode == 0
     assert stdout == ""
     assert stderr == ""
-    assert [launch["label"] for launch in launches] == ["first", "first"]
+    assert [launch["label"] for launch in launches] == ["first", "second"]
     first_session = launches[0]["args"][-1]
     assert launches[1]["args"][
         launches[1]["args"].index("--effort") + 1
@@ -2138,6 +2138,6 @@ def test_fable_session_falls_back_to_opus_when_no_fable_account_is_safe(tmp_path
     assert launches[1]["args"][-4:] == [
         "--model",
         "opus",
-        "--resume",
+        "--session-id",
         first_session,
     ]

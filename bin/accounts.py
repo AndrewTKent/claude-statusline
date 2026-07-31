@@ -803,6 +803,21 @@ def write_profile_credentials(label: str, blob: str) -> None:
         _write_0600(profile / ".credentials.json", blob)
 
 
+def _repin_known_profile_login(source_label: str, identity: dict, blobs: dict) -> None:
+    mode = load_mode()
+    if mode.get("mode") != "set" or mode.get("label") != source_label:
+        return
+    target_label = resolve_label(
+        identity.get("email"),
+        identity.get("org_uuid"),
+        load_label_pairs(),
+    )
+    target = (blobs.get("accounts") or {}).get(target_label)
+    if target_label == source_label or not target or entry_needs_login(target, time.time()):
+        return
+    save_mode("set", target_label)
+
+
 def sync_profile_credentials(blobs: dict, *, persist: bool) -> set[str]:
     changed = False
     blocked_labels: set[str] = set()
@@ -888,6 +903,7 @@ def sync_profile_credentials(blobs: dict, *, persist: bool) -> set[str]:
             set_entry_blob(entry, stored_blob)
             entry["email"] = expected_email
             entry["org_uuid"] = expected_org_uuid
+            _repin_known_profile_login(label, identity, blobs)
             changed = True
             print(
                 f"warning: repaired {label} profile login from its stored identity",
@@ -1439,7 +1455,7 @@ def _rate_eligible(five_hour: float | None, seven_day: float | None) -> bool:
         five_hour is not None
         and five_hour < RATE_CAP_PCT
         and seven_day is not None
-        and seven_day < RATE_CAP_PCT
+        and seven_day < SEVEN_DAY_CAP_PCT
     )
 
 
@@ -1492,14 +1508,17 @@ def pick_profile_route(
     force_pin: bool = False,
 ) -> str | None:
     if force_pin and pin is not None:
-        return next(
-            (
-                row["label"]
-                for row in rows
-                if row["label"] == pin and not row["expired"]
-            ),
-            None,
-        )
+        for row in rows:
+            if row["label"] != pin or row["expired"]:
+                continue
+            if require_fable and not fable_eligible(
+                row["five_hour"],
+                row["seven_day"],
+                row["fable"],
+            ):
+                return None
+            return row["label"]
+        return None
     ordered = rows
     if pin is not None:
         ordered = sorted(rows, key=lambda row: row["label"] != pin)
@@ -1510,16 +1529,55 @@ def pick_profile_route(
             continue
         if row["label"] in excludes:
             continue
-        if not _rate_eligible(row["five_hour"], row["seven_day"]):
-            continue
-        if require_fable and not fable_eligible(
-            row["five_hour"],
-            row["seven_day"],
-            row["fable"],
-        ):
+        if require_fable:
+            if not fable_eligible(
+                row["five_hour"],
+                row["seven_day"],
+                row["fable"],
+            ):
+                continue
+        elif not _rate_eligible(row["five_hour"], row["seven_day"]):
             continue
         return row["label"]
-    return None
+    if require_fable:
+        return None
+    return _most_headroom(ordered, excludes, require_fable=False)
+
+
+def _most_headroom(
+    rows: list[dict],
+    excludes: set[str],
+    *,
+    require_fable: bool,
+) -> str | None:
+    """Last resort when every account trips a ceiling: the one with the most
+    runway still beats refusing to route. Only genuinely walled accounts
+    (>= HARD_WALL_PCT on an axis they need) stay unpickable."""
+
+    def usable(row: dict) -> bool:
+        axes = [row["five_hour"], row["seven_day"]]
+        if require_fable:
+            axes.append(row["fable"])
+        return all(pct is not None and pct < HARD_WALL_PCT for pct in axes)
+
+    candidates = [
+        row
+        for row in rows
+        if not row["expired"]
+        and not row.get("stale")
+        and row["label"] not in excludes
+        and usable(row)
+    ]
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda row: (
+            binding_pct(row["five_hour"], row["seven_day"]),
+            row["fable"] if require_fable and row["fable"] is not None else 0.0,
+            row["label"],
+        ),
+    )["label"]
 
 
 def rank_profile_rows(
@@ -1835,14 +1893,14 @@ def _profile_row_eligible(
         and not row["expired"]
         and not row.get("stale")
         and label not in excludes
-        and _rate_eligible(row["five_hour"], row["seven_day"])
         and (
-            not require_fable
-            or fable_eligible(
+            fable_eligible(
                 row["five_hour"],
                 row["seven_day"],
                 row["fable"],
             )
+            if require_fable
+            else _rate_eligible(row["five_hour"], row["seven_day"])
         )
     )
 
@@ -1945,26 +2003,23 @@ def cmd_pick_env(args) -> None:
     print(f"export ACCOUNTS_ROUTED_ORG_UUID={shlex.quote(selected['org_uuid'])}")
 
 
+# 5h is an imminent wall; 20% of a WEEK is still hours of runway, so the
+# weekly axis gets a looser ceiling instead of blocking an otherwise-fresh
+# account.
 RATE_CAP_PCT = 80.0
-FABLE_CAP_PCT = 95.0
+SEVEN_DAY_CAP_PCT = 90.0
+# Above this on either axis an account is genuinely walled and never a
+# last-resort pick.
+HARD_WALL_PCT = 97.0
+FABLE_CAP_PCT = 100.0
 
 
 def fable_eligible(
-    five_hour: float | None, seven_day: float | None, fable: float | None
+    _five_hour: float | None,
+    _seven_day: float | None,
+    fable: float | None,
 ) -> bool:
-    """Usable for Fable work: headroom on the fable window AND both rate windows
-    (5h and 7d). Fable headroom is worthless if either rate window is capped — you
-    can't make requests at all (a maxed weekly is why a fresh-fable account can
-    still be unusable). fable None (tier has no weekly_scoped limit), or any of the
-    three axes None or at/over cap → ineligible."""
-    return (
-        fable is not None
-        and fable < FABLE_CAP_PCT
-        and five_hour is not None
-        and five_hour < RATE_CAP_PCT
-        and seven_day is not None
-        and seven_day < RATE_CAP_PCT
-    )
+    return fable is not None and fable < FABLE_CAP_PCT
 
 
 def _fable_rank(r: dict) -> tuple:
@@ -2039,11 +2094,11 @@ def cmd_fable(_args) -> None:
 
 
 def cmd_status(_args) -> None:
-    mode = load_mode()
     with locked():
         blobs = load_blobs()
         capture_live_to_blobs(blobs)
         blocked_labels = sync_profile_credentials(blobs, persist=True)
+    mode = load_mode()
     rows = [
         row for row in route_rows(blobs, None, time.time()) if row["label"] not in blocked_labels
     ]

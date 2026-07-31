@@ -2,9 +2,9 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
   Template for the accounts usage-poll launchd agent. install-accounts-poll.sh
-  populates REPO_ROOT and HOME, then copies this file to ~/Library/LaunchAgents/.
+  populates HOME, then copies this file to ~/Library/LaunchAgents/.
 
-  Runs `accounts poll` every 30 minutes so launch-time routing never decides on a
+  Runs `accounts poll` every minute so live routing never decides on a
   stale board. StartInterval, not KeepAlive: the job exits after each poll, and
   KeepAlive would relaunch it immediately in a loop.
 -->
@@ -15,7 +15,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>__REPO_ROOT__/bin/accounts.py</string>
+        <string>__HOME__/.local/bin/accounts</string>
         <string>poll</string>
     </array>
 
@@ -23,7 +23,7 @@
     <true/>
 
     <key>StartInterval</key>
-    <integer>1800</integer>
+    <integer>60</integer>
 
     <!-- If a poll fails instantly, wait at least 10s before the next launch.
          Protects against crash loops if config is broken. -->
