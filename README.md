@@ -36,7 +36,8 @@ Four tools, one repo, shared data files:
 model   Fable 5.ultracode
 time    ⏱ 2:29:20
 account you@example.com
-repo    my-project main (v1.2.0*)
+repo    my-project feature/fix-the-thing (v1.2.0*)
+pr      #N Fix The Thing The Session Is Working On
 context ●●●●●●●○○○○○○○○ 49%
 session ●●●●●●●●●○○○○○○ 60.2%   resets 10:00pm PDT
 weekly  ●●●●○○○○○○○○○○○ 31.07%  resets jul 27, 12:00pm PDT
@@ -80,7 +81,7 @@ Restart Claude Code. Done.
 
 ### Codex
 
-**Requires:** Codex CLI &middot; Python 3 &middot; `tmux` &middot; `~/.local/bin` on `PATH`
+**Requires:** Codex CLI &middot; Python 3 &middot; `tmux` &middot; `~/.local/bin` on `PATH` &middot; Optional: [`gh`](https://cli.github.com/) for PR linkage
 
 ```bash
 ./install-codex.sh
@@ -90,7 +91,7 @@ codex-statusline --sandbox read-only --ask-for-approval on-request
 
 `codex-statusline` launches Codex in tmux with a fixed bottom pane matching the
 multi-line Claude Code status view. It shows the current model, elapsed time,
-account, repository, context use, 5-hour and weekly limits, tokens, agents, and
+account, repository, linked pull request, context use, 5-hour and weekly limits, tokens, agents, and
 running tools. It binds each footer to the rollout file opened by its owning Codex
 process, so concurrent and resumed sessions do not exchange context values. Mouse
 wheel scrollback is enabled with a 100,000-line history; tune it with
@@ -137,6 +138,7 @@ dispatch to the renderer; anything else launches Codex). `codex-top` monitors ex
 | `time` | session duration available | Wall-clock (`⏱ 24:12`); adds `idle Nm` after 30s with no user turn |
 | `account` | account resolved | Tag from `ACCOUNT_LABELS`, colored per `LABEL_COLORS` |
 | `repo` | always | Dir name, `worktree`/`primary` tag, branch (dirty `*`, `↑`/`↓` ahead/behind), PR badge |
+| `pr` | the checkout maps to an open PR | PR number and title for the checked-out branch or detached PR head |
 | `context` | always | Context-window fill — 15-dot sweet-spot bar (blue <30%, green 30–70%, yellow 70–85%, red 85%+) |
 | `session` | 5h rate-limit data available | 5h window used, 15-dot bar + `resets <time>` |
 | `weekly` | 7-day rate-limit data available | 7-day window used, 15-dot bar + `resets <date>` |
@@ -411,7 +413,7 @@ Claude Code                    statusline.sh
 | Network latency | Background refreshes; a changed credential can block up to 2s for identity validation |
 | Concurrent sessions | Lock file with stale-PID detection (auto-cleanup at 30s) |
 | Git dirty check | `git diff-index --quiet HEAD` (faster than `git status`) |
-| PR status | `gh pr view` cached 90s, background-refreshed |
+| PR status | Repository-scoped `gh` lookup cached 90s, background-refreshed |
 | Ledger writes | Atomic (mktemp + mv) |
 | Account switch | OAuth token hash + credential mtime tracking, synchronous identity validation before ledger writes |
 | Subagent scan | File-based cache with 30s TTL, scoped to current session |
@@ -441,7 +443,8 @@ Claude Code                    statusline.sh
 | `/tmp/claude/statusline-{usage,profile}-cache.json` | Current-profile aliases for companion apps | Updated each render |
 | `/tmp/claude/statusline-subagent-<sid>.txt` | Subagent token cache per session | 30s TTL |
 | `/tmp/claude/ctx-history-<sid>.txt` | Context-fill samples, for the fill-ETA calc | Rolling |
-| `/tmp/claude/statusline-pr-<branch>.json` | PR status cache | 90s TTL |
+| `/tmp/claude/statusline-pr-<repo-ref-key>.json` | PR status cache | 90s TTL |
+| `/tmp/claude/statusline-pr-<repo-ref-key>.json.lock` | PR refresh lock | Persistent file, transient lock |
 | `/tmp/claude/statusline-raw.json` | Raw status blob, for macOS apps | Updated each render |
 | `/tmp/claude/statusline-notif-state.json` | Notification dedup state | Per-threshold |
 | `/tmp/claude/statusline-refresh-<profile>.lock` | Account-keyed background refresh lock | Transient |
