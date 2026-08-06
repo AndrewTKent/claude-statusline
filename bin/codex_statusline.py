@@ -6,7 +6,10 @@ from __future__ import annotations
 import argparse
 import base64
 import codecs
+from collections.abc import Callable
 from contextlib import closing, contextmanager
+import fcntl
+import hashlib
 import json
 import os
 import re
@@ -128,6 +131,15 @@ class Thread:
     archived: int
     agent_path: str = ""
     agent_nickname: str = ""
+
+
+@dataclass(frozen=True)
+class GitInfo:
+    repo: str
+    display_branch: str
+    root: str
+    branch_name: str
+    head: str
 
 
 @dataclass
@@ -2787,10 +2799,13 @@ def display_model(model: str) -> str:
 
 
 GIT_INFO_TTL_SECONDS = 5
+PR_CACHE_TTL_SECONDS = 90
+PR_CACHE_DIR = Path(os.environ.get("CODEX_STATUSLINE_PR_CACHE_DIR", "/tmp/claude"))
+PR_REFRESH_PROCESSES: list[subprocess.Popen[Any]] = []
 
 
 @lru_cache(maxsize=128)
-def git_info(cwd: str, fallback_branch: str, bucket: int) -> tuple[str, str]:
+def git_info(cwd: str, fallback_branch: str, bucket: int) -> GitInfo:
     path = cwd or os.getcwd()
     try:
         root = subprocess.check_output(
@@ -2800,30 +2815,28 @@ def git_info(cwd: str, fallback_branch: str, bucket: int) -> tuple[str, str]:
             timeout=0.4,
         ).strip()
     except (subprocess.SubprocessError, OSError):
-        return Path(path).name or "unknown", fallback_branch or "-"
+        return GitInfo(Path(path).name or "unknown", fallback_branch or "-", "", "", "")
 
     repo = Path(root).name
-    branch = fallback_branch
-    if not branch:
-        try:
-            branch = subprocess.check_output(
-                ["git", "-C", root, "branch", "--show-current"],
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=0.4,
-            ).strip()
-        except (subprocess.SubprocessError, OSError):
-            branch = ""
-    if not branch:
-        try:
-            branch = subprocess.check_output(
-                ["git", "-C", root, "rev-parse", "--short", "HEAD"],
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=0.4,
-            ).strip()
-        except (subprocess.SubprocessError, OSError):
-            branch = "-"
+    try:
+        branch_name = subprocess.check_output(
+            ["git", "-C", root, "branch", "--show-current"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=0.4,
+        ).strip()
+    except (subprocess.SubprocessError, OSError):
+        branch_name = fallback_branch.removesuffix("*")
+    try:
+        head = subprocess.check_output(
+            ["git", "-C", root, "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=0.4,
+        ).strip()
+    except (subprocess.SubprocessError, OSError):
+        head = ""
+    display_branch = branch_name or (head[:8] if head else fallback_branch or "-")
 
     try:
         dirty = subprocess.check_output(
@@ -2834,7 +2847,169 @@ def git_info(cwd: str, fallback_branch: str, bucket: int) -> tuple[str, str]:
         ).strip()
     except (subprocess.SubprocessError, OSError):
         dirty = ""
-    return repo, f"{branch}{'*' if dirty else ''}"
+    return GitInfo(
+        repo,
+        f"{display_branch}{'*' if dirty else ''}",
+        root,
+        branch_name,
+        head,
+    )
+
+
+def query_pull_request(repo_root: str, branch: str, head: str) -> dict[str, Any] | None:
+    if branch in {"main", "master"}:
+        return None
+    fields = "number,title,url,state"
+    try:
+        if branch:
+            payload = subprocess.check_output(
+                ["gh", "pr", "view", branch, "--json", fields],
+                cwd=repo_root,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=5,
+            )
+        elif head:
+            repo = subprocess.check_output(
+                ["gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
+                cwd=repo_root,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=5,
+            ).strip()
+            number = subprocess.check_output(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{repo}/commits/{head}/pulls",
+                    "--jq",
+                    f'map(select(.state == "open" and .head.sha == "{head}")) | first | .number // empty',
+                ],
+                cwd=repo_root,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=5,
+            ).strip()
+            if not number:
+                return None
+            payload = subprocess.check_output(
+                ["gh", "pr", "view", number, "--json", fields],
+                cwd=repo_root,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=5,
+            )
+        else:
+            return None
+        data = json.loads(payload)
+    except (json.JSONDecodeError, OSError, subprocess.SubprocessError):
+        return None
+    if data.get("state") != "OPEN" or not data.get("number"):
+        return None
+    return {
+        "number": int(data["number"]),
+        "title": re.sub(r"[\x00-\x1f\x7f]", " ", str(data.get("title") or "")).strip(),
+        "url": str(data.get("url") or ""),
+    }
+
+
+def pr_cache_path(repo_root: str, branch: str, head: str) -> Path:
+    ref = branch or head
+    digest = hashlib.sha256(f"{repo_root}\0{ref}".encode()).hexdigest()[:16]
+    return PR_CACHE_DIR / f"statusline-pr-{digest}.json"
+
+
+def read_pr_cache(cache_file: Path) -> dict[str, Any] | None:
+    data = read_json(cache_file)
+    if not data.get("number"):
+        return None
+    return data
+
+
+def write_pr_cache(cache_file: Path, pull_request: dict[str, Any] | None) -> None:
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    temporary = cache_file.with_name(f"{cache_file.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(json.dumps(pull_request or {}, ensure_ascii=False) + "\n")
+        os.replace(temporary, cache_file)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def refresh_pr_cache(
+    cache_file: Path,
+    repo_root: str,
+    branch: str,
+    head: str,
+    lock_fd: int,
+) -> None:
+    try:
+        write_pr_cache(cache_file, query_pull_request(repo_root, branch, head))
+    finally:
+        if lock_fd >= 0:
+            os.close(lock_fd)
+
+
+def reap_pr_cache_refreshes() -> None:
+    PR_REFRESH_PROCESSES[:] = [
+        process for process in PR_REFRESH_PROCESSES if process.poll() is None
+    ]
+
+
+def start_pr_cache_refresh(cache_file: Path, repo_root: str, branch: str, head: str) -> None:
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = Path(f"{cache_file}.lock")
+    try:
+        descriptor = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        return
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(descriptor)
+        return
+    try:
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--refresh-pr-cache",
+                "--pr-cache-file",
+                str(cache_file),
+                "--pr-repo-root",
+                repo_root,
+                "--pr-branch",
+                branch,
+                "--pr-head",
+                head,
+                "--pr-lock-fd",
+                str(descriptor),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            pass_fds=(descriptor,),
+            start_new_session=True,
+        )
+    except OSError:
+        os.close(descriptor)
+        return
+    os.close(descriptor)
+    PR_REFRESH_PROCESSES.append(process)
+
+
+def pull_request_info(repo_root: str, branch: str, head: str) -> dict[str, Any] | None:
+    reap_pr_cache_refreshes()
+    if not repo_root or not (branch or head) or branch in {"main", "master"}:
+        return None
+    cache_file = pr_cache_path(repo_root, branch, head)
+    try:
+        stale = time.time() - cache_file.stat().st_mtime >= PR_CACHE_TTL_SECONDS
+    except OSError:
+        stale = True
+    if stale:
+        start_pr_cache_refresh(cache_file, repo_root, branch, head)
+    return read_pr_cache(cache_file)
 
 
 def color_for_pct(pct: float, p: Palette) -> str:
@@ -2949,13 +3124,21 @@ def render_goal_row(label: str, value: int, goal: int, width: int, p: Palette, i
     bar, pct = build_bar(value, goal, width, p)
     detail = f"{format_tokens(value)}/{format_tokens(goal)}" if goal > 0 else format_tokens(value)
     pct_text = format_pct(pct).ljust(7) if goal > 0 else "goal n/a"
-    return f"{' ' * indent}{label:<7} {bar} {pct_text} {detail}"
+    pct_color = color_for_pct(pct, p)
+    return (
+        f"{' ' * indent}{p.white}{label:<7}{p.reset} {bar} "
+        f"{pct_color}{pct_text}{p.reset} {p.dim}{detail}{p.reset}"
+    )
 
 
 def render_rate_limit_row(label: str, limit: dict[str, Any], width: int, p: Palette, indent: int = 8) -> str:
     used_percent, reset = limit_display(limit)
     bar = build_pct_bar(used_percent, width, p)
-    return f"{' ' * indent}{label:<7} {bar} {format_pct(used_percent).ljust(7)} {reset}"
+    pct_color = color_for_pct(used_percent, p)
+    return (
+        f"{' ' * indent}{p.white}{label:<7}{p.reset} {bar} "
+        f"{pct_color}{format_pct(used_percent).ljust(7)}{p.reset} {p.dim}{reset}{p.reset}"
+    )
 
 
 def rate_limit_window_label(window_minutes: Any, fallback: str) -> str:
@@ -3013,6 +3196,7 @@ def snapshot_for_thread(
     now: datetime,
     *,
     prefer_thread_cwd: bool = False,
+    include_pull_request: bool = True,
     active_window_seconds: int = 900,
 ) -> dict[str, Any]:
     model = thread.model or str(codex_config.get("model", ""))
@@ -3021,7 +3205,7 @@ def snapshot_for_thread(
     usage = usage_from_rollout(thread)
     tokens.session = usage.session_total
     repo_cwd = thread.cwd if prefer_thread_cwd else (cwd if paths_related(cwd, thread.cwd) else thread.cwd)
-    repo, branch = git_info(repo_cwd, thread.git_branch, int(now.timestamp() // GIT_INFO_TTL_SECONDS))
+    git = git_info(repo_cwd, thread.git_branch, int(now.timestamp() // GIT_INFO_TTL_SECONDS))
     window = usage.context_window or context_window(model)
 
     return {
@@ -3032,8 +3216,13 @@ def snapshot_for_thread(
         "reasoning_effort": effort,
         "context_window": window,
         "account": account_label(),
-        "repo": repo,
-        "branch": branch,
+        "repo": git.repo,
+        "branch": git.display_branch,
+        "pull_request": (
+            pull_request_info(git.root, git.branch_name, git.head)
+            if include_pull_request
+            else None
+        ),
         "cwd": thread.cwd,
         "created_at": thread.created_at,
         "updated_at": thread.updated_at,
@@ -3156,6 +3345,7 @@ def all_sessions_snapshot(args: argparse.Namespace) -> dict[str, Any]:
                         cwd,
                         now,
                         prefer_thread_cwd=True,
+                        include_pull_request=False,
                         active_window_seconds=args.active_window,
                     )
                 )
@@ -3193,6 +3383,13 @@ def render_default(data: dict[str, Any], width: int, p: Palette) -> str:
         f"        account {data['account']}",
         f"        repo    {data['repo']} ({data['branch']})",
     ]
+    pull_request = data.get("pull_request")
+    if pull_request:
+        value = short_text(
+            f"#{pull_request['number']} {pull_request['title']}",
+            max(1, width - 16),
+        )
+        lines.append(f"        pr      {value}")
 
     if usage["context_window"] > 0:
         lines.append(render_goal_row("context", usage["context_used"], usage["context_window"], DEFAULT_BAR_WIDTH, p))
@@ -3243,19 +3440,61 @@ def render_footer(data: dict[str, Any], width: int, p: Palette) -> str:
     tokens = data["tokens"]
     rate_limits = usage.get("rate_limits") or {}
 
-    def row(label: str, value: str) -> str:
+    effort_name = data["reasoning_effort"]
+    effort = f".{effort_name}" if effort_name else ""
+
+    def solid(color: str) -> Callable[[str], str]:
+        return lambda value: f"{color}{value}{p.reset}"
+
+    def model_style(value: str) -> str:
+        effort_colors = {
+            "low": p.dim,
+            "medium": p.orange,
+            "high": p.red,
+            "xhigh": p.red,
+            "max": p.red,
+            "ultracode": p.magenta,
+        }
+        if effort and value.endswith(effort):
+            model = value[: -len(effort)]
+            return f"{p.blue}{model}{p.reset}{effort_colors.get(effort_name, p.white)}{effort}{p.reset}"
+        return f"{p.blue}{value}{p.reset}"
+
+    def repo_style(value: str) -> str:
+        repo, separator, branch = value.partition(" (")
+        if not separator:
+            return f"{p.cyan}{value}{p.reset}"
+        if not branch.endswith(")"):
+            branch = f"{branch[:-2]}…)" if len(branch) > 1 else ")"
+        branch_color = p.orange if "*" in data["branch"] else p.green
+        return f"{p.cyan}{repo}{p.reset} {branch_color}({branch}{p.reset}"
+
+    def pr_style(value: str) -> str:
+        number, separator, title = value.partition(" ")
+        suffix = f" {p.white}{title}{p.reset}" if separator else ""
+        return f"{p.cyan}{number}{p.reset}{suffix}"
+
+    def row(
+        label: str,
+        value: str,
+        style: Callable[[str], str] | None = None,
+    ) -> str:
         prefix = f"  {label:<7} "
         if width <= len(prefix):
-            return short_text(f"{label} {value}", max(1, width))
-        return prefix + short_text(value, max(1, width - len(prefix)))
+            return f"{p.white}{short_text(f'{label} {value}', max(1, width))}{p.reset}"
+        clipped = short_text(value, max(1, width - len(prefix)))
+        styled = style(clipped) if style else solid(p.white)(clipped)
+        return f"  {p.white}{label:<7}{p.reset} {styled}"
 
-    effort = f".{data['reasoning_effort']}" if data["reasoning_effort"] else ""
     lines = [
-        row("model", f"{data['model_display']}{effort}"),
-        row("time", format_duration(data["session_age_seconds"])),
-        row("account", data["account"]),
-        row("repo", f"{data['repo']} ({data['branch']})"),
+        row("model", f"{data['model_display']}{effort}", model_style),
+        row("time", f"⏱ {format_duration(data['session_age_seconds'])}"),
+        row("account", data["account"], solid(p.orange)),
+        row("repo", f"{data['repo']} ({data['branch']})", repo_style),
     ]
+    pull_request = data.get("pull_request")
+    if pull_request:
+        lines.append(row("pr", f"#{pull_request['number']} {pull_request['title']}", pr_style))
     if usage["context_window"] > 0:
         if width >= 64:
             lines.append(render_goal_row("context", usage["context_used"], usage["context_window"], DEFAULT_BAR_WIDTH, p, 2))
@@ -3265,6 +3504,7 @@ def render_footer(data: dict[str, Any], width: int, p: Palette) -> str:
                 row(
                     "context",
                     f"{format_pct(context_pct)} {format_tokens(usage['context_used'])}/{format_tokens(usage['context_window'])}",
+                    solid(color_for_pct(context_pct, p)),
                 )
             )
     for label, limit in labeled_rate_limits(rate_limits):
@@ -3272,7 +3512,13 @@ def render_footer(data: dict[str, Any], width: int, p: Palette) -> str:
             lines.append(render_rate_limit_row(label, limit, DEFAULT_BAR_WIDTH, p, 2))
         else:
             limit_pct, limit_reset = limit_display(limit)
-            lines.append(row(label, f"{format_pct(limit_pct)} {limit_reset}"))
+            lines.append(
+                row(
+                    label,
+                    f"{format_pct(limit_pct)} {limit_reset}",
+                    solid(color_for_pct(limit_pct, p)),
+                )
+            )
 
     lines.extend(
         [
@@ -3285,10 +3531,12 @@ def render_footer(data: dict[str, Any], width: int, p: Palette) -> str:
                 f"{int(agents.get('active', 0))}/{int(agents.get('total', 0))} running · "
                 f"tools {activity['active_tools'] + int(agents.get('active_tools', 0))} · "
                 f"shells {activity['active_shells'] + int(agents.get('active_shells', 0))}",
+                solid(p.green if int(agents.get("active", 0)) else p.dim),
             ),
             row(
                 "mode",
                 f"{data.get('sandbox', '-')} · approvals {data.get('approval_mode', '-')}",
+                solid(p.dim),
             ),
         ]
     )
@@ -3645,6 +3893,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--show-inactive", action="store_true", help="show completed/stale sessions in --top")
     parser.add_argument("--include-agents", action="store_true", help="include subagent sessions in --top")
     parser.add_argument("--sort", choices=("active", "context", "tokens", "idle"), default="active", help="sort mode for --top")
+    parser.add_argument("--refresh-pr-cache", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--pr-cache-file", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--pr-repo-root", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--pr-branch", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--pr-head", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--pr-lock-fd", type=int, default=-1, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if (
         not args.thread_id
@@ -3660,6 +3914,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
+    if args.refresh_pr_cache:
+        refresh_pr_cache(
+            Path(args.pr_cache_file),
+            args.pr_repo_root,
+            args.pr_branch,
+            args.pr_head,
+            args.pr_lock_fd,
+        )
+        return 0
     color_enabled = not args.no_color and not os.environ.get("NO_COLOR")
     if args.watch > 0:
         return watch(args, Palette(color_enabled))

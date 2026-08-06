@@ -973,10 +973,17 @@ FOCUS=""
 GIT_INFO=""
 IS_DIRTY=false
 BRANCH=""
+BRANCH_NAME=""
+HEAD_SHA=""
+GIT_ROOT=""
 IN_WORKTREE=false
 WORKTREE_NAME=""
 if [ -d "$CWD" ] && git -C "$CWD" rev-parse --git-dir > /dev/null 2>&1; then
-    BRANCH=$(git -C "$CWD" branch --show-current 2>/dev/null)
+    GIT_ROOT=$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null)
+    BRANCH_NAME=$(git -C "$CWD" branch --show-current 2>/dev/null)
+    HEAD_SHA=$(git -C "$CWD" rev-parse HEAD 2>/dev/null)
+    BRANCH="$BRANCH_NAME"
+    [ -z "$BRANCH" ] && BRANCH="${HEAD_SHA:0:8}"
     # Detect worktree: git-common-dir differs from git-dir when in a worktree
     GIT_DIR=$(git -C "$CWD" rev-parse --git-dir 2>/dev/null)
     GIT_COMMON=$(git -C "$CWD" rev-parse --git-common-dir 2>/dev/null)
@@ -1008,7 +1015,8 @@ if [ -d "$CWD" ] && git -C "$CWD" rev-parse --git-dir > /dev/null 2>&1; then
             GIT_INFO=" ${green}(${BRANCH})${reset}"
         fi
         # Ahead/behind
-        UPSTREAM=$(git -C "$CWD" rev-parse --abbrev-ref "${BRANCH}@{upstream}" 2>/dev/null)
+        UPSTREAM=""
+        [ -n "$BRANCH_NAME" ] && UPSTREAM=$(git -C "$CWD" rev-parse --abbrev-ref "${BRANCH_NAME}@{upstream}" 2>/dev/null)
         if [ -n "$UPSTREAM" ]; then
             COUNTS=$(git -C "$CWD" rev-list --left-right --count HEAD..."${UPSTREAM}" 2>/dev/null)
             AHEAD=$(echo "$COUNTS" | cut -f1)
@@ -1023,8 +1031,14 @@ fi
 
 # ── PR state indicator (cached 90s) ────────────────────
 PR_BADGE=""
-if [ -n "$BRANCH" ] && [ "$BRANCH" != "main" ] && [ "$BRANCH" != "master" ] && command -v gh >/dev/null 2>&1; then
-    pr_cache_file="/tmp/claude/statusline-pr-${BRANCH//\//_}.json"
+PR_NUMBER=""
+PR_TITLE=""
+PR_URL=""
+if [ -n "$GIT_ROOT" ] && [ -n "$HEAD_SHA" ] && [ "$BRANCH_NAME" != "main" ] && [ "$BRANCH_NAME" != "master" ] && command -v gh >/dev/null 2>&1; then
+    pr_ref="${BRANCH_NAME:-$HEAD_SHA}"
+    pr_cache_key=$(printf '%s\0%s' "$GIT_ROOT" "$pr_ref" | cksum)
+    pr_cache_key="${pr_cache_key%% *}"
+    pr_cache_file="/tmp/claude/statusline-pr-${pr_cache_key}.json"
     pr_cache_max_age=90
     pr_needs_refresh=true
 
@@ -1038,24 +1052,38 @@ if [ -n "$BRANCH" ] && [ "$BRANCH" != "main" ] && [ "$BRANCH" != "master" ] && c
     if $pr_needs_refresh; then
         # Fire-and-forget background refresh
         (
-            pr_data=$(gh pr view "$BRANCH" --json state,isDraft,reviewDecision,statusCheckRollup 2>/dev/null)
-            if [ -n "$pr_data" ] && echo "$pr_data" | jq -e '.state' >/dev/null 2>&1; then
-                echo "$pr_data" > "$pr_cache_file"
+            if [ -n "$BRANCH_NAME" ]; then
+                pr_data=$(cd "$GIT_ROOT" && gh pr view "$BRANCH_NAME" --json state,isDraft,reviewDecision,statusCheckRollup,number,title,url 2>/dev/null)
             else
-                echo '{"state":"NONE"}' > "$pr_cache_file"
+                repo_slug=$(cd "$GIT_ROOT" && gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null)
+                pr_number=""
+                if [ -n "$repo_slug" ]; then
+                    pr_number=$(gh api "repos/${repo_slug}/commits/${HEAD_SHA}/pulls" --jq "map(select(.state == \"open\" and .head.sha == \"${HEAD_SHA}\")) | first | .number // empty" 2>/dev/null)
+                fi
+                pr_data=""
+                [ -n "$pr_number" ] && pr_data=$(cd "$GIT_ROOT" && gh pr view "$pr_number" --json state,isDraft,reviewDecision,statusCheckRollup,number,title,url 2>/dev/null)
             fi
+            pr_tmp="${pr_cache_file}.${BASHPID:-$$}.tmp"
+            if [ -n "$pr_data" ] && echo "$pr_data" | jq -e '.state' >/dev/null 2>&1; then
+                printf '%s\n' "$pr_data" > "$pr_tmp"
+            else
+                printf '%s\n' '{"state":"NONE"}' > "$pr_tmp"
+            fi
+            mv -f "$pr_tmp" "$pr_cache_file"
         ) &
     fi
 
     # Always read from cache
     if [ -f "$pr_cache_file" ]; then
-        pr_info=$(jq -r '[.state // "NONE", .isDraft // false | tostring, .reviewDecision // "NONE", ([.statusCheckRollup[]? | .status] | if any(. == "FAILURE") then "FAIL" elif any(. == "PENDING") then "PENDING" else "PASS" end)] | join("|")' "$pr_cache_file" 2>/dev/null)
-        pr_state="${pr_info%%|*}"
-        pr_rest="${pr_info#*|}"
-        pr_draft="${pr_rest%%|*}"
-        pr_rest2="${pr_rest#*|}"
-        pr_review="${pr_rest2%%|*}"
-        pr_checks="${pr_rest2#*|}"
+        eval "$(jq -r '
+            "pr_state=" + ((.state // "NONE") | @sh),
+            "pr_draft=" + ((.isDraft // false | tostring) | @sh),
+            "pr_review=" + ((.reviewDecision // "NONE") | @sh),
+            "pr_checks=" + (([.statusCheckRollup[]? | .status] | if any(. == "FAILURE") then "FAIL" elif any(. == "PENDING") then "PENDING" else "PASS" end) | @sh),
+            "PR_NUMBER=" + ((.number // "" | tostring) | @sh),
+            "PR_TITLE=" + ((.title // "" | gsub("[\u0000-\u001f\u007f]"; " ")) | @sh),
+            "PR_URL=" + ((.url // "") | @sh)
+        ' "$pr_cache_file" 2>/dev/null)"
 
         if [ "$pr_state" = "OPEN" ]; then
             if [ "$pr_draft" = "true" ]; then
@@ -1727,7 +1755,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
             _best_fable=""
             _best_label=""
             printf -v _rate_cap_rank '%020.12f' 80
-            printf -v _fable_cap_rank '%020.12f' 95
+            printf -v _fable_cap_rank '%020.12f' 100
             while IFS='|' read -r em uuid tag ep pct pct_state seven_day_iso weekly_pct_ledger fbl_iso fable_pct_ledger last_seen_ts; do
                 [ -z "$em" ] && continue
                 # Match the active account on (email, org_uuid). Legacy ledger
@@ -2025,15 +2053,16 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     fi
                 else
                     candidate_eligible=1
-                    if [ "$five_known" = "0" ] || [ "$weekly_known" = "0" ] ||
-                       ! _account_rank_precedes "$five_rank" "$_rate_cap_rank" ||
-                       ! _account_rank_precedes "$weekly_rank" "$_rate_cap_rank" ||
-                       [ -n "$exp_suffix" ]; then
+                    if [ -n "$exp_suffix" ]; then
                         candidate_eligible=0
-                    fi
-                    if [ "$_route_mode" = "fable" ] &&
-                       { [ "$fable_known" = "0" ] ||
-                         ! _account_rank_precedes "$fable_rank" "$_fable_cap_rank"; }; then
+                    elif [ "$_route_mode" = "fable" ]; then
+                        if [ "$fable_known" = "0" ] ||
+                           ! _account_rank_precedes "$fable_rank" "$_fable_cap_rank"; then
+                            candidate_eligible=0
+                        fi
+                    elif [ "$five_known" = "0" ] || [ "$weekly_known" = "0" ] ||
+                         ! _account_rank_precedes "$five_rank" "$_rate_cap_rank" ||
+                         ! _account_rank_precedes "$weekly_rank" "$_rate_cap_rank"; then
                         candidate_eligible=0
                     fi
                 fi
@@ -2116,9 +2145,10 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     pct_raw="—"
                     pct_color="$dim"
                 fi
-                # Weekly-capped accounts are unusable regardless of 5h state — dim the name.
                 name_color="$white"
-                [ "$weekly_int" -ge 100 ] 2>/dev/null && name_color="$dim"
+                if [ "$_route_mode" != "fable" ] && [ "$weekly_int" -ge 100 ] 2>/dev/null; then
+                    name_color="$dim"
+                fi
                 [ "${#display_name}" -gt "$_name_w" ] && _name_w=${#display_name}
                 row_rest=" ${pct_color}$(_ralign "$pct_raw" 4)${reset}  ${dim}$(_ralign "$five_reset_rel" 6)${reset}   ${weekly_seg}   ${fable_seg}  ${dim}$(_ralign "$wk_reset_rel" 6)${reset}${exp_suffix}${stale_suffix}"
                 # Annotate with hard-wall warning when applicable. (Windfall
@@ -2305,6 +2335,17 @@ if [ -x "$HOME/.accounts/bin/claude" ] && [ -n "$SESSION_ID" ] &&
     UNSUP_BADGE="${red}UNSUPERVISED${reset}"
 fi
 
+render_pr_row() {
+    [ -z "$PR_NUMBER" ] && return
+    local pr_title="$PR_TITLE"
+    local pr_title_max=$((COLS - 10 - ${#PR_NUMBER}))
+    [ "$pr_title_max" -lt 1 ] && pr_title_max=1
+    if [ "${#pr_title}" -gt "$pr_title_max" ]; then
+        pr_title="${pr_title:0:$((pr_title_max-1))}…"
+    fi
+    printf "\n${white}%-7s${reset} ${cyan}#%s${reset} %s" "pr" "$PR_NUMBER" "$pr_title"
+}
+
 # ── Render: default (multi-line) ──────────────────────────
 render_default() {
     # Labeled identity block — one fact per row, consistent with
@@ -2323,6 +2364,7 @@ render_default() {
         fi
     fi
     printf  "${white}%-7s${reset} %b"   "repo"    "${REPO_LABEL}${SHORT_GIT_INFO}${FOCUS}"
+    render_pr_row
 
     # Detail lines (dimmer for visual hierarchy). CONTEXT_PCT carries the
     # API's sub-percent precision; CONTEXT_INT still drives bar + color.
@@ -2404,6 +2446,7 @@ render_narrow() {
         [ "$COLS" -ge 50 ] 2>/dev/null && [ -n "$SHORT_GIT_INFO" ] && git_seg="$SHORT_GIT_INFO"
         printf "\n${cyan}%s${reset}%b" "$DIR_NAME" "$git_seg"
     fi
+    render_pr_row
 
     # Context — bar shrinks at narrower widths, percent always shown.
     local ctx_pct="${CONTEXT_PCT:-$CONTEXT_INT}"
