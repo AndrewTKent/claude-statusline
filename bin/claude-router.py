@@ -481,7 +481,17 @@ def run_supervised(binary: str, args: list[str]) -> int:
     current_model = model_name(args)
     current_effort = option_value(args, "--effort")
     current_family = "fable" if current_model == "fable" else "general"
-    if mode.get("mode") == "fable" and current_family != "fable":
+    # An explicit non-fable --model is a user choice fable mode must honor.
+    user_pinned_model = (
+        current_model
+        if option_value(args, "--model") and current_family != "fable"
+        else None
+    )
+    if (
+        mode.get("mode") == "fable"
+        and current_family != "fable"
+        and user_pinned_model is None
+    ):
         current_model = "fable"
         current_family = "fable"
         launch_args = replace_model_args(launch_args, current_model)
@@ -548,7 +558,19 @@ def run_supervised(binary: str, args: list[str]) -> int:
                     transcript_path = session_transcript_path(watched_session_id)
                 rendered_model = state.get("model")
                 if rendered_model:
-                    current_model = model_name(args, rendered_model)
+                    mapped_model = model_name(args, rendered_model)
+                    if (
+                        current_model is not None
+                        and mapped_model
+                        and mapped_model != current_model
+                    ):
+                        # A live /model switch: pin the user's non-fable
+                        # choice so fable mode stops reasserting over it.
+                        user_pinned_model = (
+                            mapped_model if mapped_model != "fable" else None
+                        )
+                        model_override = None
+                    current_model = mapped_model
                     current_family = (
                         "fable" if current_model == "fable" else "general"
                     )
@@ -596,9 +618,14 @@ def run_supervised(binary: str, args: list[str]) -> int:
                 else:
                     mode, mode_generation = accounts.load_mode_snapshot()
                     mode_changed = mode_generation != applied_mode_generation
+                    if mode_changed and mode.get("mode") == "fable":
+                        # Re-issuing `accounts fable` means everything back
+                        # on fable, including sessions the user pinned away.
+                        user_pinned_model = None
                     if (
                         mode.get("mode") == "fable"
                         and current_family != "fable"
+                        and user_pinned_model is None
                     ):
                         next_profile = accounts.select_profile(
                             require_fable=True,
@@ -700,7 +727,17 @@ def run_supervised(binary: str, args: list[str]) -> int:
                     transcript_path = session_transcript_path(watched_session_id)
                 rendered_model = state.get("model")
                 if rendered_model:
-                    current_model = model_name(args, rendered_model)
+                    mapped_model = model_name(args, rendered_model)
+                    if (
+                        current_model is not None
+                        and mapped_model
+                        and mapped_model != current_model
+                    ):
+                        user_pinned_model = (
+                            mapped_model if mapped_model != "fable" else None
+                        )
+                        model_override = None
+                    current_model = mapped_model
                     current_family = (
                         "fable" if current_model == "fable" else "general"
                     )
