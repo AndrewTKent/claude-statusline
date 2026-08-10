@@ -309,8 +309,11 @@ the router tools under `~/.local/bin`, and prepends a supervised launcher from
 account, watches the active model's quota windows, and resumes the exact session
 under another isolated profile before a window is exhausted. The shell never
 regains control during a handoff. Changing to Fable mode also moves running
-supervised sessions to Fable in place. If every Fable-capable account is gated,
-the same session resumes on Opus using the safest general-model account.
+supervised sessions to Fable in place — except a session you explicitly put on
+another model (a `--model` launch flag or a live `/model` switch), which stays
+there until you switch back to `/model fable` or re-run `accounts fable`. If
+every Fable-capable account is gated, the same session resumes on Opus using the
+safest general-model account.
 Minted long-lived tokens remain outside `~/.claude`
 (`~/.accounts/vault.json`); archival copies only session JSONLs from
 `~/.claude/projects`.
