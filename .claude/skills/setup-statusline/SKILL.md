@@ -47,24 +47,26 @@ multi-account routing layer on top, run `/setup-account-routing` after this.
 Alternative installs (copy, not symlink): `curl` per the README, Homebrew
 (`homebrew/claude-statusline.rb`), or npm (`npm/`).
 
-## Optional: token-scan daemon
+## Background agents
 
-The token/challenge rows read `~/.claude/token-scan-summary.json`, produced by
-a background scanner. Without it those rows stay empty.
+`install-account-router.sh` installs these; run them directly for a
+statusline-only setup. Idempotent, and `--remove` unloads them.
 
 ```bash
 brew install fswatch
-"$REPO/macos/launchd/install-daemon.sh"
+"$REPO/macos/launchd/install-agents.sh"
 ```
 
-## Optional: account-board poller
+Skipping them does not look broken — the rows just read empty or zero:
 
-The multi-account board (`~/.claude/account-resets.json`) goes stale after 3h
-without polls; launch-time routing then decides on old data.
+| Agent | Feeds | Symptom when absent |
+|---|---|---|
+| `com.claude-scan-tokens-watch` | `token-scan-summary.json` | token/challenge rows empty |
+| `com.claude-accounts-poll` | `account-resets.json` | board goes `~ stale`, routing decides on old data |
+| `com.claude-usage-ledger` | `usage-ledger.json` | `lifetime` stuck at 0 |
 
-```bash
-"$REPO/macos/launchd/install-accounts-poll.sh"
-```
+Verify with `launchctl list | grep claude-` and the per-agent logs in
+`~/.claude/*-std{out,err}.log`.
 
 ## Optional extras
 

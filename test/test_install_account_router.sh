@@ -7,6 +7,9 @@ trap 'rm -rf "$test_root"' EXIT
 
 export HOME="$test_root/home"
 export ZDOTDIR="$HOME"
+# launchctl binds to the login session, so letting the installer load agents
+# here would unload the real ones and point them at this temp HOME.
+export STATUSLINE_SKIP_AGENTS=1
 mkdir -p "$HOME/.local/bin" "$HOME/.local/share/claude/versions"
 cat > "$HOME/.local/share/claude/versions/2.0.0" <<'EOF'
 #!/bin/sh
