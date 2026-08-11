@@ -2293,7 +2293,7 @@ def test_reissued_fable_mode_promotes_a_pinned_session(monkeypatch):
 
     assert len(launches) == 2
     assert claude_router.option_value(launches[1], "--model") == "fable"
-    assert launches[1][-2:] == ["--resume", session_id]
+    assert launches[1][-2:] == ["--session-id", session_id]
 
 
 def test_router_imposed_opus_fallback_still_recovers_to_fable(monkeypatch):
@@ -2372,7 +2372,7 @@ def test_router_imposed_opus_fallback_still_recovers_to_fable(monkeypatch):
     assert len(launches) == 2
     assert claude_router.option_value(launches[0], "--model") == "opus"
     assert claude_router.option_value(launches[1], "--model") == "fable"
-    assert launches[1][-2:] == ["--resume", session_id]
+    assert launches[1][-2:] == ["--session-id", session_id]
 
 
 def test_live_switch_back_to_fable_clears_the_pin(monkeypatch):
@@ -2454,4 +2454,4 @@ def test_live_switch_back_to_fable_clears_the_pin(monkeypatch):
     # handoff fired only after the switch back to fable, and carried fable
     assert len(handoffs) == 1
     assert claude_router.option_value(launches[-1], "--model") == "fable"
-    assert launches[-1][-2:] == ["--resume", session_id]
+    assert launches[-1][-2:] == ["--session-id", session_id]
