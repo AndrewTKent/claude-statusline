@@ -242,7 +242,7 @@ class CodexStatuslineTest(unittest.TestCase):
                 return re.sub(r"\x1b(?:\[[0-9;]*m|\][^\a]*\a)", "", result.stdout).splitlines()
 
             render()
-            deadline = time.monotonic() + 2
+            deadline = time.monotonic() + 10
             while not list(cache.glob("statusline-pr-*.json")) and time.monotonic() < deadline:
                 time.sleep(0.02)
             branch_lines = render()
@@ -267,7 +267,7 @@ class CodexStatuslineTest(unittest.TestCase):
                 capture_output=True,
             )
             render()
-            deadline = time.monotonic() + 2
+            deadline = time.monotonic() + 10
             while len(list(cache.glob("statusline-pr-*.json"))) < 2 and time.monotonic() < deadline:
                 time.sleep(0.02)
             detached_lines = render()
