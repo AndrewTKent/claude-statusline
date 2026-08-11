@@ -328,8 +328,6 @@ Two independent tools, both built on the same session JSONLs.
 
 **Durable ledger & archival** (`bin/usage-ledger.py`, `bin/archive-transcripts.sh`, `bin/vault-snapshot.sh`) keep a permanent per-day/per-model token ledger at `~/.claude/usage-ledger.json` and mirror Claude Code session JSONLs nightly — rows never pruned, survives transcript cleanup.
 
-**Redaction** (`bin/scan-tokens-export.py`, `-autoflag.py`, `-coworker-scrub.py`, `-merge.py`) strips sensitive content from a session JSONL into a separate export copy before you hand it to a third party — source files are never modified. Pipeline, re-run steps, and file layout: [`bin/REDACTION.md`](bin/REDACTION.md).
-
 ---
 
 ## macOS Native
