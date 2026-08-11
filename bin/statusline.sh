@@ -51,6 +51,16 @@ reset='\033[0m'
 sep=" ${dim}│${reset} "
 
 # ── Helpers ─────────────────────────────────────────────
+# file_mtime PATH — epoch mtime, empty when unreadable.
+# GNU stat's -f means --file-system: it exits 0 with unrelated output instead of
+# falling through to the BSD spelling, so probe -c first and reject non-numbers.
+file_mtime() {
+    local mtime
+    mtime=$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null)
+    case "$mtime" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s' "$mtime"
+}
+
 format_tokens() {
     local num=$1
     if [ "$num" -ge 1000000 ] 2>/dev/null; then
@@ -424,7 +434,7 @@ get_subagent_tokens() {
     if [ -f "$cache_file" ]; then
         local cache_age
         local cache_mtime
-        cache_mtime=$(stat -f %m "$cache_file" 2>/dev/null || stat -c %Y "$cache_file" 2>/dev/null)
+        cache_mtime=$(file_mtime "$cache_file")
         cache_age=$(( $(date +%s) - cache_mtime ))
         if [ "$cache_age" -lt 30 ]; then
             SUBAGENT_TOKENS=$(cat "$cache_file" 2>/dev/null)
@@ -681,7 +691,7 @@ ln -sfn "$profile_cache_file" /tmp/claude/statusline-profile-cache.json 2>/dev/n
 ln -sfn "$prev_poll_file" /tmp/claude/statusline-usage-prev.json 2>/dev/null || true
 
 if [ -f "$creds_file" ]; then
-    creds_mtime=$(stat -f %m "$creds_file" 2>/dev/null || stat -c %Y "$creds_file" 2>/dev/null)
+    creds_mtime=$(file_mtime "$creds_file")
     old_creds_mtime=$(cat "$creds_mtime_file" 2>/dev/null)
     if [ "$old_creds_mtime" != "$creds_mtime" ]; then
         rm -f "$cache_file" "$profile_cache_file" "$lock_file"
@@ -795,7 +805,7 @@ if [ -n "$SESSION_ID" ]; then
     # Tokens don't move fast; scanner walks every JSONL so keep frequency low per terminal.
     if [ -f "$SCAN_SCRIPT" ]; then
         scan_mtime=0
-        [ -f "$SCAN_CACHE" ] && scan_mtime=$(stat -f %m "$SCAN_CACHE" 2>/dev/null || stat -c %Y "$SCAN_CACHE" 2>/dev/null || echo 0)
+        [ -f "$SCAN_CACHE" ] && scan_mtime=$(file_mtime "$SCAN_CACHE" || echo 0)
         scan_age=$(( now - scan_mtime ))
         if [ "$scan_age" -gt 180 ]; then
             # Pass config vars through so the scanner can classify w/o re-sourcing.
@@ -973,10 +983,17 @@ FOCUS=""
 GIT_INFO=""
 IS_DIRTY=false
 BRANCH=""
+BRANCH_NAME=""
+HEAD_SHA=""
+GIT_ROOT=""
 IN_WORKTREE=false
 WORKTREE_NAME=""
 if [ -d "$CWD" ] && git -C "$CWD" rev-parse --git-dir > /dev/null 2>&1; then
-    BRANCH=$(git -C "$CWD" branch --show-current 2>/dev/null)
+    GIT_ROOT=$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null)
+    BRANCH_NAME=$(git -C "$CWD" branch --show-current 2>/dev/null)
+    HEAD_SHA=$(git -C "$CWD" rev-parse HEAD 2>/dev/null)
+    BRANCH="$BRANCH_NAME"
+    [ -z "$BRANCH" ] && BRANCH="${HEAD_SHA:0:8}"
     # Detect worktree: git-common-dir differs from git-dir when in a worktree
     GIT_DIR=$(git -C "$CWD" rev-parse --git-dir 2>/dev/null)
     GIT_COMMON=$(git -C "$CWD" rev-parse --git-common-dir 2>/dev/null)
@@ -1008,7 +1025,8 @@ if [ -d "$CWD" ] && git -C "$CWD" rev-parse --git-dir > /dev/null 2>&1; then
             GIT_INFO=" ${green}(${BRANCH})${reset}"
         fi
         # Ahead/behind
-        UPSTREAM=$(git -C "$CWD" rev-parse --abbrev-ref "${BRANCH}@{upstream}" 2>/dev/null)
+        UPSTREAM=""
+        [ -n "$BRANCH_NAME" ] && UPSTREAM=$(git -C "$CWD" rev-parse --abbrev-ref "${BRANCH_NAME}@{upstream}" 2>/dev/null)
         if [ -n "$UPSTREAM" ]; then
             COUNTS=$(git -C "$CWD" rev-list --left-right --count HEAD..."${UPSTREAM}" 2>/dev/null)
             AHEAD=$(echo "$COUNTS" | cut -f1)
@@ -1023,13 +1041,19 @@ fi
 
 # ── PR state indicator (cached 90s) ────────────────────
 PR_BADGE=""
-if [ -n "$BRANCH" ] && [ "$BRANCH" != "main" ] && [ "$BRANCH" != "master" ] && command -v gh >/dev/null 2>&1; then
-    pr_cache_file="/tmp/claude/statusline-pr-${BRANCH//\//_}.json"
+PR_NUMBER=""
+PR_TITLE=""
+PR_URL=""
+if [ -n "$GIT_ROOT" ] && [ -n "$HEAD_SHA" ] && [ "$BRANCH_NAME" != "main" ] && [ "$BRANCH_NAME" != "master" ] && command -v gh >/dev/null 2>&1; then
+    pr_ref="${BRANCH_NAME:-$HEAD_SHA}"
+    pr_cache_key=$(printf '%s\0%s' "$GIT_ROOT" "$pr_ref" | cksum)
+    pr_cache_key="${pr_cache_key%% *}"
+    pr_cache_file="/tmp/claude/statusline-pr-${pr_cache_key}.json"
     pr_cache_max_age=90
     pr_needs_refresh=true
 
     if [ -f "$pr_cache_file" ]; then
-        pr_mtime=$(stat -f %m "$pr_cache_file" 2>/dev/null || stat -c %Y "$pr_cache_file" 2>/dev/null)
+        pr_mtime=$(file_mtime "$pr_cache_file")
         pr_now=$(date +%s)
         pr_age=$(( pr_now - pr_mtime ))
         [ "$pr_age" -lt "$pr_cache_max_age" ] && pr_needs_refresh=false
@@ -1038,24 +1062,38 @@ if [ -n "$BRANCH" ] && [ "$BRANCH" != "main" ] && [ "$BRANCH" != "master" ] && c
     if $pr_needs_refresh; then
         # Fire-and-forget background refresh
         (
-            pr_data=$(gh pr view "$BRANCH" --json state,isDraft,reviewDecision,statusCheckRollup 2>/dev/null)
-            if [ -n "$pr_data" ] && echo "$pr_data" | jq -e '.state' >/dev/null 2>&1; then
-                echo "$pr_data" > "$pr_cache_file"
+            if [ -n "$BRANCH_NAME" ]; then
+                pr_data=$(cd "$GIT_ROOT" && gh pr view "$BRANCH_NAME" --json state,isDraft,reviewDecision,statusCheckRollup,number,title,url 2>/dev/null)
             else
-                echo '{"state":"NONE"}' > "$pr_cache_file"
+                repo_slug=$(cd "$GIT_ROOT" && gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null)
+                pr_number=""
+                if [ -n "$repo_slug" ]; then
+                    pr_number=$(gh api "repos/${repo_slug}/commits/${HEAD_SHA}/pulls" --jq "map(select(.state == \"open\" and .head.sha == \"${HEAD_SHA}\")) | first | .number // empty" 2>/dev/null)
+                fi
+                pr_data=""
+                [ -n "$pr_number" ] && pr_data=$(cd "$GIT_ROOT" && gh pr view "$pr_number" --json state,isDraft,reviewDecision,statusCheckRollup,number,title,url 2>/dev/null)
             fi
+            pr_tmp="${pr_cache_file}.${BASHPID:-$$}.tmp"
+            if [ -n "$pr_data" ] && echo "$pr_data" | jq -e '.state' >/dev/null 2>&1; then
+                printf '%s\n' "$pr_data" > "$pr_tmp"
+            else
+                printf '%s\n' '{"state":"NONE"}' > "$pr_tmp"
+            fi
+            mv -f "$pr_tmp" "$pr_cache_file"
         ) &
     fi
 
     # Always read from cache
     if [ -f "$pr_cache_file" ]; then
-        pr_info=$(jq -r '[.state // "NONE", .isDraft // false | tostring, .reviewDecision // "NONE", ([.statusCheckRollup[]? | .status] | if any(. == "FAILURE") then "FAIL" elif any(. == "PENDING") then "PENDING" else "PASS" end)] | join("|")' "$pr_cache_file" 2>/dev/null)
-        pr_state="${pr_info%%|*}"
-        pr_rest="${pr_info#*|}"
-        pr_draft="${pr_rest%%|*}"
-        pr_rest2="${pr_rest#*|}"
-        pr_review="${pr_rest2%%|*}"
-        pr_checks="${pr_rest2#*|}"
+        eval "$(jq -r '
+            "pr_state=" + ((.state // "NONE") | @sh),
+            "pr_draft=" + ((.isDraft // false | tostring) | @sh),
+            "pr_review=" + ((.reviewDecision // "NONE") | @sh),
+            "pr_checks=" + (([.statusCheckRollup[]? | .status] | if any(. == "FAILURE") then "FAIL" elif any(. == "PENDING") then "PENDING" else "PASS" end) | @sh),
+            "PR_NUMBER=" + ((.number // "" | tostring) | @sh),
+            "PR_TITLE=" + ((.title // "" | gsub("[\u0000-\u001f\u007f]"; " ")) | @sh),
+            "PR_URL=" + ((.url // "") | @sh)
+        ' "$pr_cache_file" 2>/dev/null)"
 
         if [ "$pr_state" = "OPEN" ]; then
             if [ "$pr_draft" = "true" ]; then
@@ -1083,7 +1121,7 @@ DIR_NAME="${DIR_NAME##*\\}"
 # ── Fetch rate limits + profile (background, never blocking) ──
 
 if [ -f "$cache_file" ]; then
-    cache_mtime=$(stat -f %m "$cache_file" 2>/dev/null || stat -c %Y "$cache_file" 2>/dev/null)
+    cache_mtime=$(file_mtime "$cache_file")
     cache_age=$(( now - cache_mtime ))
     [ "$cache_age" -ge "$cache_max_age" ] && needs_refresh=true
 else
@@ -1091,7 +1129,7 @@ else
 fi
 
 if [ -f "$profile_cache_file" ]; then
-    p_mtime=$(stat -f %m "$profile_cache_file" 2>/dev/null || stat -c %Y "$profile_cache_file" 2>/dev/null)
+    p_mtime=$(file_mtime "$profile_cache_file")
     p_age=$(( now - p_mtime ))
     [ "$p_age" -ge "$profile_cache_max_age" ] && needs_profile_refresh=true
 else
@@ -1103,7 +1141,7 @@ if $needs_refresh || $needs_profile_refresh; then
     # Clean up stale lock files (PID dead or lock older than 30s)
     if [ -f "$lock_file" ]; then
         lock_pid=$(cat "$lock_file" 2>/dev/null)
-        lock_age=$(( now - $(stat -f %m "$lock_file" 2>/dev/null || stat -c %Y "$lock_file" 2>/dev/null || echo "$now") ))
+        lock_age=$(( now - $(file_mtime "$lock_file" || echo "$now") ))
         if [ "$lock_age" -gt 30 ] || ! kill -0 "$lock_pid" 2>/dev/null; then
             rm -f "$lock_file"
         fi
@@ -1139,12 +1177,12 @@ if $needs_refresh || $needs_profile_refresh; then
                     if [ -n "$response" ] && echo "$response" | jq -e '.five_hour' >/dev/null 2>&1; then
                         # Save previous poll for interpolation
                         if [ -f "$cache_file" ]; then
-                            prev_ts=$(stat -f %m "$cache_file" 2>/dev/null || stat -c %Y "$cache_file" 2>/dev/null)
+                            prev_ts=$(file_mtime "$cache_file")
                             # One jq to pull all three values — saves 2 subprocess spawns per render.
                             eval "$(jq -r '"prev_5h=" + (.five_hour.utilization // 0 | tostring),
                                            "prev_7d=" + (.seven_day.utilization // 0 | tostring),
                                            "prev_extra=" + (.extra_usage.used_credits // 0 | tostring)' "$cache_file" 2>/dev/null)"
-                            printf '{"ts":%s,"five_hour":%s,"seven_day":%s,"extra_used":%s}' "$prev_ts" "${prev_5h:-0}" "${prev_7d:-0}" "${prev_extra:-0}" > "/tmp/claude/statusline-usage-prev-${ACCOUNT_CACHE_KEY}.json"
+                            printf '{"ts":%s,"five_hour":%s,"seven_day":%s,"extra_used":%s}' "${prev_ts:-0}" "${prev_5h:-0}" "${prev_7d:-0}" "${prev_extra:-0}" > "/tmp/claude/statusline-usage-prev-${ACCOUNT_CACHE_KEY}.json"
                         fi
                         usage_cache_tmp=$(mktemp "${cache_file}.tmp.XXXXXX")
                         if [ -n "$usage_cache_tmp" ]; then
@@ -1441,7 +1479,7 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
 
     # Interpolate between polls for fractional precision
     if [ "$_usage_data_source" = "cache" ] && [ -f "$prev_poll_file" ] && [ -f "$cache_file" ]; then
-        poll_ts=$(stat -f %m "$cache_file" 2>/dev/null || stat -c %Y "$cache_file" 2>/dev/null)
+        poll_ts=$(file_mtime "$cache_file")
         # One jq pull — saves 2 spawns per render.
         eval "$(jq -r '"prev_ts=" + (.ts // 0 | tostring),
                        "prev_5h=" + (.five_hour // 0 | tostring),
@@ -1727,7 +1765,7 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
             _best_fable=""
             _best_label=""
             printf -v _rate_cap_rank '%020.12f' 80
-            printf -v _fable_cap_rank '%020.12f' 95
+            printf -v _fable_cap_rank '%020.12f' 100
             while IFS='|' read -r em uuid tag ep pct pct_state seven_day_iso weekly_pct_ledger fbl_iso fable_pct_ledger last_seen_ts; do
                 [ -z "$em" ] && continue
                 # Match the active account on (email, org_uuid). Legacy ledger
@@ -2025,15 +2063,16 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     fi
                 else
                     candidate_eligible=1
-                    if [ "$five_known" = "0" ] || [ "$weekly_known" = "0" ] ||
-                       ! _account_rank_precedes "$five_rank" "$_rate_cap_rank" ||
-                       ! _account_rank_precedes "$weekly_rank" "$_rate_cap_rank" ||
-                       [ -n "$exp_suffix" ]; then
+                    if [ -n "$exp_suffix" ]; then
                         candidate_eligible=0
-                    fi
-                    if [ "$_route_mode" = "fable" ] &&
-                       { [ "$fable_known" = "0" ] ||
-                         ! _account_rank_precedes "$fable_rank" "$_fable_cap_rank"; }; then
+                    elif [ "$_route_mode" = "fable" ]; then
+                        if [ "$fable_known" = "0" ] ||
+                           ! _account_rank_precedes "$fable_rank" "$_fable_cap_rank"; then
+                            candidate_eligible=0
+                        fi
+                    elif [ "$five_known" = "0" ] || [ "$weekly_known" = "0" ] ||
+                         ! _account_rank_precedes "$five_rank" "$_rate_cap_rank" ||
+                         ! _account_rank_precedes "$weekly_rank" "$_rate_cap_rank"; then
                         candidate_eligible=0
                     fi
                 fi
@@ -2116,9 +2155,10 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     pct_raw="—"
                     pct_color="$dim"
                 fi
-                # Weekly-capped accounts are unusable regardless of 5h state — dim the name.
                 name_color="$white"
-                [ "$weekly_int" -ge 100 ] 2>/dev/null && name_color="$dim"
+                if [ "$_route_mode" != "fable" ] && [ "$weekly_int" -ge 100 ] 2>/dev/null; then
+                    name_color="$dim"
+                fi
                 [ "${#display_name}" -gt "$_name_w" ] && _name_w=${#display_name}
                 row_rest=" ${pct_color}$(_ralign "$pct_raw" 4)${reset}  ${dim}$(_ralign "$five_reset_rel" 6)${reset}   ${weekly_seg}   ${fable_seg}  ${dim}$(_ralign "$wk_reset_rel" 6)${reset}${exp_suffix}${stale_suffix}"
                 # Annotate with hard-wall warning when applicable. (Windfall
@@ -2305,6 +2345,17 @@ if [ -x "$HOME/.accounts/bin/claude" ] && [ -n "$SESSION_ID" ] &&
     UNSUP_BADGE="${red}UNSUPERVISED${reset}"
 fi
 
+render_pr_row() {
+    [ -z "$PR_NUMBER" ] && return
+    local pr_title="$PR_TITLE"
+    local pr_title_max=$((COLS - 10 - ${#PR_NUMBER}))
+    [ "$pr_title_max" -lt 1 ] && pr_title_max=1
+    if [ "${#pr_title}" -gt "$pr_title_max" ]; then
+        pr_title="${pr_title:0:$((pr_title_max-1))}…"
+    fi
+    printf "\n${white}%-7s${reset} ${cyan}#%s${reset} %s" "pr" "$PR_NUMBER" "$pr_title"
+}
+
 # ── Render: default (multi-line) ──────────────────────────
 render_default() {
     # Labeled identity block — one fact per row, consistent with
@@ -2323,6 +2374,7 @@ render_default() {
         fi
     fi
     printf  "${white}%-7s${reset} %b"   "repo"    "${REPO_LABEL}${SHORT_GIT_INFO}${FOCUS}"
+    render_pr_row
 
     # Detail lines (dimmer for visual hierarchy). CONTEXT_PCT carries the
     # API's sub-percent precision; CONTEXT_INT still drives bar + color.
@@ -2404,6 +2456,7 @@ render_narrow() {
         [ "$COLS" -ge 50 ] 2>/dev/null && [ -n "$SHORT_GIT_INFO" ] && git_seg="$SHORT_GIT_INFO"
         printf "\n${cyan}%s${reset}%b" "$DIR_NAME" "$git_seg"
     fi
+    render_pr_row
 
     # Context — bar shrinks at narrower widths, percent always shown.
     local ctx_pct="${CONTEXT_PCT:-$CONTEXT_INT}"
@@ -2545,7 +2598,7 @@ render_rprompt() {
     #   _claude_rprompt() {
     #     local f=~/.claude/rprompt.txt
     #     [[ -f "$f" ]] || return
-    #     local age=$(( $(date +%s) - $(stat -f %m "$f") ))
+    #     local age=$(( $(date +%s) - $(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f") ))
     #     (( age > 300 )) && { RPROMPT=""; return }
     #     RPROMPT="$(cat "$f")"
     #   }

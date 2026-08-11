@@ -3038,7 +3038,7 @@ exec /bin/cat "$@"
         assert "old@example.com" not in rendered
         assert "acct" not in session
 
-    def test_quarantined_and_weekly_walled_accounts_do_not_win_best_next_marker(
+    def test_best_next_marker_matches_route_mode_and_quarantine(
         self,
         tmp_path,
     ):
@@ -3242,9 +3242,9 @@ exec /bin/cat "$@"
                     "fresh@example.com|fresh-org": {
                         "email": "fresh@example.com",
                         "org_uuid": "fresh-org",
-                        "five_hour_pct": 5,
-                        "seven_day_pct": 5,
-                        "fable_pct": 94.6,
+                        "five_hour_pct": 100,
+                        "seven_day_pct": 100,
+                        "fable_pct": 99,
                         "last_seen": time.time(),
                     },
                 }
@@ -3253,6 +3253,11 @@ exec /bin/cat "$@"
         rendered = render()
         marked = [line for line in rendered.splitlines() if "✓ best next" in line]
         assert marked and all("Fresh" in line for line in marked), rendered
+
+        resets["fresh@example.com|fresh-org"]["fable_pct"] = 100
+        (claude_dir / "account-resets.json").write_text(json.dumps(resets))
+        rendered = render()
+        assert "✓ best next" not in rendered, rendered
 
         (claude_dir / "account-resets.json").write_text(
             json.dumps(

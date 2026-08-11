@@ -44,8 +44,8 @@ FOOTER_HEIGHT="${CODEX_STATUSLINE_HEIGHT:-12}"
 REFRESH_INTERVAL="${CODEX_STATUSLINE_INTERVAL:-3}"
 MANAGE_APPROVALS="${CODEX_STATUSLINE_MANAGE_APPROVALS:-1}"
 HISTORY_LIMIT="${CODEX_STATUSLINE_HISTORY_LIMIT:-100000}"
-if [[ ! "$FOOTER_HEIGHT" =~ ^[1-9][0-9]*$ ]] || (( FOOTER_HEIGHT < 11 )); then
-    printf 'CODEX_STATUSLINE_HEIGHT must be an integer of at least 11\n' >&2
+if [[ ! "$FOOTER_HEIGHT" =~ ^[1-9][0-9]*$ ]] || (( FOOTER_HEIGHT < 12 )); then
+    printf 'CODEX_STATUSLINE_HEIGHT must be an integer of at least 12\n' >&2
     exit 1
 fi
 if [[ ! "$REFRESH_INTERVAL" =~ ^[0-9]+([.][0-9]+)?$ || "$REFRESH_INTERVAL" =~ ^0([.]0+)?$ ]]; then

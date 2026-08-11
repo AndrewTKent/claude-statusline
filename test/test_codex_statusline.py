@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -42,6 +43,239 @@ class CodexStatuslineTest(unittest.TestCase):
         self.assertTrue(codex_statusline.paths_related("/tmp/project", "/tmp/project/src"))
         self.assertTrue(codex_statusline.paths_related("/tmp/project/src", "/tmp/project"))
         self.assertFalse(codex_statusline.paths_related("/tmp/project-a", "/tmp/project-b"))
+
+    def test_query_pull_request_resolves_branch(self) -> None:
+        payload = json.dumps(
+            {
+                "number": 314,
+                "state": "OPEN",
+                "title": "Show Pull Request Linkage",
+                "url": "https://github.com/acme/widget-app/pull/314",
+            }
+        )
+        with mock.patch.object(
+            codex_statusline.subprocess,
+            "check_output",
+            return_value=payload,
+        ) as check_output:
+            pull_request = codex_statusline.query_pull_request(
+                "/work/logistics-app",
+                "andrew/pr-linkage",
+                "a1379d1",
+            )
+
+        self.assertEqual(pull_request["number"], 314)
+        self.assertEqual(pull_request["title"], "Show Pull Request Linkage")
+        command = check_output.call_args.args[0]
+        self.assertEqual(command[:3], ["gh", "pr", "view"])
+        self.assertEqual(command[3], "andrew/pr-linkage")
+
+    def test_query_pull_request_resolves_detached_head(self) -> None:
+        payload = json.dumps(
+            {
+                "number": 314,
+                "state": "OPEN",
+                "title": "Show Pull Request Linkage",
+                "url": "https://github.com/acme/widget-app/pull/314",
+            }
+        )
+        with mock.patch.object(
+            codex_statusline.subprocess,
+            "check_output",
+            side_effect=["acme/widget-app\n", "314\n", payload],
+        ) as check_output:
+            pull_request = codex_statusline.query_pull_request(
+                "/work/logistics-app",
+                "",
+                "a1379d1309d15399bb8ca20dbc2fb8a1ce6a8065",
+            )
+
+        self.assertEqual(pull_request["number"], 314)
+        commands = [call.args[0] for call in check_output.call_args_list]
+        self.assertEqual(commands[0][:3], ["gh", "repo", "view"])
+        self.assertEqual(commands[1][:2], ["gh", "api"])
+        self.assertEqual(commands[2][:3], ["gh", "pr", "view"])
+
+    def test_pr_refresh_lock_can_be_reused_after_owner_releases_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "statusline-pr.json"
+            lock_file = Path(f"{cache_file}.lock")
+            descriptor = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o600)
+            codex_statusline.fcntl.flock(
+                descriptor,
+                codex_statusline.fcntl.LOCK_EX | codex_statusline.fcntl.LOCK_NB,
+            )
+            try:
+                with mock.patch.object(codex_statusline.subprocess, "Popen") as popen:
+                    codex_statusline.start_pr_cache_refresh(
+                        cache_file,
+                        "/work/logistics-app",
+                        "andrew/pr-linkage",
+                        "a1379d1",
+                    )
+                popen.assert_not_called()
+            finally:
+                os.close(descriptor)
+
+            child = mock.Mock()
+            child.poll.return_value = None
+            with mock.patch.object(codex_statusline.subprocess, "Popen", return_value=child) as popen:
+                codex_statusline.start_pr_cache_refresh(
+                    cache_file,
+                    "/work/logistics-app",
+                    "andrew/pr-linkage",
+                    "a1379d1",
+                )
+
+            popen.assert_called_once()
+            self.assertEqual(len(popen.call_args.kwargs["pass_fds"]), 1)
+            codex_statusline.PR_REFRESH_PROCESSES.clear()
+
+    def test_reap_pr_cache_refreshes_drops_completed_children(self) -> None:
+        completed = mock.Mock()
+        completed.poll.return_value = 0
+        running = mock.Mock()
+        running.poll.return_value = None
+        codex_statusline.PR_REFRESH_PROCESSES[:] = [completed, running]
+
+        codex_statusline.reap_pr_cache_refreshes()
+
+        self.assertEqual(codex_statusline.PR_REFRESH_PROCESSES, [running])
+        completed.poll.assert_called_once_with()
+        running.poll.assert_called_once_with()
+        codex_statusline.PR_REFRESH_PROCESSES.clear()
+
+    def test_claude_statusline_renders_pr_below_repo_for_branch_and_detached_head(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pr_number = 314
+            tmp = Path(tmpdir)
+            home = tmp / "home"
+            cache = tmp / "cache"
+            project = tmp / "logistics-app"
+            fake_bin = tmp / "bin"
+            for path in (home / ".claude", cache, project, fake_bin):
+                path.mkdir(parents=True, exist_ok=True)
+            (home / ".claude/statusline.conf").write_text("MAX_COLS=100\n")
+
+            subprocess.run(
+                ["git", "init", "-b", "main"],
+                cwd=project,
+                check=True,
+                capture_output=True,
+            )
+            (project / "README.md").write_text("fixture\n")
+            subprocess.run(["git", "add", "README.md"], cwd=project, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Statusline Test",
+                    "-c",
+                    "user.email=statusline@example.com",
+                    "commit",
+                    "-m",
+                    "fixture",
+                ],
+                cwd=project,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "checkout", "-b", "andrew/pr-linkage"],
+                cwd=project,
+                check=True,
+                capture_output=True,
+            )
+
+            fake_gh = fake_bin / "gh"
+            fake_gh.write_text(
+                "#!/usr/bin/env bash\n"
+                "if [[ \"$1\" == pr && \"$2\" == view ]]; then\n"
+                "  printf '%s\\n' \"$FAKE_PR_JSON\"\n"
+                "elif [[ \"$1\" == repo && \"$2\" == view ]]; then\n"
+                "  printf '%s\\n' 'acme/widget-app'\n"
+                "elif [[ \"$1\" == api ]]; then\n"
+                f"  printf '%s\\n' '{pr_number}'\n"
+                "fi\n"
+            )
+            fake_gh.chmod(0o755)
+
+            script = tmp / "statusline.sh"
+            script.write_text(
+                (MODULE_PATH.with_name("statusline.sh"))
+                .read_text()
+                .replace("/tmp/claude", str(cache))
+            )
+            fixture = json.loads(
+                (MODULE_PATH.parents[1] / "test/fixtures/input.json").read_text()
+            )
+            fixture["workspace"]["current_dir"] = str(project)
+            env = {
+                **os.environ,
+                "FAKE_PR_JSON": json.dumps(
+                    {
+                        "number": pr_number,
+                        "state": "OPEN",
+                        "isDraft": False,
+                        "reviewDecision": "REVIEW_REQUIRED",
+                        "statusCheckRollup": [],
+                        "title": "Show Pull Request Linkage",
+                        "url": "https://github.com/acme/widget-app/pull/314",
+                    }
+                ),
+                "HOME": str(home),
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "STATUSLINE_FORMAT": "default",
+                "TZ": "America/Los_Angeles",
+            }
+
+            def render() -> list[str]:
+                result = subprocess.run(
+                    ["bash", str(script)],
+                    cwd=project,
+                    env=env,
+                    input=json.dumps(fixture),
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                )
+                return re.sub(r"\x1b(?:\[[0-9;]*m|\][^\a]*\a)", "", result.stdout).splitlines()
+
+            render()
+            deadline = time.monotonic() + 10
+            while not list(cache.glob("statusline-pr-*.json")) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            branch_lines = render()
+            branch_repo_index = next(i for i, line in enumerate(branch_lines) if line.startswith("repo"))
+            self.assertTrue(branch_lines[branch_repo_index + 1].startswith("pr"))
+            self.assertIn(f"#{pr_number}", branch_lines[branch_repo_index + 1])
+            self.assertIn("Pull Request Linkage", branch_lines[branch_repo_index + 1])
+
+            (home / ".claude/statusline.conf").write_text("MAX_COLS=50\n")
+            narrow_lines = render()
+            narrow_repo_index = next(
+                i for i, line in enumerate(narrow_lines) if line.startswith(project.name)
+            )
+            self.assertTrue(narrow_lines[narrow_repo_index + 1].startswith("pr"))
+            self.assertIn(f"#{pr_number}", narrow_lines[narrow_repo_index + 1])
+            (home / ".claude/statusline.conf").write_text("MAX_COLS=100\n")
+
+            subprocess.run(
+                ["git", "checkout", "--detach"],
+                cwd=project,
+                check=True,
+                capture_output=True,
+            )
+            render()
+            deadline = time.monotonic() + 10
+            while len(list(cache.glob("statusline-pr-*.json"))) < 2 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            detached_lines = render()
+            detached_repo_index = next(
+                i for i, line in enumerate(detached_lines) if line.startswith("repo")
+            )
+            self.assertTrue(detached_lines[detached_repo_index + 1].startswith("pr"))
+            self.assertIn(f"#{pr_number}", detached_lines[detached_repo_index + 1])
 
     def test_parse_shell_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2591,6 +2825,7 @@ class CodexStatuslineTest(unittest.TestCase):
         )
 
     def test_render_footer_shows_live_limits_and_workers_within_width(self) -> None:
+        pr_number = 314
         data = {
             "model_display": "GPT-5.6",
             "reasoning_effort": "max",
@@ -2598,6 +2833,11 @@ class CodexStatuslineTest(unittest.TestCase):
             "account": "andrew@example.com",
             "repo": "statusline",
             "branch": "feat/codex-top",
+            "pull_request": {
+                "number": pr_number,
+                "title": "Show Pull Request Linkage",
+                "url": "https://github.com/acme/widget-app/pull/314",
+            },
             "context_window": 1000,
             "tokens": {"today": 4000, "lifetime": 9000},
             "usage": {
@@ -2621,7 +2861,53 @@ class CodexStatuslineTest(unittest.TestCase):
         self.assertIn("weekly", rendered)
         self.assertIn("agents  1/3 running", rendered)
         self.assertIn("shells 3", rendered)
+        lines = rendered.splitlines()
+        repo_index = next(i for i, line in enumerate(lines) if line.startswith("  repo"))
+        self.assertTrue(lines[repo_index + 1].startswith("  pr"))
+        self.assertIn(f"#{pr_number} Show Pull Request Linkage", lines[repo_index + 1])
         self.assertTrue(all(len(line) <= 80 for line in rendered.splitlines()))
+
+        palette = codex_statusline.Palette(True)
+        colored = codex_statusline.render_footer(data, 80, palette)
+        self.assertIn(
+            f"  {palette.white}{'model':<7}{palette.reset} "
+            f"{palette.blue}GPT-5.6{palette.reset}{palette.red}.max{palette.reset}",
+            colored,
+        )
+        self.assertIn(
+            f"  {palette.white}{'account':<7}{palette.reset} "
+            f"{palette.orange}andrew@example.com{palette.reset}",
+            colored,
+        )
+        self.assertIn(
+            f"{palette.cyan}statusline{palette.reset} "
+            f"{palette.green}(feat/codex-top){palette.reset}",
+            colored,
+        )
+        self.assertIn(
+            f"{palette.cyan}#{pr_number}{palette.reset} "
+            f"{palette.white}Show Pull Request Linkage{palette.reset}",
+            colored,
+        )
+
+        unlinked = {**data, "pull_request": None}
+        unlinked_lines = codex_statusline.render_footer(
+            unlinked, 80, codex_statusline.Palette(False)
+        ).splitlines()
+        self.assertFalse(any(line.startswith("  pr") for line in unlinked_lines))
+        for label in (
+            "model",
+            "time",
+            "account",
+            "repo",
+            "context",
+            "5-hour",
+            "weekly",
+            "usage",
+            "agents",
+            "mode",
+        ):
+            self.assertTrue(any(line.startswith(f"  {label}") for line in unlinked_lines))
 
         wide_lines = codex_statusline.render_footer(data, 140, codex_statusline.Palette(False)).splitlines()
         self.assertTrue(wide_lines[0].startswith("  model"))
@@ -2629,6 +2915,8 @@ class CodexStatuslineTest(unittest.TestCase):
 
         narrow_lines = codex_statusline.render_footer(data, 40, codex_statusline.Palette(False)).splitlines()
         self.assertTrue(all(len(line) <= 40 for line in narrow_lines))
+        narrow_repo = next(line for line in narrow_lines if line.startswith("  repo"))
+        self.assertEqual(narrow_repo.count("("), narrow_repo.count(")"))
         tiny_lines = codex_statusline.render_footer(data, 8, codex_statusline.Palette(False)).splitlines()
         self.assertTrue(all(len(line) <= 8 for line in tiny_lines))
 
@@ -3041,8 +3329,8 @@ class CodexStatuslineTest(unittest.TestCase):
             )
             cases = (
                 ({"CODEX_STATUSLINE_INTERVAL": "0"}, "positive number"),
-                ({"CODEX_STATUSLINE_HEIGHT": "10"}, "at least 11"),
-                ({"CODEX_STATUSLINE_HEIGHT": "08"}, "at least 11"),
+                ({"CODEX_STATUSLINE_HEIGHT": "11"}, "at least 12"),
+                ({"CODEX_STATUSLINE_HEIGHT": "08"}, "at least 12"),
                 ({"CODEX_STATUSLINE_HISTORY_LIMIT": "0"}, "positive integer"),
             )
 
