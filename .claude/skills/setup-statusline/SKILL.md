@@ -38,7 +38,7 @@ multi-account routing layer on top, run `/setup-account-routing` after this.
    Knobs worth setting on day one (the example documents the rest):
    - `ACCOUNT_LABELS` — `label:email` pairs; disambiguate same-email orgs with
      `label:email|org-uuid`. Make each label match what you see in the email
-     (`brown:*@alumni.brown.edu`, not an internal codename).
+     (`alumni:*@alumni.example.edu`, not an internal codename).
    - `WORK_PATHS` / `PERSONAL_PATHS` — repo path prefixes for work/personal
      token attribution.
    - `EMAIL_PAYER_MAP` — who pays for which account, for the cost rows.

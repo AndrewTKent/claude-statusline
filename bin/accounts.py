@@ -6,7 +6,7 @@ Credentials and entitlement caches stay isolated while projects, skills, setting
 and transcript state are shared. A supervisor routes each exact session by
 reset-aware headroom and resumes it under another profile before quota exhaustion.
 
-The setup-token vault remains separate for headless hound jobs.
+The setup-token vault remains separate for headless remote jobs.
 
 Router commands:
   set LABEL       force every supervised session onto LABEL
@@ -15,7 +15,7 @@ Router commands:
   status / ls     mode + per-account 5h/7d/fable headroom, ⚠login flags
   poll / refresh  refresh the usage board / re-auth stale accounts (no browser)
   mint / tokens   mint a long-lived token for an account / list minted tokens
-  sync            converge the minted-token vault with hound
+  sync            converge the minted-token vault with the sync host
   pick-env        emit env exports for the best routable account
 """
 
@@ -659,7 +659,7 @@ def cmd_refresh(args) -> None:
 # ── token vault + native profile router ───────────────────────────────────
 # Long-lived per-account tokens minted by `claude setup-token`, stored in a
 # 0600 file OUTSIDE ~/.claude (the nightly archival chain mirrors ~/.claude
-# session data to hound in plaintext — long-lived tokens must never land in an
+# session data to a remote host in plaintext — long-lived tokens must never land in an
 # archived path). These tokens are for headless jobs, not interactive routing.
 
 TOKEN_VAULT_PATH = HOME / ".accounts" / "vault.json"
@@ -1612,12 +1612,18 @@ def remove_session_lease(pid: int) -> None:
         save_session_leases(leases)
 
 
-HOUND_HOSTS = ("hound", "hound-ts")
-HOUND_VAULT = "~/.accounts/vault.json"
+SYNC_VAULT = "~/.accounts/vault.json"
 
 
-def hound_host(timeout: int = 3) -> str | None:
-    for host in HOUND_HOSTS:
+def sync_hosts() -> tuple[str, ...]:
+    """SSH targets to converge the vault with, first reachable one wins.
+    Unset means vault sync is off."""
+    raw = os.environ.get("ACCOUNTS_SYNC_HOSTS") or _conf_var("ACCOUNTS_SYNC_HOSTS")
+    return tuple(raw.split())
+
+
+def sync_host(timeout: int = 3) -> str | None:
+    for host in sync_hosts():
         r = subprocess.run(
             ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={timeout}", host, "true"],
             capture_output=True,
@@ -1638,18 +1644,22 @@ def merge_token_vaults(a: dict, b: dict) -> dict:
     return out
 
 
-def sync_with_hound(quiet: bool = False) -> bool:
-    """Converge the token vault with hound: pull, merge (newest mint per label
-    wins), write local, push the merged set back — both machines end up with
-    the full vault. Best-effort: hound unreachable leaves local untouched.
+def sync_with_remote(quiet: bool = False) -> bool:
+    """Converge the token vault with the sync host: pull, merge (newest mint per
+    label wins), write local, push the merged set back — both machines end up
+    with the full vault. Best-effort: unreachable leaves local untouched.
     Tokens transit ssh stdio only, never argv."""
-    host = hound_host()
+    if not sync_hosts():
+        if not quiet:
+            print("no ACCOUNTS_SYNC_HOSTS configured — vault stays local-only")
+        return False
+    host = sync_host()
     if host is None:
         if not quiet:
-            print("hound unreachable — vault stays local-only (run `accounts sync` later)")
+            print("sync host unreachable — vault stays local-only (run `accounts sync` later)")
         return False
     r = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", host, f"cat {HOUND_VAULT} 2>/dev/null || true"],
+        ["ssh", "-o", "BatchMode=yes", host, f"cat {SYNC_VAULT} 2>/dev/null || true"],
         capture_output=True,
         text=True,
     )
@@ -1665,7 +1675,7 @@ def sync_with_hound(quiet: bool = False) -> bool:
             "-o",
             "BatchMode=yes",
             host,
-            f"mkdir -p ~/.accounts && chmod 700 ~/.accounts && cat > {HOUND_VAULT} && chmod 600 {HOUND_VAULT}",
+            f"mkdir -p ~/.accounts && chmod 700 ~/.accounts && cat > {SYNC_VAULT} && chmod 600 {SYNC_VAULT}",
         ],
         input=json.dumps(merged, indent=2, sort_keys=True) + "\n",
         capture_output=True,
@@ -1681,8 +1691,8 @@ def sync_with_hound(quiet: bool = False) -> bool:
 
 
 def cmd_sync(_args) -> None:
-    """Converge ~/.accounts/vault.json between this machine and hound."""
-    sync_with_hound()
+    """Converge ~/.accounts/vault.json between this machine and the sync host."""
+    sync_with_remote()
 
 
 def cmd_mint(args) -> None:
@@ -1704,7 +1714,7 @@ def cmd_mint(args) -> None:
     }
     save_token_vault(vault)
     print(f"vaulted token for {label} (expires in ~1 year); it was not displayed")
-    sync_with_hound(quiet=False)
+    sync_with_remote(quiet=False)
 
 
 def cmd_tokens(_args) -> None:
@@ -2175,7 +2185,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     p_refresh.set_defaults(fn=cmd_refresh)
 
-    sub.add_parser("sync", help="converge the token vault with hound").set_defaults(fn=cmd_sync)
+    sub.add_parser("sync", help="converge the token vault with the sync host").set_defaults(fn=cmd_sync)
 
     p_pick_env = sub.add_parser(
         "pick-env", help="emit env exports for the best routable account"

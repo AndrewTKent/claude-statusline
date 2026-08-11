@@ -74,7 +74,15 @@
 # ─── Live state stack row (opt-in) ─────────────────────────────────────────
 # Adds a "stack" row driven by bin/live-state.py — a snapshot probe across
 # Claude (account-resets.json), Codex (the newest ~/.codex/state_N.sqlite),
-# and hound autobuild agents (sessions.jsonl). Distinct from the historical
+# and remote autobuild agents ($AGENT_SESSIONS_PATH). Distinct from the historical
 # scan-tokens engine; see bin/ARCHITECTURE.md for the two-layer model.
 # Set to 1 to enable.
 # SHOW_BACKENDS_ROW=1
+#
+# Optional: point at a remote agent runner's session log (JSONL, one event per
+# line with an "agent" key) to add an "agents:" segment to the stack row.
+# AGENT_SESSIONS_PATH="$HOME/.my-agent-runner/sessions.jsonl"
+#
+# Optional: SSH targets for `accounts sync` to converge the minted-token vault
+# with (space-separated, first reachable wins). Unset means sync is off.
+# ACCOUNTS_SYNC_HOSTS="my-host my-host-tailscale"

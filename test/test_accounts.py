@@ -25,7 +25,7 @@ PAIRS = [
     ("coram-max", "andrew.kent@coram.ai", "e1c8"),
     ("coram-work", "andrew.kent@coram.ai", "52ae"),
     ("work", "*@coram.ai", None),
-    ("gmail", "andrewkent10@gmail.com", None),
+    ("gmail", "someone@gmail.com", None),
 ]
 
 
@@ -2763,7 +2763,7 @@ exec /bin/cat "$@"
             'SHOW_ACCOUNT_RESETS=1\n'
             'MAX_COLS=200\n'
             'ACCOUNT_LABELS="coram-max:andrew.kent@coram.ai|coram-org '
-            'brown:*@alumni.brown.edu"\n'
+            'alumni:*@alumni.example.edu"\n'
             'ACCOUNTS_EXCLUDE="brown"\n'
         )
         resets = {
@@ -2775,8 +2775,8 @@ exec /bin/cat "$@"
                 "fable_pct": 24,
                 "last_seen": time.time(),
             },
-            "andrew@alumni.brown.edu|brown-org": {
-                "email": "andrew@alumni.brown.edu",
+            "jane@alumni.example.edu|alumni-org": {
+                "email": "jane@alumni.example.edu",
                 "org_uuid": "brown-org",
                 "five_hour_pct": 0,
                 "seven_day_pct": 0,
