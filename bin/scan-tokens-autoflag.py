@@ -38,9 +38,9 @@ PATTERNS = {
         (r"aws_secret_access_key\s*=\s*['\"]?[A-Za-z0-9/+=]{30,}", "aws secret"),
         # JWTs
         (r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b", "jwt"),
-        # Emails (exclude coram.ai, anthropic.com, common open-source addresses, and tool IDs)
+        # Emails (exclude anthropic.com, common open-source addresses, and tool IDs)
         # Require surrounding whitespace/punctuation — not inside random strings
-        (r"(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9._%+-]{1,}@(?!coram\.ai\b)(?!anthropic\.com\b)(?!example\.com\b)[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![A-Za-z0-9_])", "email address"),
+        (r"(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9._%+-]{1,}@(?!anthropic\.com\b)(?!example\.com\b)[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![A-Za-z0-9_])", "email address"),
         # Phone numbers — require explicit formatting (parens or dashes) to exclude random digit runs
         (r"(?<![0-9])(?:\+1[-.\s]?)?\(?[2-9][0-9]{2}\)[-.\s]?[0-9]{3}[-.\s]?[0-9]{4}(?![0-9])", "phone number (parens)"),
         (r"(?<![0-9])(?:\+1[-.\s]?)?[2-9][0-9]{2}[-.][0-9]{3}[-.][0-9]{4}(?![0-9])", "phone number (dashed)"),

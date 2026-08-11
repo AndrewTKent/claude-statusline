@@ -201,7 +201,7 @@ def classify_session(src: Path, overrides: dict) -> str:
                     cwd_l = cwd.lower()
                     if "/personal/" in cwd_l or "/desktop/" in cwd_l:
                         return "personal"
-                    if "/coram/" in cwd_l or "/work/" in cwd_l or "orcamobility" in cwd_l:
+                    if "/work/" in cwd_l:
                         return "work"
                 break
         except Exception:

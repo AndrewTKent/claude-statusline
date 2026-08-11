@@ -22,25 +22,25 @@ import accounts  # noqa: E402
 NOW = datetime(2026, 7, 16, 20, 0, 0, tzinfo=timezone.utc)
 
 PAIRS = [
-    ("coram-max", "andrew.kent@coram.ai", "e1c8"),
-    ("coram-work", "andrew.kent@coram.ai", "52ae"),
-    ("work", "*@coram.ai", None),
+    ("acme-max", "jane.doe@acme.ai", "e1c8"),
+    ("acme-work", "jane.doe@acme.ai", "52ae"),
+    ("work", "*@acme.ai", None),
     ("gmail", "someone@gmail.com", None),
 ]
 
 
 class TestResolveLabel:
     def test_uuid_qualified_beats_bare(self):
-        assert accounts.resolve_label("andrew.kent@coram.ai", "52ae", PAIRS) == "coram-work"
+        assert accounts.resolve_label("jane.doe@acme.ai", "52ae", PAIRS) == "acme-work"
 
     def test_uuid_qualified_exact(self):
-        assert accounts.resolve_label("andrew.kent@coram.ai", "e1c8", PAIRS) == "coram-max"
+        assert accounts.resolve_label("jane.doe@acme.ai", "e1c8", PAIRS) == "acme-max"
 
     def test_bare_fallback_when_uuid_unknown(self):
-        assert accounts.resolve_label("andrew.kent@coram.ai", "zzzz", PAIRS) == "work"
+        assert accounts.resolve_label("jane.doe@acme.ai", "zzzz", PAIRS) == "work"
 
     def test_bare_glob(self):
-        assert accounts.resolve_label("other@coram.ai", None, PAIRS) == "work"
+        assert accounts.resolve_label("other@acme.ai", None, PAIRS) == "work"
 
     def test_no_match_falls_back_to_localpart(self):
         assert accounts.resolve_label("x@nowhere.io", None, PAIRS) == "x"
@@ -2762,14 +2762,14 @@ exec /bin/cat "$@"
         (claude_dir / "statusline.conf").write_text(
             'SHOW_ACCOUNT_RESETS=1\n'
             'MAX_COLS=200\n'
-            'ACCOUNT_LABELS="coram-max:andrew.kent@coram.ai|coram-org '
+            'ACCOUNT_LABELS="acme-max:jane.doe@acme.ai|acme-org '
             'alumni:*@alumni.example.edu"\n'
             'ACCOUNTS_EXCLUDE="brown"\n'
         )
         resets = {
-            "andrew.kent@coram.ai|coram-org": {
-                "email": "andrew.kent@coram.ai",
-                "org_uuid": "coram-org",
+            "jane.doe@acme.ai|acme-org": {
+                "email": "jane.doe@acme.ai",
+                "org_uuid": "acme-org",
                 "five_hour_pct": 18,
                 "seven_day_pct": 20,
                 "fable_pct": 24,
@@ -2800,9 +2800,9 @@ exec /bin/cat "$@"
             {
                 "HOME": str(home),
                 "TZ": "UTC",
-                "ACCOUNTS_ROUTED_LABEL": "coram-max",
-                "ACCOUNTS_ROUTED_EMAIL": "andrew.kent@coram.ai",
-                "ACCOUNTS_ROUTED_ORG_UUID": "coram-org",
+                "ACCOUNTS_ROUTED_LABEL": "acme-max",
+                "ACCOUNTS_ROUTED_EMAIL": "jane.doe@acme.ai",
+                "ACCOUNTS_ROUTED_ORG_UUID": "acme-org",
             }
         )
         # Hermetic: a real session exports its own profile dir, which would
@@ -2819,7 +2819,7 @@ exec /bin/cat "$@"
         )
         rendered = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
 
-        assert "Coram-max" in rendered
+        assert "Acme-max" in rendered
         assert "Brown" not in rendered
         assert (tmp_path / "cache/statusline-usage-cache.json").is_symlink()
         assert (tmp_path / "cache/statusline-profile-cache.json").is_symlink()
@@ -3452,9 +3452,9 @@ class TestCaptureLiveClearsFlag:
         monkeypatch.setattr(accounts, "live_cred", lambda: (live, "keychain"))
         saved: list[dict] = []
         monkeypatch.setattr(accounts, "save_blobs", saved.append)
-        blobs = {"accounts": {"coram-max": {"blob": live, "auth_dead_at": 99}}}
-        assert accounts.capture_live_to_blobs(blobs) == "coram-max"
-        assert "auth_dead_at" not in blobs["accounts"]["coram-max"]
+        blobs = {"accounts": {"acme-max": {"blob": live, "auth_dead_at": 99}}}
+        assert accounts.capture_live_to_blobs(blobs) == "acme-max"
+        assert "auth_dead_at" not in blobs["accounts"]["acme-max"]
         assert saved, "clear must persist"
 
     def test_matching_live_token_without_flag_saves_nothing(self, monkeypatch):
@@ -3463,8 +3463,8 @@ class TestCaptureLiveClearsFlag:
         monkeypatch.setattr(
             accounts, "save_blobs", lambda _b: (_ for _ in ()).throw(AssertionError("no write"))
         )
-        blobs = {"accounts": {"coram-max": {"blob": live}}}
-        assert accounts.capture_live_to_blobs(blobs) == "coram-max"
+        blobs = {"accounts": {"acme-max": {"blob": live}}}
+        assert accounts.capture_live_to_blobs(blobs) == "acme-max"
 
 
 class TestProfileKeychain:

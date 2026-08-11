@@ -20,8 +20,8 @@ That file lists the sessions you are responsible for. Each entry has
 `sid` (session id) and `path` (full path to JSONL). Read each session's
 JSONL.
 
-**User context:** Senior ML engineer at Coram AI submitting transcripts
-to the CEO as part of a token-usage bounty. Wants technical engineering
+**User context:** an engineer submitting transcripts to someone at their
+company as part of a token-usage review. Wants technical engineering
 content preserved (code, debugging, PRs) and personal/sensitive material
 hidden.
 
@@ -31,16 +31,15 @@ hidden.
    directed at the assistant
 2. **`sensitive-data`** — PII (emails, phones, addresses), API keys,
    tokens, customer contact info, third-party person contact details
-3. **`personal-aside`** — anything unrelated to Coram engineering work:
-   the legal dispute against Didge NX / Nextera Robotics / Lana Graf /
-   Alex Rand / BTA / attorneys / phantom stock / W-2C / wage act /
-   clawback; training / Ironman / Tarawera / races; personal trips;
-   Japan / Sonoma / Italy; compensation / salary / equity; health;
-   family / relationships; anything revealing thinking on personal matters
+3. **`personal-aside`** — anything unrelated to engineering work: legal
+   disputes, named third parties, attorneys, equity/phantom stock, tax or
+   wage matters; athletic training and races; personal trips and
+   destinations; compensation / salary; health; family / relationships;
+   anything revealing thinking on personal matters
 4. **`personal-comms`** — pasted iMessages, emails, Slack DMs from
    personal contacts
-5. **`other`** — harsh judgments about coworkers by name, internal Coram
-   drama, confidential Coram product/strategy, ranting about customers
+5. **`other`** — harsh judgments about coworkers by name, internal
+   company drama, confidential product/strategy, ranting about customers
 
 ### What to IGNORE
 

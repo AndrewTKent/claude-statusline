@@ -6,7 +6,7 @@ For every JSONL in scope:
     emit a range covering that message's timestamp ± 60s, category personal-aside.
   - Uncommon names match on bare first name (Ashesh, Hema, Tushar, etc.)
   - Common names require a work-context signal nearby (PR, merged, review,
-    code, @, coram, slack, commit, ticket, sync, standup, etc.)
+    code, @, slack, commit, ticket, sync, standup, etc.)
   - Full-name matches always count regardless of commonness.
 
 Writes staging output to ~/.claude/token-scan-coworker-staging.json for
@@ -78,7 +78,7 @@ HANDLES = [
 # Work-context signals that qualify a common first name
 WORK_CONTEXT = re.compile(
     r"\b(PR|pull\s+request|merged|review|approved?|commit|commits|ticket|"
-    r"AGI-\d+|EDGE-\d+|slack|DM|sync|standup|coram|PIP|perf|@|"
+    r"[A-Z]{2,5}-\d+|slack|DM|sync|standup|PIP|perf|@|"
     r"code|repo|branch|"
     r"coworker|teammate|engineer|manager|CEO|CTO|VP|"
     r"eng-updates|voice-agent|logistics-app|logistics-core|4d-view|kb-server)\b",

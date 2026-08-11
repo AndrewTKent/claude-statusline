@@ -60,9 +60,7 @@ def local_dt(ts: int) -> datetime:
 def short_email(email: str) -> str:
     """jane_doe@alumni.example.edu → alumni, jane.doe@acme.ai → acme."""
     domain = email.split("@", 1)[-1].lower()
-    if "coram" in domain:
-        return "coram"
-    if "brown" in domain or "alumni" in domain:
+    if "alumni" in domain:
         return "alumni"
     if "gmail" in domain:
         return "personal"
