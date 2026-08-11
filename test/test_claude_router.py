@@ -1899,7 +1899,7 @@ def test_advisory_usage_update_does_not_handoff_a_running_session(tmp_path):
     assert launches[0]["args"][-2] == "--session-id"
 
 
-def test_running_opus_session_switches_to_fable_when_mode_changes(tmp_path):
+def test_mode_change_before_first_transcript_reuses_the_new_session_id(tmp_path):
     home = tmp_path / "home"
     claude_dir = home / ".claude"
     accounts_dir = home / ".accounts"
@@ -2009,12 +2009,12 @@ def test_running_opus_session_switches_to_fable_when_mode_changes(tmp_path):
     assert launches[1]["args"][-4:] == [
         "--model",
         "fable",
-        "--resume",
+        "--session-id",
         first_session,
     ]
 
 
-def test_fable_session_falls_back_to_opus_when_no_fable_account_is_safe(tmp_path):
+def test_fable_ignores_general_ceilings_until_fable_usage_is_full(tmp_path):
     home = tmp_path / "home"
     claude_dir = home / ".claude"
     accounts_dir = home / ".accounts"
@@ -2047,8 +2047,8 @@ def test_fable_session_falls_back_to_opus_when_no_fable_account_is_safe(tmp_path
         json.dumps(
             {
                 "first@example.com|org-first": {
-                    "five_hour_pct": 10,
-                    "seven_day_pct": 10,
+                    "five_hour_pct": 100,
+                    "seven_day_pct": 100,
                     "fable_pct": 10,
                     "last_seen": time.time(),
                 },
@@ -2111,9 +2111,9 @@ def test_fable_session_falls_back_to_opus_when_no_fable_account_is_safe(tmp_path
         json.dumps(
             {
                 "first@example.com|org-first": {
-                    "five_hour_pct": 10,
-                    "seven_day_pct": 10,
-                    "fable_pct": 95,
+                    "five_hour_pct": 100,
+                    "seven_day_pct": 100,
+                    "fable_pct": 100,
                     "last_seen": time.time(),
                 },
                 "second@example.com|org-second": {
@@ -2132,7 +2132,7 @@ def test_fable_session_falls_back_to_opus_when_no_fable_account_is_safe(tmp_path
     assert process.returncode == 0
     assert stdout == ""
     assert stderr == ""
-    assert [launch["label"] for launch in launches] == ["first", "first"]
+    assert [launch["label"] for launch in launches] == ["first", "second"]
     first_session = launches[0]["args"][-1]
     assert launches[1]["args"][
         launches[1]["args"].index("--effort") + 1
@@ -2140,7 +2140,7 @@ def test_fable_session_falls_back_to_opus_when_no_fable_account_is_safe(tmp_path
     assert launches[1]["args"][-4:] == [
         "--model",
         "opus",
-        "--resume",
+        "--session-id",
         first_session,
     ]
 
@@ -2293,7 +2293,7 @@ def test_reissued_fable_mode_promotes_a_pinned_session(monkeypatch):
 
     assert len(launches) == 2
     assert claude_router.option_value(launches[1], "--model") == "fable"
-    assert launches[1][-2:] == ["--resume", session_id]
+    assert launches[1][-2:] == ["--session-id", session_id]
 
 
 def test_router_imposed_opus_fallback_still_recovers_to_fable(monkeypatch):
@@ -2372,7 +2372,7 @@ def test_router_imposed_opus_fallback_still_recovers_to_fable(monkeypatch):
     assert len(launches) == 2
     assert claude_router.option_value(launches[0], "--model") == "opus"
     assert claude_router.option_value(launches[1], "--model") == "fable"
-    assert launches[1][-2:] == ["--resume", session_id]
+    assert launches[1][-2:] == ["--session-id", session_id]
 
 
 def test_live_switch_back_to_fable_clears_the_pin(monkeypatch):
@@ -2454,4 +2454,4 @@ def test_live_switch_back_to_fable_clears_the_pin(monkeypatch):
     # handoff fired only after the switch back to fable, and carried fable
     assert len(handoffs) == 1
     assert claude_router.option_value(launches[-1], "--model") == "fable"
-    assert launches[-1][-2:] == ["--resume", session_id]
+    assert launches[-1][-2:] == ["--session-id", session_id]

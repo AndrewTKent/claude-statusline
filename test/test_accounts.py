@@ -340,10 +340,28 @@ class TestPickProfileRoute:
             require_fable=True,
         ) == "gmail"
 
+    def test_fable_route_ignores_general_advisory_ceilings(self):
+        rows = [
+            accounts_row(
+                "fable-ready",
+                100.0,
+                seven_day=100.0,
+                fable=99.0,
+            )
+        ]
+
+        assert accounts.pick_profile_route(rows, set(), None) is None
+        assert accounts.pick_profile_route(
+            rows,
+            set(),
+            None,
+            require_fable=True,
+        ) == "fable-ready"
+
     def test_forced_pin_ignores_quota_and_exclusions(self):
         rows = [
             accounts_row("safe", 5.0, seven_day=5.0),
-            accounts_row("work", 100.0, seven_day=100.0, fable=100.0),
+            accounts_row("work", 100.0, seven_day=100.0, fable=99.0),
         ]
 
         assert accounts.pick_profile_route(
@@ -353,6 +371,19 @@ class TestPickProfileRoute:
             require_fable=True,
             force_pin=True,
         ) == "work"
+
+    def test_forced_fable_pin_rejects_a_full_fable_window(self):
+        rows = [
+            accounts_row("work", 10.0, seven_day=10.0, fable=100.0),
+        ]
+
+        assert accounts.pick_profile_route(
+            rows,
+            set(),
+            "work",
+            require_fable=True,
+            force_pin=True,
+        ) is None
 
     def test_forced_pin_rejects_an_expired_account(self):
         rows = [
@@ -662,10 +693,10 @@ class TestHandoffTarget:
             require_fable=False,
         ) == "first"
 
-    def test_fable_session_stays_until_handoff_threshold(self, monkeypatch):
+    def test_fable_session_stays_until_the_fable_window_is_full(self, monkeypatch):
         rows = [
-            accounts_row("current", 10.0, seven_day=10.0, fable=81.0),
-            accounts_row("other", 10.0, seven_day=10.0, fable=82.0),
+            accounts_row("current", 10.0, seven_day=10.0, fable=99.0),
+            accounts_row("other", 10.0, seven_day=10.0, fable=1.0),
         ]
         self._wire(monkeypatch, rows, mode="fable")
 
@@ -674,9 +705,9 @@ class TestHandoffTarget:
             require_fable=True,
         ) is None
 
-    def test_fable_session_switches_at_handoff_threshold(self, monkeypatch):
+    def test_fable_session_switches_when_the_fable_window_is_full(self, monkeypatch):
         rows = [
-            accounts_row("current", 10.0, seven_day=10.0, fable=95.0),
+            accounts_row("current", 10.0, seven_day=10.0, fable=100.0),
             accounts_row("other", 10.0, seven_day=10.0, fable=82.0),
         ]
         self._wire(monkeypatch, rows, mode="fable")
@@ -686,19 +717,31 @@ class TestHandoffTarget:
             require_fable=True,
         ) == "other"
 
-    def test_fable_session_switches_when_weekly_window_cannot_spend(
-        self, monkeypatch
+    @pytest.mark.parametrize(
+        ("five_hour", "seven_day"),
+        [(100.0, 20.0), (20.0, 100.0)],
+    )
+    def test_fable_session_ignores_general_window_ceilings(
+        self,
+        five_hour,
+        seven_day,
+        monkeypatch,
     ):
         rows = [
-            accounts_row("current", 10.0, seven_day=80.0, fable=20.0),
-            accounts_row("other", 10.0, seven_day=20.0, fable=82.0),
+            accounts_row(
+                "current",
+                five_hour,
+                seven_day=seven_day,
+                fable=99.0,
+            ),
+            accounts_row("other", 10.0, seven_day=20.0, fable=1.0),
         ]
         self._wire(monkeypatch, rows, mode="fable")
 
         assert accounts.handoff_target(
             "current",
             require_fable=True,
-        ) == "other"
+        ) is None
 
     def test_general_fallback_uses_general_headroom_in_fable_mode(
         self,
@@ -1608,7 +1651,7 @@ class TestCmdStatus:
 
         output = capsys.readouterr().out
         assert "general: work" in output
-        assert "fable: work" in output
+        assert "fable: (none free)" in output
 
 
 class TestNativeProfiles:
@@ -1780,6 +1823,55 @@ class TestNativeProfiles:
         assert "auth_dead_at" not in blobs["accounts"]["gmail"]
         assert (profile / ".credentials.json").read_text() == old
         assert "repaired gmail profile login" in capsys.readouterr().err
+
+    def test_known_profile_login_moves_the_global_pin(self, tmp_path, monkeypatch):
+        self._paths(tmp_path, monkeypatch)
+        monkeypatch.setattr(accounts, "MODE_PATH", tmp_path / "mode.json")
+        current_blob = _live_blob("current")
+        login_blob = _live_blob("login")
+        target_blob = _live_blob("target")
+        current_profile = accounts.ensure_native_profile(
+            "current",
+            {"blob": current_blob},
+        )
+        target_profile = accounts.ensure_native_profile(
+            "target",
+            {"blob": target_blob},
+        )
+        accounts._write_0600(current_profile / ".credentials.json", login_blob)
+        blobs = {
+            "accounts": {
+                "current": {
+                    "blob": current_blob,
+                    "email": "current@example.com",
+                    "org_uuid": "current-org",
+                },
+                "target": {
+                    "blob": target_blob,
+                    "email": "target@example.com",
+                    "org_uuid": "target-org",
+                },
+            }
+        }
+        monkeypatch.setattr(
+            accounts,
+            "fetch_profile",
+            lambda _token: {
+                "account": {"email": "target@example.com"},
+                "organization": {"uuid": "target-org"},
+            },
+        )
+        monkeypatch.setattr(
+            accounts,
+            "load_label_pairs",
+            lambda: [("target", "target@example.com", "target-org")],
+        )
+        accounts.save_mode("set", "current")
+
+        assert accounts.sync_profile_credentials(blobs, persist=False) == set()
+        assert accounts.load_mode() == {"mode": "set", "label": "target"}
+        assert (current_profile / ".credentials.json").read_text() == current_blob
+        assert (target_profile / ".credentials.json").read_text() == target_blob
 
     def test_removes_only_the_mismatched_profile_keychain_item(
         self,
@@ -2010,40 +2102,26 @@ class TestLoadModeFable:
 
 
 class TestFableEligible:
-    # signature: fable_eligible(five_hour, seven_day, fable)
-    def test_all_under_cap(self):
-        assert accounts.fable_eligible(30.0, 30.0, 40.0) is True
-
-    def test_boundary_just_under_cap(self):
-        assert accounts.fable_eligible(79.0, 79.0, 94.0) is True
+    def test_fable_just_under_full_is_eligible(self):
+        assert accounts.fable_eligible(100.0, 100.0, 99.0) is True
 
     def test_fable_none_ineligible(self):
         assert accounts.fable_eligible(10.0, 10.0, None) is False
 
-    def test_fable_at_cap_ineligible(self):
-        assert accounts.fable_eligible(10.0, 10.0, 95.0) is False
+    @pytest.mark.parametrize("fable", [100.0, 101.0])
+    def test_full_fable_window_is_ineligible(self, fable):
+        assert accounts.fable_eligible(10.0, 10.0, fable) is False
 
-    def test_fable_over_cap_ineligible(self):
-        assert accounts.fable_eligible(10.0, 10.0, 100.0) is False
-
-    def test_five_hour_none_ineligible(self):
-        assert accounts.fable_eligible(None, 10.0, 10.0) is False
-
-    def test_five_hour_at_cap_ineligible(self):
-        assert accounts.fable_eligible(80.0, 10.0, 10.0) is False
-
-    def test_seven_day_none_ineligible(self):
-        assert accounts.fable_eligible(10.0, None, 10.0) is False
-
-    def test_seven_day_at_cap_ineligible(self):
-        assert accounts.fable_eligible(10.0, 80.0, 10.0) is False
-
-    def test_fable_headroom_useless_when_weekly_capped(self):
-        # 0% fable used but weekly maxed → can't make requests → not usable
-        assert accounts.fable_eligible(10.0, 100.0, 0.0) is False
-
-    def test_fable_headroom_useless_when_5h_capped(self):
-        assert accounts.fable_eligible(100.0, 10.0, 0.0) is False
+    @pytest.mark.parametrize(
+        ("five_hour", "seven_day"),
+        [(None, None), (100.0, 10.0), (10.0, 100.0)],
+    )
+    def test_general_windows_do_not_affect_fable_eligibility(
+        self,
+        five_hour,
+        seven_day,
+    ):
+        assert accounts.fable_eligible(five_hour, seven_day, 10.0) is True
 
 
 class TestBindingPct:
@@ -2103,11 +2181,11 @@ class TestPickEnvFable:
         picked = accounts.pick_route(accounts._fable_first(rows), vault, set(), self.NOW, None)
         assert picked == ("bravo", "sk-bravo")
 
-    def test_skips_weekly_maxed_fable_account(self):
+    def test_weekly_ceiling_does_not_hide_fable_headroom(self):
         rows = [accounts_row("alpha", 0.0, fable=8.0, seven_day=100.0),
                 accounts_row("bravo", 34.0, fable=41.0, seven_day=52.0)]
         picked = accounts.pick_route(accounts._fable_first(rows), self.VAULT, set(), self.NOW, None)
-        assert picked == ("bravo", "sk-bravo")
+        assert picked == ("alpha", "sk-alpha")
 
 
 class TestRouteRowsStale:
@@ -2824,7 +2902,12 @@ exec /bin/cat "$@"
         assert (tmp_path / "cache/statusline-usage-cache.json").is_symlink()
         assert (tmp_path / "cache/statusline-profile-cache.json").is_symlink()
 
-    def test_in_profile_login_replaces_launch_identity_before_ledger_write(self, tmp_path):
+    @pytest.mark.parametrize("credential_source", ["file", "keychain"])
+    def test_in_profile_login_replaces_launch_identity_before_ledger_write(
+        self,
+        tmp_path,
+        credential_source,
+    ):
         repo = Path(__file__).resolve().parent.parent
         home = tmp_path / "home"
         claude_dir = home / ".claude"
@@ -2835,11 +2918,19 @@ exec /bin/cat "$@"
         )
         profile = tmp_path / "profile"
         profile.mkdir()
-        (profile / ".credentials.json").write_text(
-            json.dumps({"claudeAiOauth": {"accessToken": "new-token"}})
+        credential_blob = json.dumps(
+            {"claudeAiOauth": {"accessToken": "new-token"}}
         )
+        if credential_source == "file":
+            (profile / ".credentials.json").write_text(credential_blob)
         fake_bin = tmp_path / "bin"
         fake_bin.mkdir()
+        if credential_source == "keychain":
+            fake_security = fake_bin / "security"
+            fake_security.write_text(
+                "#!/usr/bin/env bash\nprintf '%s' '" + credential_blob + "'\n"
+            )
+            fake_security.chmod(0o755)
         fake_curl = fake_bin / "curl"
         fake_curl.write_text(
             "#!/usr/bin/env bash\n"

@@ -1,3 +1,16 @@
 #!/bin/sh
+# Sole entrypoint for every `claude` launch: route through the account
+# router, falling back to the newest native binary if the router can't run.
 
-exec "$HOME/.local/bin/claude-router" "$@"
+router="$HOME/.local/bin/claude-router"
+if [ -x "$router" ] && command -v python3 >/dev/null 2>&1; then
+    exec "$router" "$@"
+fi
+
+real=$(ls -t "$HOME/.local/share/claude/versions/"* 2>/dev/null | head -n 1)
+if [ -n "$real" ]; then
+    exec "$real" "$@"
+fi
+
+echo "claude: neither claude-router nor a native binary found" >&2
+exit 127

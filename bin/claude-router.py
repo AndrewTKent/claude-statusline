@@ -45,17 +45,42 @@ SYNC_OUTPUT_ON = b"\x1b[?2026h"
 SYNC_OUTPUT_OFF = b"\x1b[?2026l"
 
 
+def _usable_claude(path: Path) -> bool:
+    # ~/.local/bin/claude is now the router wrapper; treating it (or any
+    # router shim) as the real binary would exec-loop back into the router.
+    try:
+        resolved = path.resolve(strict=True)
+        if not os.access(resolved, os.X_OK):
+            return False
+        with resolved.open("rb") as handle:
+            head = handle.read(512)
+    except OSError:
+        return False
+    return not (head.startswith(b"#!") and b"claude-router" in head)
+
+
 def claude_binary() -> str:
     explicit = os.environ.get("CLAUDE_REAL_BIN")
-    if explicit:
+    if explicit and _usable_claude(Path(explicit)):
         return explicit
     native = Path.home() / ".local/bin/claude"
-    if native.is_file() and os.access(native, os.X_OK):
+    if _usable_claude(native):
         return str(native)
+    versions = Path.home() / ".local/share/claude/versions"
+    try:
+        newest = max(
+            (p for p in versions.iterdir() if _usable_claude(p)),
+            key=lambda p: p.stat().st_mtime,
+            default=None,
+        )
+    except OSError:
+        newest = None
+    if newest is not None:
+        return str(newest)
     binary = shutil.which("claude")
-    if not binary:
-        raise RuntimeError("claude binary not found")
-    return binary
+    if binary and _usable_claude(Path(binary)):
+        return binary
+    raise RuntimeError("claude binary not found")
 
 
 def is_interactive(args: list[str]) -> bool:
@@ -275,6 +300,23 @@ def transcript_size(path: Path | None) -> int:
         return path.stat().st_size
     except OSError:
         return 0
+
+
+def handoff_session_args(
+    args: list[str],
+    session_id: str,
+    model_override: str | None = None,
+    effort_override: str | None = None,
+) -> list[str]:
+    launch_args = resume_session_args(
+        args,
+        session_id,
+        model_override,
+        effort_override,
+    )
+    if transcript_size(session_transcript_path(session_id)) > 0:
+        return launch_args
+    return [*launch_args[:-2], "--session-id", session_id]
 
 
 def record_limit_kind(record: dict) -> str | None:
@@ -699,7 +741,7 @@ def run_supervised(binary: str, args: list[str]) -> int:
                         continue
                     applied_mode_generation = mode_generation
                 stop_for_handoff(child)
-                launch_args = resume_session_args(
+                launch_args = handoff_session_args(
                     args,
                     session_id,
                     next_model,
@@ -764,7 +806,7 @@ def run_supervised(binary: str, args: list[str]) -> int:
                     return child.wait()
                 next_profile, next_override = limit_route
                 next_model = next_override or current_model
-                launch_args = resume_session_args(
+                launch_args = handoff_session_args(
                     args,
                     session_id,
                     next_model,
