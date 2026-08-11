@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template for the usage-ledger fold. install-usage-ledger.sh populates
+  REPO_ROOT and HOME, then copies this file to ~/Library/LaunchAgents/.
+
+  The scan-tokens watcher keeps aggregates fresh but follows the live
+  transcript set, so nothing preserves usage once Claude Code's retention
+  deletes a session. This fold is the durable layer, and the statusline's
+  lifetime figure reads it. StartInterval, not KeepAlive: the job exits after
+  each fold, and usage-ledger.py self-throttles to USAGE_LEDGER_INTERVAL_H
+  (default 6h), so a short interval here costs nothing.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.claude-usage-ledger</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__REPO_ROOT__/bin/usage-ledger.py</string>
+        <string>--quiet</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StartInterval</key>
+    <integer>1800</integer>
+
+    <!-- If a fold fails instantly, wait at least 10s before the next launch. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.claude/usage-ledger-stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.claude/usage-ledger-stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>

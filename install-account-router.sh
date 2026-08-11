@@ -42,3 +42,8 @@ fi
 
 printf 'Installed supervised Claude launcher at %s and %s\n' "$native_claude" "$router_bin/claude"
 printf 'Open a new shell or run: %s\n' "$path_line"
+
+# Routing quality depends on a fresh board, so the pollers ship with the router
+# rather than as a step someone can skip.
+"$repo_root/macos/launchd/install-agents.sh" || \
+    printf 'Background agents did not fully install — run macos/launchd/install-agents.sh\n' >&2
