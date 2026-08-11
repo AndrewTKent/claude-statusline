@@ -1787,7 +1787,13 @@ def test_statusline_says_when_an_env_pin_is_bypassed(tmp_path):
     assert "pin preferred bypassed" in result.stdout
 
 
-def test_advisory_usage_update_does_not_handoff_a_running_session(tmp_path):
+def test_advisory_usage_at_the_wall_hands_off_a_running_session(tmp_path):
+    # Inverts the rule this test previously pinned. Holding a live session until
+    # a real 429 meant riding an account to exhaustion with idle accounts on the
+    # board, and the 429 costs more than the stop-and-resume it was avoiding: it
+    # ends the turn AND locks the account out for hours. Departure is gated at
+    # DEPART_PCT, well above the bar for merely being unfit to receive work, so
+    # mid-range advisory noise still moves nothing.
     home = tmp_path / "home"
     claude_dir = home / ".claude"
     accounts_dir = home / ".accounts"
@@ -1895,8 +1901,11 @@ def test_advisory_usage_update_does_not_handoff_a_running_session(tmp_path):
     assert process.returncode == 0
     assert stdout == ""
     assert stderr == ""
-    assert [launch["label"] for launch in launches] == ["first"]
+    assert [launch["label"] for launch in launches] == ["first", "second"]
     assert launches[0]["args"][-2] == "--session-id"
+    # Same session, new account. A transcript-less session is re-issued by id
+    # rather than resumed, so identity is the property worth pinning here.
+    assert launches[1]["args"][-1] == launches[0]["args"][-1]
 
 
 def test_mode_change_before_first_transcript_reuses_the_new_session_id(tmp_path):

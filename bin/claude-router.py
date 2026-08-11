@@ -734,6 +734,28 @@ def run_supervised(binary: str, args: list[str]) -> int:
                         )
                         if next_profile is None or next_profile["label"] != target:
                             continue
+                    elif mode.get("mode") == "auto" and accounts.profile_near_wall(
+                        selected["label"]
+                    ):
+                        # Fable has its own departure trigger above; general work
+                        # had none, so an auto session rode its account to a hard
+                        # 429 with idle accounts on the board.
+                        target = accounts.handoff_target(
+                            selected["label"],
+                            require_fable=False,
+                            margin_pct=accounts.HANDOFF_MARGIN_PCT,
+                        )
+                        if not target:
+                            continue
+                        next_profile = accounts.select_profile(
+                            avoid_labels={selected["label"]},
+                            require_fable=False,
+                            lease_pid=router_pid,
+                        )
+                        if next_profile is None or next_profile["label"] != target:
+                            continue
+                        next_model = model_override or current_model
+                        next_override = model_override
                     elif mode_changed:
                         applied_mode_generation = mode_generation
                         continue

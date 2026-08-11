@@ -2051,10 +2051,31 @@ def profile_general_exhausted(label: str) -> bool:
         return False
 
 
+def profile_near_wall(label: str) -> bool:
+    """True when the active account is close enough to a rate wall to leave now.
+
+    profile_general_exhausted fires at RATE_CAP_PCT, the same bar a target must
+    clear, so it only ever reports a wall already hit. Staleness still gates:
+    the statusline rewrites the active row every render, so an unknown row here
+    means something is wrong and guessing is worse than staying.
+    """
+    try:
+        rows = route_rows(load_blobs(), label, time.time())
+        row = next((candidate for candidate in rows if candidate["label"] == label), None)
+        return bool(
+            row
+            and not row.get("stale")
+            and binding_pct(row["five_hour"], row["seven_day"]) >= DEPART_PCT
+        )
+    except Exception:
+        return False
+
+
 def handoff_target(
     current_label: str,
     *,
     require_fable: bool,
+    margin_pct: float = 0.0,
 ) -> str | None:
     try:
         blobs = load_blobs()
@@ -2087,7 +2108,18 @@ def handoff_target(
             require_fable=require_fable,
             force_pin=force_pin,
         )
-        return target if target != current_label else None
+        if target is None or target == current_label:
+            return None
+        if margin_pct > 0.0 and current is not None:
+            chosen = next((row for row in rows if row["label"] == target), None)
+            if chosen is None:
+                return None
+            gain = binding_pct(current["five_hour"], current["seven_day"]) - binding_pct(
+                chosen["five_hour"], chosen["seven_day"]
+            )
+            if gain < margin_pct:
+                return None
+        return target
     except Exception:
         return None
 
@@ -2128,6 +2160,13 @@ SEVEN_DAY_CAP_PCT = 90.0
 # last-resort pick.
 HARD_WALL_PCT = 97.0
 FABLE_CAP_PCT = 100.0
+# Leave the active account here. Deliberately later than RATE_CAP_PCT, the bar a
+# row must clear to RECEIVE work: moving a live session costs a stop and resume,
+# so departure waits until the wall is imminent rather than merely approaching.
+DEPART_PCT = 90.0
+# A departure must buy this much runway. handoff_target ranks without a floor,
+# so without a margin a 72.1% account hands off to a 72.0% one and re-fires.
+HANDOFF_MARGIN_PCT = 15.0
 
 
 def fable_eligible(

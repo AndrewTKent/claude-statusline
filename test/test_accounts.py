@@ -775,6 +775,90 @@ class TestHandoffTarget:
             require_fable=False,
         ) == "other"
 
+    def test_margin_rejects_a_handoff_that_buys_no_runway(self, monkeypatch):
+        rows = [
+            accounts_row("current", 72.1, seven_day=10.0),
+            accounts_row("barely", 72.0, seven_day=10.0),
+        ]
+        self._wire(monkeypatch, rows)
+
+        assert accounts.handoff_target(
+            "current",
+            require_fable=False,
+            margin_pct=accounts.HANDOFF_MARGIN_PCT,
+        ) is None
+
+    def test_margin_allows_a_handoff_that_buys_real_runway(self, monkeypatch):
+        rows = [
+            accounts_row("current", 72.0, seven_day=10.0),
+            accounts_row("fresh", 5.0, seven_day=5.0),
+        ]
+        self._wire(monkeypatch, rows)
+
+        assert accounts.handoff_target(
+            "current",
+            require_fable=False,
+            margin_pct=accounts.HANDOFF_MARGIN_PCT,
+        ) == "fresh"
+
+    def test_margin_is_off_for_callers_that_do_not_ask(self, monkeypatch):
+        rows = [
+            accounts_row("current", 72.1, seven_day=10.0),
+            accounts_row("barely", 72.0, seven_day=10.0),
+        ]
+        self._wire(monkeypatch, rows)
+
+        assert accounts.handoff_target(
+            "current",
+            require_fable=False,
+        ) == "barely"
+
+
+class TestProfileNearWall:
+    def _wire(self, monkeypatch, rows):
+        monkeypatch.setattr(accounts, "load_blobs", lambda: {"accounts": {}})
+        monkeypatch.setattr(accounts, "route_rows", lambda *_args: rows)
+
+    def test_fires_at_the_departure_threshold(self, monkeypatch):
+        self._wire(
+            monkeypatch,
+            [accounts_row("current", accounts.DEPART_PCT, seven_day=10.0)],
+        )
+
+        assert accounts.profile_near_wall("current") is True
+
+    def test_quiet_below_the_threshold(self, monkeypatch):
+        self._wire(
+            monkeypatch,
+            [accounts_row("current", accounts.DEPART_PCT - 0.1, seven_day=10.0)],
+        )
+
+        assert accounts.profile_near_wall("current") is False
+
+    def test_the_weekly_axis_can_trigger_it(self, monkeypatch):
+        self._wire(
+            monkeypatch,
+            [accounts_row("current", 5.0, seven_day=accounts.DEPART_PCT)],
+        )
+
+        assert accounts.profile_near_wall("current") is True
+
+    def test_a_stale_row_never_triggers_it(self, monkeypatch):
+        self._wire(
+            monkeypatch,
+            [accounts_row("current", 99.0, seven_day=99.0, stale=True)],
+        )
+
+        assert accounts.profile_near_wall("current") is False
+
+    def test_holds_where_the_account_is_merely_unfit_to_receive(self, monkeypatch):
+        # RATE_CAP_PCT means "don't send new sessions here", not "abandon ship".
+        # Departure is the stricter condition, so the band between them stays put.
+        self._wire(monkeypatch, [accounts_row("current", 85.0, seven_day=10.0)])
+
+        assert accounts.profile_general_exhausted("current") is True
+        assert accounts.profile_near_wall("current") is False
+
 
 class TestConfirmStaleCandidate:
     """One request resolves the stale row that left selection with no candidate."""
