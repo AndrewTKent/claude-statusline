@@ -16,7 +16,7 @@
       bin/scan-tokens*.py / .sh                      reads:
       bin/account-usage-summary.py                     ~/.claude/account-resets.json
       bin/derive-cap.py                                ~/.codex/state_5.sqlite
-                                                       ~/.agent-runner/sessions.jsonl
+                                                       $AGENT_SESSIONS_PATH
       writes:
         ~/.claude/token-scan-summary.json            outputs (modes):
         ~/.claude/token-scan-cache.json                kv | --render | --json
@@ -24,19 +24,19 @@
 
       knows: per-request work/personal split          knows: this-instant 5h%,
              across both backends, payer attribution,        codex rate_limit %,
-             today/lifetime/challenge windows,               remote-host agent activity
+             today/lifetime/challenge windows,               remote agent activity
              codex rate_limit per session
 
-      doesn't know: remote-host (laptop sessions only)     doesn't know: historical
+      doesn't know: remote agents (laptop only)      doesn't know: historical
                                                                     attribution
 ```
 
 The two layers answer adjacent questions:
 
-- **Historical** — "of all the tokens I've spent this week, how many were Acme work paid by my work plan?" Slow, accurate, attributes per-request, covers both Claude and Codex.
-- **Live** — "right now, how close am I to the 5h cap, and which remote-host agents are running?" Fast, no attribution, snapshot only.
+- **Historical** — "of all the tokens I've spent this week, how many were work tokens paid by my work plan?" Slow, accurate, attributes per-request, covers both Claude and Codex.
+- **Live** — "right now, how close am I to the 5h cap, and which remote agents are running?" Fast, no attribution, snapshot only.
 
-The engine's `summary.json` includes a `codex` block with the latest `rate_limit` payload Codex emits per turn — the *authoritative* 5h / 7d utilization that `codex exec` mode silently strips. `live-state.py` prefers that signal and falls back to a raw codex sqlite token sum when no engine summary exists. Planned: pull remote-host's sessions to laptop so its work is also visible to scan-tokens.
+The engine's `summary.json` includes a `codex` block with the latest `rate_limit` payload Codex emits per turn — the *authoritative* 5h / 7d utilization that `codex exec` mode silently strips. `live-state.py` prefers that signal and falls back to a raw codex sqlite token sum when no engine summary exists. Planned: pull the remote host's sessions to the laptop so its work is also visible to scan-tokens.
 
 ## Token scan engine — three entry points, one core
 

@@ -22,22 +22,22 @@ import accounts  # noqa: E402
 NOW = datetime(2026, 7, 16, 20, 0, 0, tzinfo=timezone.utc)
 
 PAIRS = [
-    ("acme-max", "andrew.kent@acme.ai", "e1c8"),
-    ("acme-work", "andrew.kent@acme.ai", "52ae"),
+    ("acme-max", "jane.doe@acme.ai", "e1c8"),
+    ("acme-work", "jane.doe@acme.ai", "52ae"),
     ("work", "*@acme.ai", None),
-    ("gmail", "user@example.com", None),
+    ("gmail", "someone@gmail.com", None),
 ]
 
 
 class TestResolveLabel:
     def test_uuid_qualified_beats_bare(self):
-        assert accounts.resolve_label("andrew.kent@acme.ai", "52ae", PAIRS) == "acme-work"
+        assert accounts.resolve_label("jane.doe@acme.ai", "52ae", PAIRS) == "acme-work"
 
     def test_uuid_qualified_exact(self):
-        assert accounts.resolve_label("andrew.kent@acme.ai", "e1c8", PAIRS) == "acme-max"
+        assert accounts.resolve_label("jane.doe@acme.ai", "e1c8", PAIRS) == "acme-max"
 
     def test_bare_fallback_when_uuid_unknown(self):
-        assert accounts.resolve_label("andrew.kent@acme.ai", "zzzz", PAIRS) == "work"
+        assert accounts.resolve_label("jane.doe@acme.ai", "zzzz", PAIRS) == "work"
 
     def test_bare_glob(self):
         assert accounts.resolve_label("other@acme.ai", None, PAIRS) == "work"
@@ -2840,21 +2840,21 @@ exec /bin/cat "$@"
         (claude_dir / "statusline.conf").write_text(
             'SHOW_ACCOUNT_RESETS=1\n'
             'MAX_COLS=200\n'
-            'ACCOUNT_LABELS="acme-max:andrew.kent@acme.ai|acme-org '
+            'ACCOUNT_LABELS="acme-max:jane.doe@acme.ai|acme-org '
             'alumni:*@alumni.example.edu"\n'
             'ACCOUNTS_EXCLUDE="alumni"\n'
         )
         resets = {
-            "andrew.kent@acme.ai|acme-org": {
-                "email": "andrew.kent@acme.ai",
+            "jane.doe@acme.ai|acme-org": {
+                "email": "jane.doe@acme.ai",
                 "org_uuid": "acme-org",
                 "five_hour_pct": 18,
                 "seven_day_pct": 20,
                 "fable_pct": 24,
                 "last_seen": time.time(),
             },
-            "user@alumni.example.edu|alumni-org": {
-                "email": "user@alumni.example.edu",
+            "jane@alumni.example.edu|alumni-org": {
+                "email": "jane@alumni.example.edu",
                 "org_uuid": "alumni-org",
                 "five_hour_pct": 0,
                 "seven_day_pct": 0,
@@ -2879,7 +2879,7 @@ exec /bin/cat "$@"
                 "HOME": str(home),
                 "TZ": "UTC",
                 "ACCOUNTS_ROUTED_LABEL": "acme-max",
-                "ACCOUNTS_ROUTED_EMAIL": "andrew.kent@acme.ai",
+                "ACCOUNTS_ROUTED_EMAIL": "jane.doe@acme.ai",
                 "ACCOUNTS_ROUTED_ORG_UUID": "acme-org",
             }
         )
@@ -2897,7 +2897,7 @@ exec /bin/cat "$@"
         )
         rendered = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
 
-        assert "Acme-Max" in rendered
+        assert "Acme-max" in rendered
         assert "alumni" not in rendered
         assert (tmp_path / "cache/statusline-usage-cache.json").is_symlink()
         assert (tmp_path / "cache/statusline-profile-cache.json").is_symlink()

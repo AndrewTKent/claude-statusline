@@ -32,6 +32,7 @@ export WORK_PATHS PERSONAL_PATHS WORK_KEYWORDS PERSONAL_KEYWORDS
 export EMAIL_PAYER_MAP CHALLENGE_START BOUNTY_TARGET_TOKENS
 export BOUNTY_LOOKBACK_DAYS BOUNTY_SESSION_GAP_MIN
 export BRANCH_PREFIX_STRIP MAX_BRANCH LABEL_COLORS
+export AGENT_SESSIONS_PATH                # live-state.py runs as a subprocess
 
 FOCUS_FILE="$HOME/.claude/focus"
 
@@ -495,7 +496,7 @@ else
 fi
 
 # Display timezone for reset times. The Claude session may run on a host whose
-# system clock is UTC (e.g. remote-host), so resolve a real zone rather than showing
+# system clock is UTC (e.g. a remote host), so resolve a real zone rather than showing
 # UTC. Precedence: $STATUSLINE_TZ  →  ~/.claude/statusline-tz file  →  $TZ  →
 # home default. When travelling, set the zone for "where you are", e.g.:
 #   echo Europe/Rome    > ~/.claude/statusline-tz   # Portofino
@@ -1752,15 +1753,11 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                 else
                     tdisp="—"
                 fi
-                # Display name: friendly title-cased per-tag label, overriding
-                # the lowercase tag used internally for lookups. Fallback
-                # title-cases the tag so config-defined tags ("gmail",
-                # "acme") render cleanly without needing a
-                # hardcoded case here.
+                # Display name: title-cased tag, overriding the lowercase tag
+                # used internally for lookups. Any config-defined tag renders
+                # cleanly without a hardcoded case here.
                 case "$tag" in
-                    alumni)                display_name="alumni"     ;;
                     personal|gmail)        display_name="Gmail"     ;;
-                    acme)              display_name="Acme"  ;;
                     *) display_name="$(tr '[:lower:]' '[:upper:]' <<< "${tag:0:1}")${tag:1}" ;;
                 esac
                 # All account tags render white; only the leading marker
@@ -1897,8 +1894,8 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                             else if (fall) print fp"|"fu"|"fl
                         }')
                 fi
-                # Account tags appear in title-case for display (alumni /
-                # Acme) but we still key on the lowercased name for lookups.
+                # Account tags appear in title-case for display, but we still
+                # key on the lowercased name for lookups.
                 # Handled in the rendering block below.
                 # extra_int still feeds the hard-wall warning below, even
                 # though the visible column now shows weekly util.

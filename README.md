@@ -146,7 +146,7 @@ dispatch to the renderer; anything else launches Codex). `codex-top` monitors ex
 | goal row | `CHALLENGE_GOAL_M` set (see script header comment) | Progress toward a token goal, labeled `CHALLENGE_LABEL` (opt-out `SHOW_CHALLENGE_ROW=0`) |
 | `bounty` | bounty config set and uncleared | ETA to a work-token floor (opt-out `SHOW_BOUNTY_ROW=0`) |
 | `usage` | scan data available | Today / this session / lifetime totals, human-formatted |
-| `stack` | `SHOW_BACKENDS_ROW=1` | Live snapshot across Claude/Codex/remote-host agents (`bin/live-state.py`) |
+| `stack` | `SHOW_BACKENDS_ROW=1` | Live snapshot across Claude/Codex/remote agents (`bin/live-state.py`) |
 | per-account rows | `SHOW_ACCOUNT_RESETS=1` | One row per tracked account: 5h%, reset, week%, fable%, reset, work-unit cap |
 
 PR badge states: `[draft]`, `[PR✗]` checks failing, `[PR△]` changes requested, `[PR✓]` approved, `[PR⋯]` checks pending, `[PR]` open with no strong signal either way.
@@ -256,7 +256,7 @@ Create `~/.claude/statusline.conf` (bash, sourced directly). Full annotated vers
 **Account labels**
 - `ACCOUNT_LABELS="work:*@company.com personal:me@gmail.com"` — email pattern → short tag, first match wins
 - `LABEL_COLORS="work:cyan personal:magenta"` — tag → color for the `account` row (unmapped tags default to orange)
-- `EMAIL_PAYER_MAP="work:andrew@company.com personal:me@gmail.com"` — which plan paid, for the token scanner's `payer` dimension (independent of the work/personal classifier below)
+- `EMAIL_PAYER_MAP="work:you@company.com personal:me@gmail.com"` — which plan paid, for the token scanner's `payer` dimension (independent of the work/personal classifier below)
 - `SHOW_ACCOUNT_RESETS=1` — adds a per-account board (5h%, reset, week%, fable%, reset, work-unit cap) below the main rows
 
 **Token classifier** (feeds the `tokens` row's work/personal split — see `bin/scan-tokens.py`)
@@ -270,7 +270,7 @@ Create `~/.claude/statusline.conf` (bash, sourced directly). Full annotated vers
 - `SHOW_FABLE_ROW`, `SHOW_TOKENS_ROW`, `SHOW_CHALLENGE_ROW`, `SHOW_BOUNTY_ROW`
 
 **Live state stack row** (opt-in)
-- `SHOW_BACKENDS_ROW=1` — adds a `stack` row from `bin/live-state.py`: a snapshot across Claude (`account-resets.json`), Codex (newest `state_N.sqlite`), and remote-host autobuild agents (`sessions.jsonl`)
+- `SHOW_BACKENDS_ROW=1` — adds a `stack` row from `bin/live-state.py`: a snapshot across Claude (`account-resets.json`), Codex (newest `state_N.sqlite`), and remote autobuild agents (`$AGENT_SESSIONS_PATH`)
 
 ---
 
@@ -331,8 +331,6 @@ Two independent tools, both built on the same session JSONLs.
 **Token scanning** (`bin/scan_tokens_core.py` + the `bin/scan-tokens*.py`/`.sh` CLIs) attributes every request to work/personal and to a payer, incrementally, and feeds the `tokens`/`usage`/goal/`bounty` rows above plus the work-unit cap columns on the account board. `bin/derive-cap.py` fits those per-account caps from utilization history — it's a manual, unscheduled tool you re-run occasionally, not something cron or launchd calls. Full design, cache schema, and failure modes: [`bin/ARCHITECTURE.md`](bin/ARCHITECTURE.md).
 
 **Durable ledger & archival** (`bin/usage-ledger.py`, `bin/archive-transcripts.sh`, `bin/vault-snapshot.sh`) keep a permanent per-day/per-model token ledger at `~/.claude/usage-ledger.json` and mirror Claude Code session JSONLs nightly — rows never pruned, survives transcript cleanup.
-
-**Redaction** (`bin/scan-tokens-export.py`, `-autoflag.py`, `-coworker-scrub.py`, `-merge.py`) strips sensitive content from a session JSONL into a separate export copy before you hand it to a third party — source files are never modified. Pipeline, re-run steps, and file layout: [`bin/REDACTION.md`](bin/REDACTION.md).
 
 ---
 

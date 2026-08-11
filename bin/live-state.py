@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live-state probe across Claude, Codex, and remote-host autobuild agents.
+"""Live-state probe across Claude, Codex, and remote autobuild agents.
 
 The "live state" half of the two-layer architecture (see bin/ARCHITECTURE.md).
 Snapshot only — for historical attribution, see scan_tokens_core.py.
@@ -8,7 +8,7 @@ Reads (in this preference order):
   - ~/.claude/token-scan-summary.json  → engine-derived Codex rate_limit (auth)
   - ~/.claude/account-resets.json      → Claude 5h/7d utilization per account
   - ~/.codex/state_N.sqlite (highest)  → Codex token-count fallback when no engine summary
-  - ~/.agent-runner/sessions.jsonl        → remote-host agent session activity
+  - $AGENT_SESSIONS_PATH               → remote agent session activity (opt-in)
 
 Modes:
   default    KEY=VALUE pairs, one per line, for `eval $(...)` in bash
@@ -49,7 +49,9 @@ def resolve_state_db(codex_home: Path) -> Path:
 
 
 CODEX_STATE = resolve_state_db(HOME / ".codex")
-AGENT_SESSIONS = HOME / ".agent-runner" / "sessions.jsonl"
+# Opt-in: point at a remote agent runner's session log to get the agents row.
+_agent_sessions = os.environ.get("AGENT_SESSIONS_PATH", "").strip()
+AGENT_SESSIONS = Path(_agent_sessions).expanduser() if _agent_sessions else None
 
 WINDOW_5H_SECS = 5 * 60 * 60
 
@@ -182,8 +184,8 @@ def collect() -> dict:
             pass
     if codex_state is not None:
         state["codex"] = codex_state
-    # remote-host
-    if AGENT_SESSIONS.is_file():
+    # Remote agents
+    if AGENT_SESSIONS is not None and AGENT_SESSIONS.is_file():
         try:
             size = AGENT_SESSIONS.stat().st_size
             with AGENT_SESSIONS.open("rb") as f:
@@ -204,7 +206,7 @@ def collect() -> dict:
                 if agent:
                     latest[agent] = ev
             if latest:
-                state["remote-host"] = {
+                state["agents"] = {
                     agent: {
                         "session": ev.get("session_num"),
                         "event": ev.get("event"),
@@ -243,8 +245,8 @@ def render_kv(state: dict) -> None:
         emit("codex_5h_tokens", c.get("tokens_5h"))
         if c.get("last_active_epoch"):
             emit("codex_last_active_epoch", c["last_active_epoch"])
-    if "remote-host" in state:
-        for agent, ev in state["remote-host"].items():
+    if "agents" in state:
+        for agent, ev in state["agents"].items():
             prefix = f"agent_{agent}"
             emit(f"{prefix}_session", ev.get("session"))
             emit(f"{prefix}_event", ev.get("event"))
@@ -286,18 +288,18 @@ def render_line(state: dict) -> str:
             parts.append(
                 f"codex 5h: {c.get('threads_5h', 0)}t / {fmt_tokens(int(c.get('tokens_5h', 0)))}"
             )
-    if "remote-host" in state:
+    if "agents" in state:
         agents_in_order = ["build", "strategist", "hardware", "infra"]
         agent_parts: list[str] = []
         for a in agents_in_order:
-            ev = state["remote-host"].get(a)
+            ev = state["agents"].get(a)
             if not ev or ev.get("session") is None:
                 continue
             marker = "•" if ev.get("event") == "start" else " "
             short = {"build": "b", "strategist": "s", "hardware": "hw", "infra": "i"}[a]
             agent_parts.append(f"{marker}{short}#{ev['session']}")
         if agent_parts:
-            parts.append("remote-host: " + " ".join(agent_parts))
+            parts.append("agents: " + " ".join(agent_parts))
     return "  ·  ".join(parts)
 
 

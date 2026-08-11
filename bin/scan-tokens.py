@@ -11,7 +11,7 @@ and writes:
 For streaming updates during active Claude sessions, use scan-tokens-daemon.py
 (wired up by scan-tokens-watch.sh). This script remains the canonical source
 of truth for periodic rebuilds (cron, launchd StartInterval, manual sanity
-checks) and post-import consumers like scan-tokens-export.py and derive-cap.py.
+checks) and post-import consumers like derive-cap.py.
 
 Output format is stable: both the daemon and this script emit the same
 schemas for cache and summary JSON.
