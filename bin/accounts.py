@@ -45,6 +45,11 @@ LOCK_PATH = HOME / ".claude" / "accounts.lock"
 RESETS_PATH = HOME / ".claude" / "account-resets.json"
 SESSION_LIMITS_PATH = HOME / ".accounts" / "session-limits.json"
 NATIVE_REFRESH_LOCK_PATH = HOME / ".accounts" / "native-refresh.lock"
+CONFIRM_POLL_LOCK_PATH = HOME / ".accounts" / "confirm-poll.lock"
+# Short: a live session is waiting on this request.
+CONFIRM_POLL_TIMEOUT_S = 2.5
+# The lock file's own mtime is the clock — one file, no extra state to reconcile.
+CONFIRM_POLL_COOLDOWN_S = 60.0
 CONF_PATH = HOME / ".claude" / "statusline.conf"
 MIRROR_LOG = HOME / ".claude" / "accounts-mirror.log"
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
@@ -1808,7 +1813,108 @@ def _route_preferences() -> tuple[dict, str | None, bool]:
     return mode, None, False
 
 
+def confirm_stale_candidate(
+    *,
+    excludes: set[str],
+    require_fable: bool,
+) -> bool:
+    """Resolve ONE stale row against the API. True when the board changed.
+
+    Selection rejects a stale row because its old percentage strands sessions on
+    spent accounts (see effective_pcts). When that leaves no candidate at all,
+    the caller is stuck on an account it should be leaving, and one request
+    turns the blocking unknown into a fact. Deliberately outside locked(): that
+    flock blocks, so holding it across a request queues every other supervisor.
+    """
+    try:
+        blobs = load_blobs()
+        candidates = rank_profile_rows(
+            [
+                row
+                for row in route_rows(blobs, None, time.time())
+                if row.get("stale")
+                and not row["expired"]
+                and row["label"] not in excludes
+            ],
+            require_fable=require_fable,
+        )
+        if not candidates:
+            return False
+        CONFIRM_POLL_LOCK_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fresh_lock = not CONFIRM_POLL_LOCK_PATH.exists()
+        with open(CONFIRM_POLL_LOCK_PATH, "a+") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            if not fresh_lock:
+                age = time.time() - os.fstat(handle.fileno()).st_mtime
+                if age < CONFIRM_POLL_COOLDOWN_S:
+                    return False
+            os.utime(CONFIRM_POLL_LOCK_PATH, None)
+            label = candidates[0]["label"]
+            entry = (blobs.get("accounts") or {}).get(label) or {}
+            now = int(time.time())
+            blob = profile_live_blob(label) or entry.get("blob", "")
+            expiry = blob_access_expiry(blob)
+            if expiry is not None and now >= expiry:
+                return False
+            token = blob_access_token(blob)
+            if not token:
+                return False
+            usage = fetch_usage(token, timeout=CONFIRM_POLL_TIMEOUT_S)
+            if usage is None:
+                return False
+            merge_reset_rows(
+                {
+                    f"{entry.get('email')}|{entry.get('org_uuid')}": usage_to_reset_row(
+                        entry.get("email"),
+                        entry.get("org_uuid"),
+                        usage,
+                        now,
+                    )
+                }
+            )
+            return True
+    except Exception:
+        return False
+
+
 def select_profile(
+    *,
+    avoid_labels: set[str] | None = None,
+    require_fable: bool = False,
+    prefer_fable: bool | None = None,
+    lease_pid: int | None = None,
+    force_label: str | None = None,
+) -> dict | None:
+    """Pick a routable profile, confirming a stale candidate if nothing else
+    qualifies. The first pass is network-free; the retry only happens when
+    staleness alone is what left no candidate."""
+    picked = _select_profile_once(
+        avoid_labels=avoid_labels,
+        require_fable=require_fable,
+        prefer_fable=prefer_fable,
+        lease_pid=lease_pid,
+        force_label=force_label,
+    )
+    if picked is not None or force_label is not None:
+        return picked
+    if not confirm_stale_candidate(
+        excludes=excluded_labels() | (avoid_labels or set()),
+        require_fable=require_fable,
+    ):
+        return None
+    return _select_profile_once(
+        avoid_labels=avoid_labels,
+        require_fable=require_fable,
+        prefer_fable=prefer_fable,
+        lease_pid=lease_pid,
+        force_label=force_label,
+    )
+
+
+def _select_profile_once(
     *,
     avoid_labels: set[str] | None = None,
     require_fable: bool = False,

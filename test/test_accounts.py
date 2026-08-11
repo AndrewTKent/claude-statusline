@@ -21,6 +21,13 @@ import accounts  # noqa: E402
 
 NOW = datetime(2026, 7, 16, 20, 0, 0, tzinfo=timezone.utc)
 
+# What the API returns for an account that turned out to be idle after all.
+USAGE_OK = {
+    "five_hour": {"utilization": 0, "resets_at": "2026-08-12T00:00:00Z"},
+    "seven_day": {"utilization": 5, "resets_at": "2026-08-18T00:00:00Z"},
+    "limits": [],
+}
+
 PAIRS = [
     ("acme-max", "jane.doe@acme.ai", "e1c8"),
     ("acme-work", "jane.doe@acme.ai", "52ae"),
@@ -767,6 +774,153 @@ class TestHandoffTarget:
             "current",
             require_fable=False,
         ) == "other"
+
+
+class TestConfirmStaleCandidate:
+    """One request resolves the stale row that left selection with no candidate."""
+
+    def _wire(self, monkeypatch, tmp_path, rows, *, usage=USAGE_OK):
+        monkeypatch.setattr(
+            accounts, "CONFIRM_POLL_LOCK_PATH", tmp_path / "confirm-poll.lock"
+        )
+        monkeypatch.setattr(
+            accounts,
+            "load_blobs",
+            lambda: {
+                "accounts": {
+                    row["label"]: {
+                        "blob": "blob",
+                        "email": f"{row['label']}@x",
+                        "org_uuid": f"org-{row['label']}",
+                    }
+                    for row in rows
+                }
+            },
+        )
+        monkeypatch.setattr(accounts, "route_rows", lambda *_args: rows)
+        monkeypatch.setattr(accounts, "profile_live_blob", lambda _label: "blob")
+        monkeypatch.setattr(accounts, "blob_access_expiry", lambda _blob: None)
+        monkeypatch.setattr(accounts, "blob_access_token", lambda _blob: "token")
+        merged = {}
+        monkeypatch.setattr(accounts, "merge_reset_rows", merged.update)
+        calls = []
+        monkeypatch.setattr(
+            accounts,
+            "fetch_usage",
+            lambda _token, timeout=None: (calls.append(timeout), usage)[1],
+        )
+        return calls, merged
+
+    def test_confirms_the_stale_row_and_writes_the_board(self, monkeypatch, tmp_path):
+        calls, merged = self._wire(
+            monkeypatch, tmp_path, [accounts_row("idle", 99.0, stale=True)]
+        )
+
+        assert accounts.confirm_stale_candidate(excludes=set(), require_fable=False)
+        assert len(calls) == 1
+        assert merged
+
+    def test_spends_no_request_when_nothing_is_stale(self, monkeypatch, tmp_path):
+        calls, _ = self._wire(
+            monkeypatch, tmp_path, [accounts_row("fresh", 10.0)]
+        )
+
+        assert not accounts.confirm_stale_candidate(excludes=set(), require_fable=False)
+        assert calls == []
+
+    def test_skips_a_stale_row_the_caller_excluded(self, monkeypatch, tmp_path):
+        calls, _ = self._wire(
+            monkeypatch, tmp_path, [accounts_row("idle", 99.0, stale=True)]
+        )
+
+        assert not accounts.confirm_stale_candidate(
+            excludes={"idle"}, require_fable=False
+        )
+        assert calls == []
+
+    def test_cooldown_blocks_a_second_confirm(self, monkeypatch, tmp_path):
+        calls, _ = self._wire(
+            monkeypatch, tmp_path, [accounts_row("idle", 99.0, stale=True)]
+        )
+
+        assert accounts.confirm_stale_candidate(excludes=set(), require_fable=False)
+        assert not accounts.confirm_stale_candidate(excludes=set(), require_fable=False)
+        assert len(calls) == 1
+
+    def test_another_holder_of_the_lock_is_not_waited_on(self, monkeypatch, tmp_path):
+        calls, _ = self._wire(
+            monkeypatch, tmp_path, [accounts_row("idle", 99.0, stale=True)]
+        )
+        lock = tmp_path / "confirm-poll.lock"
+        lock.touch()
+        with open(lock, "a+") as held:
+            accounts.fcntl.flock(held, accounts.fcntl.LOCK_EX | accounts.fcntl.LOCK_NB)
+
+            assert not accounts.confirm_stale_candidate(
+                excludes=set(), require_fable=False
+            )
+            assert calls == []
+
+    def test_a_failed_request_changes_nothing(self, monkeypatch, tmp_path):
+        _, merged = self._wire(
+            monkeypatch,
+            tmp_path,
+            [accounts_row("idle", 99.0, stale=True)],
+            usage=None,
+        )
+
+        assert not accounts.confirm_stale_candidate(excludes=set(), require_fable=False)
+        assert merged == {}
+
+    def test_the_request_carries_a_short_timeout(self, monkeypatch, tmp_path):
+        calls, _ = self._wire(
+            monkeypatch, tmp_path, [accounts_row("idle", 99.0, stale=True)]
+        )
+
+        accounts.confirm_stale_candidate(excludes=set(), require_fable=False)
+
+        assert calls == [accounts.CONFIRM_POLL_TIMEOUT_S]
+
+
+class TestSelectProfileRetriesAfterConfirm:
+    def _wire(self, monkeypatch, results):
+        seen = iter(results)
+        monkeypatch.setattr(
+            accounts, "_select_profile_once", lambda **_kwargs: next(seen)
+        )
+        confirms = []
+        monkeypatch.setattr(
+            accounts,
+            "confirm_stale_candidate",
+            lambda **kwargs: (confirms.append(kwargs), True)[1],
+        )
+        monkeypatch.setattr(accounts, "excluded_labels", set)
+        return confirms
+
+    def test_first_pass_success_never_touches_the_network(self, monkeypatch):
+        confirms = self._wire(monkeypatch, [{"label": "fresh"}])
+
+        assert accounts.select_profile()["label"] == "fresh"
+        assert confirms == []
+
+    def test_retries_once_after_a_confirm(self, monkeypatch):
+        confirms = self._wire(monkeypatch, [None, {"label": "idle"}])
+
+        assert accounts.select_profile()["label"] == "idle"
+        assert len(confirms) == 1
+
+    def test_a_forced_label_is_authoritative_and_skips_the_confirm(self, monkeypatch):
+        confirms = self._wire(monkeypatch, [None])
+
+        assert accounts.select_profile(force_label="pinned") is None
+        assert confirms == []
+
+    def test_avoided_labels_are_not_confirmed(self, monkeypatch):
+        confirms = self._wire(monkeypatch, [None, {"label": "other"}])
+
+        accounts.select_profile(avoid_labels={"spent"})
+
+        assert confirms[0]["excludes"] == {"spent"}
 
 
 class TestMergeTokenVaults:
