@@ -1286,7 +1286,10 @@ def test_running_supervisor_retries_an_unavailable_human_route(
     ] == ["current", "target"]
 
 
-def test_fable_mode_launches_directly_on_fable(monkeypatch):
+def test_fable_mode_launches_directly_on_fable(monkeypatch, tmp_path):
+    # A real ~/.claude/settings.json naming a fable model would hide the
+    # --model injection this test asserts on.
+    monkeypatch.setenv("HOME", str(tmp_path))
     selected = {
         "profile": "/profiles/fable",
         "label": "fable",
@@ -1566,7 +1569,13 @@ def test_statusline_labels_an_ultracode_session(tmp_path):
     fixture = json.loads((REPO / "test" / "fixtures" / "input.json").read_text())
     fixture["workspace"]["current_dir"] = str(project)
     fixture["effort"] = {"level": "xhigh"}
-    env = os.environ.copy()
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        # A supervised session injects ACCOUNTS_*/CLAUDE_* vars that change
+        # what the statusline renders; the test env must not inherit them.
+        if not key.startswith(("ACCOUNTS_", "CLAUDE_", "STATUSLINE_", "FORMAT"))
+    }
     env.update(
         {
             "HOME": str(home),
@@ -2218,7 +2227,8 @@ def test_fable_mode_honors_an_explicit_opus_launch(monkeypatch):
     assert selections[0].get("require_fable") is False
 
 
-def test_fable_mode_keeps_a_live_opus_switch(monkeypatch):
+def test_fable_mode_keeps_a_live_opus_switch(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
     session_id = str(uuid.uuid4())
     selections = []
     launches = []
