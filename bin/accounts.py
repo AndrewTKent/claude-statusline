@@ -2100,7 +2100,16 @@ def handoff_target(
                 require_fable=True,
             )
         ):
-            return None
+            if (
+                binding_pct(current["five_hour"], current["seven_day"])
+                < DEPART_PCT
+            ):
+                return None
+            # Leaving a rate wall, not a fable ceiling: fable ranking ignores
+            # the rate axes, so the move must buy rate runway to be worth it —
+            # and the walled row often ranks first, so it must not pick itself.
+            margin_pct = max(margin_pct, HANDOFF_MARGIN_PCT)
+            excludes = excludes | {current_label}
         target = pick_profile_route(
             rows,
             excludes,
