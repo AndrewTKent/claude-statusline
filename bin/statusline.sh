@@ -2746,9 +2746,11 @@ render_iterm2() {
 }
 
 # ── Notification Center alerts ─────────────────────────────
-# Fires macOS notifications at key thresholds with once-per-event dedup.
+# Opt-in via STATUSLINE_NOTIFY=1 — the router now leaves accounts before they
+# wall, so per-render threshold banners are noise by default.
 # Thresholds: rate limit 80/90/95%, context 80/95%, budget 90/100%
 notify_check() {
+    [ "${STATUSLINE_NOTIFY:-0}" = "1" ] || return 0
     command -v osascript >/dev/null 2>&1 || return
     local state_file="/tmp/claude/statusline-notif-state.json"
     [ ! -f "$state_file" ] && echo '{}' > "$state_file"
