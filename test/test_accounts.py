@@ -1123,6 +1123,122 @@ class TestConfirmStaleCandidate:
 
         assert calls == [accounts.CONFIRM_POLL_TIMEOUT_S]
 
+    def test_refreshes_an_expired_candidate_before_polling(self, monkeypatch, tmp_path):
+        calls, _ = self._wire(
+            monkeypatch, tmp_path, [accounts_row("idle", 10.0, stale=True)]
+        )
+        live = {"blob": "expired"}
+        refreshed = []
+
+        def refresh(labels=None):
+            refreshed.append(labels)
+            live["blob"] = "fresh"
+            return 1
+
+        monkeypatch.setattr(accounts, "profile_live_blob", lambda _label: live["blob"])
+        monkeypatch.setattr(
+            accounts,
+            "blob_access_expiry",
+            lambda blob: 1 if blob == "expired" else None,
+        )
+        monkeypatch.setattr(
+            accounts,
+            "blob_access_token",
+            lambda blob: "fresh-token" if blob == "fresh" else None,
+        )
+        monkeypatch.setattr(
+            accounts,
+            "fetch_profile",
+            lambda token: (
+                {
+                    "account": {"email": "idle@x"},
+                    "organization": {"uuid": "org-idle"},
+                }
+                if token == "fresh-token"
+                else None
+            ),
+        )
+        monkeypatch.setattr(
+            accounts,
+            "refresh_dormant_profiles",
+            refresh,
+        )
+
+        assert accounts.confirm_stale_candidate(excludes=set(), require_fable=False)
+        assert refreshed == [{"idle"}]
+        assert len(calls) == 1
+
+    def test_stops_if_the_candidate_disappears_during_refresh(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        calls, merged = self._wire(
+            monkeypatch, tmp_path, [accounts_row("idle", 10.0, stale=True)]
+        )
+        blob_sets = iter(
+            [
+                {
+                    "accounts": {
+                        "idle": {
+                            "blob": "expired",
+                            "email": "idle@x",
+                            "org_uuid": "org-idle",
+                        }
+                    }
+                },
+                {"accounts": {}},
+            ]
+        )
+        live_blobs = iter(["expired", "fresh"])
+        monkeypatch.setattr(accounts, "load_blobs", lambda: next(blob_sets))
+        monkeypatch.setattr(accounts, "profile_live_blob", lambda _label: next(live_blobs))
+        monkeypatch.setattr(
+            accounts,
+            "blob_access_expiry",
+            lambda blob: 1 if blob == "expired" else None,
+        )
+        monkeypatch.setattr(accounts, "refresh_dormant_profiles", lambda _labels: 1)
+
+        assert not accounts.confirm_stale_candidate(excludes=set(), require_fable=False)
+        assert calls == []
+        assert merged == {}
+
+    def test_stops_if_the_refreshed_candidate_changed_identity(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        calls, merged = self._wire(
+            monkeypatch, tmp_path, [accounts_row("idle", 10.0, stale=True)]
+        )
+        live = {"blob": "expired"}
+
+        def refresh(_labels):
+            live["blob"] = "fresh"
+            return 1
+
+        monkeypatch.setattr(accounts, "profile_live_blob", lambda _label: live["blob"])
+        monkeypatch.setattr(
+            accounts,
+            "blob_access_expiry",
+            lambda blob: 1 if blob == "expired" else None,
+        )
+        monkeypatch.setattr(accounts, "blob_access_token", lambda _blob: "wrong-token")
+        monkeypatch.setattr(
+            accounts,
+            "fetch_profile",
+            lambda _token: {
+                "account": {"email": "other@x"},
+                "organization": {"uuid": "org-other"},
+            },
+        )
+        monkeypatch.setattr(accounts, "refresh_dormant_profiles", refresh)
+
+        assert not accounts.confirm_stale_candidate(excludes=set(), require_fable=False)
+        assert calls == []
+        assert merged == {}
+
 
 class TestSelectProfileRetriesAfterConfirm:
     def _wire(self, monkeypatch, results):
@@ -1339,6 +1455,14 @@ class TestRefreshDormantProfiles:
         monkeypatch.setattr(accounts, "refresh_blob_access", lambda blob: new)
         monkeypatch.setattr(
             accounts,
+            "fetch_profile",
+            lambda _token: {
+                "account": {"email": "g@x"},
+                "organization": {"uuid": "o1"},
+            },
+        )
+        monkeypatch.setattr(
+            accounts,
             "write_profile_credentials",
             lambda label, blob: writes.append((label, blob)),
         )
@@ -1348,6 +1472,41 @@ class TestRefreshDormantProfiles:
         assert accounts.refresh_dormant_profiles() == 1
         assert blobs["accounts"]["gmail"]["blob"] == new
         assert writes == [("gmail", new)]
+
+    def test_rejects_a_refreshed_profile_with_the_wrong_identity(self, monkeypatch):
+        old = self._expired_access_blob("old")
+        new = _live_blob("new")
+        blobs = {
+            "accounts": {
+                "gmail": {"blob": old, "email": "g@x", "org_uuid": "o1"}
+            }
+        }
+        monkeypatch.setattr(accounts.time, "time", lambda: 2_000.0)
+        monkeypatch.setattr(accounts, "load_session_leases", list)
+        monkeypatch.setattr(accounts, "excluded_labels", set)
+        monkeypatch.setattr(accounts, "profile_live_blob", lambda _label: old)
+        monkeypatch.setattr(accounts, "kc_read", lambda *_args: None)
+        monkeypatch.setattr(accounts, "refresh_blob_access", lambda _blob: new)
+        monkeypatch.setattr(
+            accounts,
+            "fetch_profile",
+            lambda _token: {
+                "account": {"email": "other@x"},
+                "organization": {"uuid": "org-other"},
+            },
+        )
+        monkeypatch.setattr(
+            accounts,
+            "write_profile_credentials",
+            lambda *_args: pytest.fail("persisted a mismatched credential"),
+        )
+        monkeypatch.setattr(accounts, "load_blobs", lambda: blobs)
+        saved = []
+        monkeypatch.setattr(accounts, "save_blobs", saved.append)
+
+        assert accounts.refresh_dormant_profiles() == 0
+        assert blobs["accounts"]["gmail"]["blob"] == old
+        assert saved == []
 
     def test_refreshes_dormant_keychain_profiles_inside_native_claude(
         self,
@@ -1447,6 +1606,11 @@ class TestRefreshDormantProfiles:
             return Process()
 
         monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "must-not-leak")
+        monkeypatch.setattr(
+            accounts,
+            "NATIVE_REFRESH_LOCK_PATH",
+            tmp_path / "native-refresh.lock",
+        )
         monkeypatch.setattr(
             accounts,
             "native_claude_binary",
@@ -1552,6 +1716,14 @@ class TestRefreshDormantProfiles:
             accounts,
             "refresh_blob_access",
             lambda _blob: _live_blob("new"),
+        )
+        monkeypatch.setattr(
+            accounts,
+            "fetch_profile",
+            lambda _token: {
+                "account": {"email": "w@x"},
+                "organization": {"uuid": "o1"},
+            },
         )
         monkeypatch.setattr(accounts, "write_profile_credentials", lambda *_args: None)
         monkeypatch.setattr(
@@ -1755,6 +1927,14 @@ class TestPollBlobsUsage:
         monkeypatch.setattr(accounts, "profile_live_blob", lambda _label: live)
         monkeypatch.setattr(
             accounts,
+            "fetch_profile",
+            lambda _token: {
+                "account": {"email": "work@example.com"},
+                "organization": {"uuid": "org-work"},
+            },
+        )
+        monkeypatch.setattr(
+            accounts,
             "fetch_usage",
             lambda token: {"five_hour": {"utilization": 12}}
             if token == "live"
@@ -1775,6 +1955,39 @@ class TestPollBlobsUsage:
                 }
             }
         ]
+
+    def test_skips_a_live_profile_with_the_wrong_identity(self, monkeypatch):
+        stored = _live_blob("stored")
+        live = _live_blob("wrong")
+        blobs = {
+            "accounts": {
+                "work": {
+                    "blob": stored,
+                    "email": "work@example.com",
+                    "org_uuid": "org-work",
+                }
+            }
+        }
+        monkeypatch.setattr(accounts.time, "time", lambda: 2_000.0)
+        monkeypatch.setattr(accounts, "profile_live_blob", lambda _label: live)
+        monkeypatch.setattr(
+            accounts,
+            "fetch_profile",
+            lambda _token: {
+                "account": {"email": "other@example.com"},
+                "organization": {"uuid": "org-other"},
+            },
+        )
+        monkeypatch.setattr(
+            accounts,
+            "fetch_usage",
+            lambda _token: pytest.fail("polled a mismatched credential"),
+        )
+        merged = {}
+        monkeypatch.setattr(accounts, "merge_reset_rows", merged.update)
+
+        assert accounts.poll_blobs_usage(blobs) == 0
+        assert merged == {}
 
 
 def _live_blob(atok, future_ms=3_000_000_000_000):
@@ -2003,6 +2216,35 @@ class TestCmdSet:
         }
         assert (accounts.PROFILES_PATH / "B" / ".credentials.json").read_text() == live
         assert not accounts.CRED_FILE.exists()
+
+
+class TestCmdRoutingMode:
+    @pytest.mark.parametrize(
+        ("command", "mode"),
+        [(accounts.cmd_auto, "auto"), (accounts.cmd_fable, "fable")],
+    )
+    def test_explicit_mode_wins_over_a_login_pin_during_sync(
+        self,
+        tmp_path,
+        monkeypatch,
+        command,
+        mode,
+    ):
+        monkeypatch.setattr(accounts, "MODE_PATH", tmp_path / "mode.json")
+        monkeypatch.setattr(accounts, "load_blobs", lambda: {"accounts": {}})
+
+        def sync(_blobs, *, persist):
+            assert not persist
+            accounts.save_mode("set", "target")
+            return set()
+
+        monkeypatch.setattr(accounts, "sync_profile_credentials", sync)
+        monkeypatch.setattr(accounts, "route_rows", lambda *_args: [])
+        monkeypatch.setattr(accounts, "excluded_labels", set)
+
+        command(types.SimpleNamespace())
+
+        assert accounts.load_mode() == {"mode": mode, "label": None}
 
 
 class TestCmdStatus:
@@ -2280,7 +2522,17 @@ class TestNativeProfiles:
         assert (profile / ".credentials.json").read_text() == old
         assert "repaired gmail profile login" in capsys.readouterr().err
 
-    def test_known_profile_login_moves_the_global_pin(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize(
+        ("initial_mode", "initial_label"),
+        [("auto", None), ("set", "current")],
+    )
+    def test_known_profile_login_pins_the_target(
+        self,
+        tmp_path,
+        monkeypatch,
+        initial_mode,
+        initial_label,
+    ):
         self._paths(tmp_path, monkeypatch)
         monkeypatch.setattr(accounts, "MODE_PATH", tmp_path / "mode.json")
         current_blob = _live_blob("current")
@@ -2322,12 +2574,157 @@ class TestNativeProfiles:
             "load_label_pairs",
             lambda: [("target", "target@example.com", "target-org")],
         )
-        accounts.save_mode("set", "current")
+        accounts.save_mode(initial_mode, initial_label)
 
         assert accounts.sync_profile_credentials(blobs, persist=False) == set()
         assert accounts.load_mode() == {"mode": "set", "label": "target"}
         assert (current_profile / ".credentials.json").read_text() == current_blob
         assert (target_profile / ".credentials.json").read_text() == target_blob
+
+    def test_known_fallback_profile_login_preserves_pane_scope(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        self._paths(tmp_path, monkeypatch)
+        monkeypatch.setattr(accounts, "LOCK_PATH", tmp_path / "accounts.lock")
+        monkeypatch.setattr(accounts, "MODE_PATH", tmp_path / "mode.json")
+        monkeypatch.setattr(accounts, "PANE_PINS_PATH", tmp_path / "pane-pins")
+        monkeypatch.setattr(accounts, "PANE_SALT_PATH", tmp_path / "pane-salt")
+        monkeypatch.setattr(accounts, "_lock_depth", 0)
+        monkeypatch.setattr(accounts, "pane_key", lambda env=None: "a" * 64)
+        monkeypatch.setattr(
+            accounts,
+            "load_label_pairs",
+            lambda: [("current", "current@example.com", "current-org")],
+        )
+        current_blob = _live_blob("current")
+        login_blob = _live_blob("login")
+        target_blob = _live_blob("target")
+        current_profile = accounts.ensure_native_profile("current", {"blob": current_blob})
+        accounts.ensure_native_profile("target", {"blob": target_blob})
+        accounts._write_0600(current_profile / ".credentials.json", login_blob)
+        blobs = {
+            "accounts": {
+                "current": {
+                    "blob": current_blob,
+                    "email": "current@example.com",
+                    "org_uuid": "current-org",
+                },
+                "target": {
+                    "blob": target_blob,
+                    "email": "target@example.com",
+                    "org_uuid": "target-org",
+                },
+            }
+        }
+        monkeypatch.setattr(
+            accounts,
+            "fetch_profile",
+            lambda _token: {
+                "account": {"email": "target@example.com"},
+                "organization": {"uuid": "target-org"},
+            },
+        )
+        accounts.save_mode("auto", None)
+        accounts.save_pane_pin("current")
+        generation = json.loads(accounts.MODE_PATH.read_text())["global_generation"]
+        accounts._write_0600(
+            accounts.PANE_PINS_PATH / f'{"b" * 64}.json',
+            json.dumps(
+                {
+                    "version": 1,
+                    "label": "current",
+                    "base_global_generation": generation,
+                }
+            ),
+        )
+
+        assert accounts.sync_profile_credentials(blobs, persist=False) == set()
+
+        assert accounts.load_mode() == {
+            "mode": "set",
+            "label": "target",
+            "policy_scope": "pane",
+        }
+        assert json.loads(accounts.MODE_PATH.read_text())["mode"] == "auto"
+        other_pin = json.loads(
+            (accounts.PANE_PINS_PATH / f'{"b" * 64}.json').read_text()
+        )
+        assert other_pin["label"] == "current"
+
+    def test_known_profile_login_revives_and_pins_an_expired_target(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        self._paths(tmp_path, monkeypatch)
+        monkeypatch.setattr(accounts, "MODE_PATH", tmp_path / "mode.json")
+        monkeypatch.setattr(accounts, "BLOBS_PATH", tmp_path / "blobs.json")
+        current_blob = _live_blob("current")
+        login_blob = _live_blob("login")
+        expired_target = _live_blob("target", future_ms=1_000_000_000_000)
+        current_profile = accounts.ensure_native_profile(
+            "current",
+            {"blob": current_blob},
+        )
+        target_profile = accounts.ensure_native_profile(
+            "target",
+            {"blob": expired_target},
+        )
+        accounts._write_0600(current_profile / ".credentials.json", login_blob)
+        blobs = {
+            "accounts": {
+                "current": {
+                    "blob": current_blob,
+                    "email": "current@example.com",
+                    "org_uuid": "current-org",
+                },
+                "target": {
+                    "blob": expired_target,
+                    "email": "target@example.com",
+                    "org_uuid": "target-org",
+                    "auth_dead_at": 1,
+                },
+            }
+        }
+        target_service = accounts.profile_keychain_service("target")
+        deleted = []
+        monkeypatch.setattr(
+            accounts,
+            "kc_read",
+            lambda service, account=None: (
+                expired_target if service == target_service and not deleted else None
+            ),
+        )
+        monkeypatch.setattr(
+            accounts,
+            "kc_delete",
+            lambda service: deleted.append(service) or True,
+        )
+        monkeypatch.setattr(
+            accounts,
+            "fetch_profile",
+            lambda _token: {
+                "account": {"email": "target@example.com"},
+                "organization": {"uuid": "target-org"},
+            },
+        )
+        monkeypatch.setattr(
+            accounts,
+            "load_label_pairs",
+            lambda: [("target", "target@example.com", "target-org")],
+        )
+        accounts.save_mode("auto", None)
+
+        assert accounts.sync_profile_credentials(blobs, persist=False) == set()
+        assert accounts.load_mode() == {"mode": "set", "label": "target"}
+        assert deleted == [target_service]
+        assert blobs["accounts"]["target"]["blob"] == login_blob
+        assert "auth_dead_at" not in blobs["accounts"]["target"]
+        assert accounts.load_blobs()["accounts"]["target"]["blob"] == login_blob
+        assert (current_profile / ".credentials.json").read_text() == current_blob
+        assert (target_profile / ".credentials.json").read_text() == login_blob
 
     def test_removes_only_the_mismatched_profile_keychain_item(
         self,

@@ -276,7 +276,7 @@ When enabled they fire once per threshold, deduped:
 
 ### Automatic account detection
 
-When you `/login` inside a routed profile, the status bar detects the credential change before writing its ledgers, refreshes the profile, and updates the rate limits and account label on the next render. Sessions using that same native profile see the refreshed login.
+When you `/login` inside a routed profile, the status bar detects the credential change before writing its ledgers, refreshes the profile, and updates the rate limits and account label on the next render. Sessions using that same native profile see the refreshed login. If the login belongs to another stored account, the router repairs the current profile and pins the logged-in account at the active policy scope: pane-local for a pane pin, otherwise global.
 
 ---
 
@@ -411,7 +411,7 @@ session resumes on another safe account on the next supervisor check after
 | `accounts set <label>` | Force every supervised session onto `<label>` |
 | `accounts pane set <label>` | Pin only the current terminal pane to `<label>` |
 | `accounts pane clear` | Return the current pane to the global policy |
-| `accounts auto` | Route supervised sessions to the freshest account |
+| `accounts auto` | Clear global and pane pins, then route supervised sessions to the freshest account |
 | `accounts fable` | Switch live supervised sessions to Fable while headroom is available |
 | `accounts status` | Mode + per-account 5h/7d/Fable headroom + ⚠login flags |
 | `accounts poll` | Refresh dormant stored/native profiles, then poll every routable account |
