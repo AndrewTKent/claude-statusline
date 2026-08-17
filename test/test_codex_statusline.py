@@ -916,7 +916,14 @@ class CodexStatuslineTest(unittest.TestCase):
                     "model_context_window": 1_000_000,
                     "total_token_usage": {"total_tokens": 123},
                 },
-                "rate_limits": {"plan_type": "pro"},
+                "rate_limits": {
+                    "plan_type": "pro",
+                    "credits": {
+                        "balance": "2500.0000000000",
+                        "has_credits": True,
+                        "unlimited": False,
+                    },
+                },
             },
         }
 
@@ -931,6 +938,14 @@ class CodexStatuslineTest(unittest.TestCase):
         )
         self.assertEqual(state.latest_token["info"]["model_context_window"], 1_000_000)
         self.assertEqual(state.latest_token["rate_limits"]["plan_type"], "pro")
+        self.assertEqual(
+            state.latest_token["rate_limits"]["credits"],
+            {
+                "balance": "2500.0000000000",
+                "has_credits": True,
+                "unlimited": False,
+            },
+        )
 
     def test_rollout_state_rejects_oversized_malformed_record_and_continues(self) -> None:
         codex_statusline.ROLLOUT_STATE_CACHE.clear()
@@ -2600,8 +2615,12 @@ class CodexStatuslineTest(unittest.TestCase):
         )
         limited = codex_statusline.Thread(**{**fresh.__dict__, "id": "limited"})
         rate_limits = {
-            "fresh": {"primary": {}, "secondary": {}},
-            "limited": {"primary": {"used_percent": 100.0, "resets_at": 1783652044}, "secondary": {}},
+            "fresh": {"primary": {}, "secondary": {}, "credits": {}},
+            "limited": {
+                "primary": {},
+                "secondary": {},
+                "credits": {"balance": "2500.0000000000"},
+            },
         }
         totals = codex_statusline.TokenSummary(0, 10, 20, 30, 1, 2)
         connection = mock.MagicMock()
@@ -2625,6 +2644,33 @@ class CodexStatuslineTest(unittest.TestCase):
             data = codex_statusline.all_sessions_snapshot(args)
 
         self.assertEqual(data["rate_limits"], rate_limits["limited"])
+
+    def test_multi_session_renderers_show_credits_below_weekly(self) -> None:
+        data = {
+            "account": "andrew@example.com",
+            "sessions": [],
+            "rate_limits": {
+                "primary": {
+                    "used_percent": 100.0,
+                    "window_minutes": 10_080,
+                },
+                "secondary": {},
+                "credits": {"balance": "2089.4740750000"},
+            },
+        }
+
+        rendered = codex_statusline.render_all_sessions(
+            data, 100, codex_statusline.Palette(False)
+        ).splitlines()
+        weekly_index = next(i for i, line in enumerate(rendered) if "weekly" in line)
+        self.assertEqual(rendered[weekly_index + 1], "        credits 2,089 remaining")
+
+        args = codex_statusline.parse_args(["--top", "--width", "100"])
+        rendered = codex_statusline.render_top(
+            data, args, codex_statusline.Palette(False)
+        ).splitlines()
+        weekly_index = next(i for i, line in enumerate(rendered) if line.startswith("wk "))
+        self.assertEqual(rendered[weekly_index + 1], "credits 2,089 remaining")
 
     def test_select_thread_prefers_root_over_newer_subagent(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2928,6 +2974,7 @@ class CodexStatuslineTest(unittest.TestCase):
             "account": "andrew@example.com",
             "repo": "statusline",
             "branch": "main",
+            "context_window": 0,
             "tokens": {"today": 0, "lifetime": 0},
             "usage": {
                 "context_window": 0,
@@ -2939,6 +2986,11 @@ class CodexStatuslineTest(unittest.TestCase):
                         "resets_at": 1784487602,
                     },
                     "secondary": {},
+                    "credits": {
+                        "balance": "2089.4740750000",
+                        "has_credits": True,
+                        "unlimited": False,
+                    },
                 },
             },
             "activity": {"active_tools": 0, "active_shells": 0},
@@ -2948,6 +3000,64 @@ class CodexStatuslineTest(unittest.TestCase):
 
         self.assertIn("weekly", rendered)
         self.assertNotIn("5-hour", rendered)
+        lines = rendered.splitlines()
+        weekly_index = next(i for i, line in enumerate(lines) if line.startswith("  weekly"))
+        self.assertEqual(lines[weekly_index + 1], "  credits 2,089 remaining")
+
+        data.update(
+            {
+                "idle_seconds": 0,
+                "sandbox": "disabled",
+                "approval_mode": "never",
+            }
+        )
+        data["usage"].update(
+            {
+                "context_used": 0,
+                "turn_total": 0,
+                "turn_cached": 0,
+                "session_output": 0,
+                "session_reasoning": 0,
+            }
+        )
+        data["activity"].update(
+            {
+                "turns_completed": 0,
+                "turns_started": 0,
+                "turns_aborted": 0,
+                "compactions": 0,
+                "tool_calls": 0,
+                "shell_calls": 0,
+                "patch_calls": 0,
+                "last_event": "-",
+                "last_command": "-",
+                "last_user_message": "-",
+                "active_turn_seconds": 0,
+            }
+        )
+        rendered = codex_statusline.render_default(
+            data, 100, codex_statusline.Palette(False)
+        ).splitlines()
+        weekly_index = next(i for i, line in enumerate(rendered) if "weekly" in line)
+        self.assertEqual(rendered[weekly_index + 1], "        credits 2,089 remaining")
+
+        data["usage"]["rate_limits"]["credits"] = {"balance": "0", "has_credits": False}
+        rendered = codex_statusline.render_footer(data, 100, codex_statusline.Palette(False))
+        self.assertIn("  credits 0 remaining", rendered)
+
+    def test_credit_balance_text_handles_unlimited_and_invalid_balances(self) -> None:
+        self.assertEqual(
+            codex_statusline.credit_balance_text({"credits": {"unlimited": True}}),
+            "unlimited",
+        )
+        for balance in (None, "not-a-number", "NaN", "Infinity"):
+            with self.subTest(balance=balance):
+                self.assertEqual(
+                    codex_statusline.credit_balance_text(
+                        {"credits": {"balance": balance}}
+                    ),
+                    "",
+                )
 
     def test_labeled_rate_limits_uses_reported_window(self) -> None:
         cases = (

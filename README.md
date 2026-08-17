@@ -91,9 +91,10 @@ codex-statusline --sandbox read-only --ask-for-approval on-request
 
 `codex-statusline` launches Codex in tmux with a fixed bottom pane matching the
 multi-line Claude Code status view. It shows the current model, elapsed time,
-account, repository, linked pull request, context use, 5-hour and weekly limits, tokens, agents, and
-running tools. It binds each footer to the rollout file opened by its owning Codex
-process, so concurrent and resumed sessions do not exchange context values. Mouse
+account, repository, linked pull request, context use, 5-hour and weekly limits,
+remaining purchased credits, tokens, agents, and running tools. It binds each
+footer to the rollout file opened by its owning Codex process, so concurrent and
+resumed sessions do not exchange context values. Mouse
 wheel scrollback is enabled with a 100,000-line history; tune it with
 `CODEX_STATUSLINE_HISTORY_LIMIT`. Mouse-dragging output selects it in tmux and
 copies it to the system clipboard on release in OSC 52-capable terminals

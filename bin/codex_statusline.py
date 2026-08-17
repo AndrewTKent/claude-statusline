@@ -20,6 +20,7 @@ import sys
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -1095,6 +1096,7 @@ class RolloutEventProjection:
             len(path) == 4
             and path[:3]
             in {
+                ("payload", "rate_limits", "credits"),
                 ("payload", "rate_limits", "primary"),
                 ("payload", "rate_limits", "secondary"),
             }
@@ -1171,6 +1173,7 @@ class RolloutEventProjection:
             len(path) == 4
             and path[:3]
             in {
+                ("payload", "rate_limits", "credits"),
                 ("payload", "rate_limits", "primary"),
                 ("payload", "rate_limits", "secondary"),
             }
@@ -1234,7 +1237,7 @@ class RolloutEventProjection:
             payload["info"] = info
 
         rate_limits: dict[str, Any] = {}
-        for key in ("primary", "secondary"):
+        for key in ("primary", "secondary", "credits"):
             rate_limits[key] = self.nested_values(("payload", "rate_limits", key))
         plan_type = self.values.get(("payload", "rate_limits", "plan_type"))
         if plan_type is not None:
@@ -1941,7 +1944,7 @@ def compact_rollout_event(item: dict[str, Any]) -> dict[str, Any] | None:
                 }
             rate_limits = payload.get("rate_limits") if isinstance(payload.get("rate_limits"), dict) else {}
             compact_limits: dict[str, Any] = {}
-            for limit_key in ("primary", "secondary"):
+            for limit_key in ("primary", "secondary", "credits"):
                 limit = rate_limits.get(limit_key) if isinstance(rate_limits.get(limit_key), dict) else {}
                 compact_limits[limit_key] = {
                     key: value
@@ -3188,6 +3191,21 @@ def labeled_rate_limits(rate_limits: dict[str, Any]) -> list[tuple[str, dict[str
     return limits
 
 
+def credit_balance_text(rate_limits: dict[str, Any]) -> str:
+    credits = rate_limits.get("credits")
+    if not isinstance(credits, dict):
+        return ""
+    if credits.get("unlimited") is True:
+        return "unlimited"
+    try:
+        balance = Decimal(str(credits.get("balance")))
+    except (InvalidOperation, ValueError):
+        return ""
+    if not balance.is_finite():
+        return ""
+    return format(balance, ",.0f")
+
+
 def snapshot_for_thread(
     thread: Thread,
     tokens: TokenSummary,
@@ -3353,7 +3371,10 @@ def all_sessions_snapshot(args: argparse.Namespace) -> dict[str, Any]:
         newest_rate_limits: dict[str, Any] = {}
         for session in sessions:
             rate_limits = session["usage"].get("rate_limits") or {}
-            if rate_limits.get("primary") or rate_limits.get("secondary"):
+            if any(
+                rate_limits.get(key)
+                for key in ("primary", "secondary", "credits")
+            ):
                 newest_rate_limits = rate_limits
                 break
 
@@ -3396,6 +3417,8 @@ def render_default(data: dict[str, Any], width: int, p: Palette) -> str:
 
     for label, limit in labeled_rate_limits(rate_limits):
         lines.append(render_rate_limit_row(label, limit, DEFAULT_BAR_WIDTH, p))
+    if credits := credit_balance_text(rate_limits):
+        lines.append(f"        credits {credits} remaining")
 
     lines.extend(
         [
@@ -3519,6 +3542,8 @@ def render_footer(data: dict[str, Any], width: int, p: Palette) -> str:
                     solid(color_for_pct(limit_pct, p)),
                 )
             )
+    if credits := credit_balance_text(rate_limits):
+        lines.append(row("credits", f"{credits} remaining"))
 
     lines.extend(
         [
@@ -3595,6 +3620,8 @@ def render_all_sessions(data: dict[str, Any], width: int, p: Palette, details: b
     ]
     for label, limit in labeled_rate_limits(rate_limits):
         lines.append(render_rate_limit_row(label, limit, DEFAULT_BAR_WIDTH, p))
+    if credits := credit_balance_text(rate_limits):
+        lines.append(f"        credits {credits} remaining")
     lines.append("        ·")
     lines.append("        # repo             branch         model            context           session    turn    tools state")
 
@@ -3715,6 +3742,8 @@ def render_top(data: dict[str, Any], args: argparse.Namespace, p: Palette) -> st
             f"{short_label} [{build_pct_bar(used_percent, rate_width, p)}] "
             f"{format_pct(used_percent):>6} {limit_reset}"
         )
+    if credits := credit_balance_text(rate_limits):
+        lines.append(f"credits {credits} remaining")
     lines.extend(["─" * min(width, 140), columns])
 
     for session in sessions:
