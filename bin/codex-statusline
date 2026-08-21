@@ -29,11 +29,6 @@ shell_join() {
     printf '%s' "$command"
 }
 
-command -v tmux >/dev/null 2>&1 || {
-    printf 'tmux is required for codex-statusline\n' >&2
-    exit 1
-}
-
 CODEX_BIN="${CODEX_STATUSLINE_CODEX_BIN:-$(command -v codex || true)}"
 if [[ -z "$CODEX_BIN" || ! -x "$CODEX_BIN" ]]; then
     printf 'Codex CLI not found; set CODEX_STATUSLINE_CODEX_BIN to its path\n' >&2
@@ -44,24 +39,17 @@ FOOTER_HEIGHT="${CODEX_STATUSLINE_HEIGHT:-12}"
 REFRESH_INTERVAL="${CODEX_STATUSLINE_INTERVAL:-3}"
 MANAGE_APPROVALS="${CODEX_STATUSLINE_MANAGE_APPROVALS:-1}"
 HISTORY_LIMIT="${CODEX_STATUSLINE_HISTORY_LIMIT:-100000}"
-if [[ ! "$FOOTER_HEIGHT" =~ ^[1-9][0-9]*$ ]] || (( FOOTER_HEIGHT < 12 )); then
-    printf 'CODEX_STATUSLINE_HEIGHT must be an integer of at least 12\n' >&2
-    exit 1
-fi
-if [[ ! "$REFRESH_INTERVAL" =~ ^[0-9]+([.][0-9]+)?$ || "$REFRESH_INTERVAL" =~ ^0([.]0+)?$ ]]; then
-    printf 'CODEX_STATUSLINE_INTERVAL must be a positive number\n' >&2
-    exit 1
-fi
+NATIVE_MODE="${CODEX_STATUSLINE_NATIVE:-0}"
 if [[ "$MANAGE_APPROVALS" != "0" && "$MANAGE_APPROVALS" != "1" ]]; then
     printf 'CODEX_STATUSLINE_MANAGE_APPROVALS must be 0 or 1\n' >&2
     exit 1
 fi
-if [[ ! "$HISTORY_LIMIT" =~ ^[1-9][0-9]*$ ]]; then
-    printf 'CODEX_STATUSLINE_HISTORY_LIMIT must be a positive integer\n' >&2
+if [[ "$NATIVE_MODE" != "0" && "$NATIVE_MODE" != "1" ]]; then
+    printf 'CODEX_STATUSLINE_NATIVE must be 0 or 1\n' >&2
     exit 1
 fi
 
-CODEX_ARGS=(-c 'tui.status_line=[]')
+CODEX_ARGS=()
 EXPLICIT_PERMISSIONS=0
 for arg in "$@"; do
     if [[ "$arg" == "--" ]]; then
@@ -77,6 +65,33 @@ if [[ "$MANAGE_APPROVALS" == "1" && "$EXPLICIT_PERMISSIONS" == "0" ]]; then
     CODEX_ARGS+=(--dangerously-bypass-approvals-and-sandbox)
 fi
 CODEX_ARGS+=("$@")
+
+if [[ "$NATIVE_MODE" == "1" ]]; then
+    NATIVE_STATUS_LINE='["model-with-reasoning","project-name","git-branch","context-used","five-hour-limit","weekly-limit","used-tokens","permissions","approval-mode","task-progress"]'
+    exec "$CODEX_BIN" \
+        --no-alt-screen \
+        -c "tui.status_line=$NATIVE_STATUS_LINE" \
+        -c 'tui.status_line_use_colors=true' \
+        "${CODEX_ARGS[@]}"
+fi
+
+if [[ ! "$FOOTER_HEIGHT" =~ ^[1-9][0-9]*$ ]] || (( FOOTER_HEIGHT < 12 )); then
+    printf 'CODEX_STATUSLINE_HEIGHT must be an integer of at least 12\n' >&2
+    exit 1
+fi
+if [[ ! "$REFRESH_INTERVAL" =~ ^[0-9]+([.][0-9]+)?$ || "$REFRESH_INTERVAL" =~ ^0([.]0+)?$ ]]; then
+    printf 'CODEX_STATUSLINE_INTERVAL must be a positive number\n' >&2
+    exit 1
+fi
+if [[ ! "$HISTORY_LIMIT" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'CODEX_STATUSLINE_HISTORY_LIMIT must be a positive integer\n' >&2
+    exit 1
+fi
+command -v tmux >/dev/null 2>&1 || {
+    printf 'tmux is required for the legacy Codex statusline\n' >&2
+    exit 1
+}
+CODEX_ARGS=(-c 'tui.status_line=[]' ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"})
 
 WORKING_DIR="$(pwd -P)"
 CODEX_WORKING_DIR="$WORKING_DIR"

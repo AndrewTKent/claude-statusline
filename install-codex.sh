@@ -5,6 +5,16 @@ SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="$HOME/.local/bin"
 CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
 CONFIG_FILE="$CODEX_DIR/statusline.conf"
+NATIVE_MODE="${CODEX_STATUSLINE_NATIVE:-}"
+
+if [ -f "$CONFIG_FILE" ]; then
+    # shellcheck source=bin/codex-config.sh
+    source "$SRC_DIR/bin/codex-config.sh"
+    load_codex_statusline_config
+    NATIVE_MODE="${CODEX_STATUSLINE_NATIVE:-0}"
+else
+    NATIVE_MODE="${NATIVE_MODE:-1}"
+fi
 
 if [ ! -d "$CODEX_DIR" ]; then
     printf "Codex home not found: %s\n" "$CODEX_DIR" >&2
@@ -15,10 +25,12 @@ command -v python3 >/dev/null 2>&1 || {
     printf "python3 is required\n" >&2
     exit 1
 }
-command -v tmux >/dev/null 2>&1 || {
-    printf "tmux is required\n" >&2
-    exit 1
-}
+if [ "$NATIVE_MODE" != "1" ]; then
+    command -v tmux >/dev/null 2>&1 || {
+        printf "tmux is required for the legacy Codex statusline\n" >&2
+        exit 1
+    }
+fi
 if [ -n "${CODEX_STATUSLINE_CODEX_BIN:-}" ]; then
     [ -x "$CODEX_STATUSLINE_CODEX_BIN" ] || {
         printf "Codex CLI is not executable: %s\n" "$CODEX_STATUSLINE_CODEX_BIN" >&2

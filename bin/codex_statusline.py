@@ -89,6 +89,21 @@ def terminal_size() -> os.terminal_size:
     return shutil.get_terminal_size((120, 40))
 
 
+def fit_footer_pane(body: str) -> None:
+    pane = os.environ.get("TMUX_PANE")
+    if not pane or os.environ.get("CODEX_STATUSLINE_HEIGHT"):
+        return
+    rows = max(1, len(body.splitlines()))
+    if terminal_size().lines == rows:
+        return
+    subprocess.run(
+        ["tmux", "resize-pane", "-t", pane, "-y", str(rows)],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 def default_width() -> int:
     try:
         return int(os.environ.get("COLUMNS") or terminal_size().columns)
@@ -3867,9 +3882,11 @@ def watch_loop(args: argparse.Namespace, p: Palette) -> int:
             ):
                 args.thread_id = data["thread_id"]
             body = render(data, args, p)
+            if args.footer:
+                fit_footer_pane(body)
             timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z")
             print("\033[2J\033[H", end="")
-            print(body)
+            print(body, end="" if args.footer else "\n")
             if not args.footer:
                 print(f"\n        refresh {timestamp} · Ctrl-C to stop")
             sys.stdout.flush()

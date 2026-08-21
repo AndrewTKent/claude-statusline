@@ -1,6 +1,9 @@
 # Codex CLI Statusline Configuration
 # Copy to ~/.codex/statusline.conf
 
+# Use Codex's native, copy-friendly footer; set to 0 for the tmux dashboard.
+CODEX_STATUSLINE_NATIVE=1
+
 # Render format: default | sigil
 # CODEX_STATUSLINE_FORMAT=default
 
