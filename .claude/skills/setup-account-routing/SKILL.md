@@ -67,7 +67,7 @@ Run `/setup-statusline` first — both tools share `~/.claude/statusline.conf`.
    Mode changes are detected by running supervisors. Handoffs preserve the exact
    session ID and do not return control to the shell. Source changes to either
    router module reload the supervisor in place. New launches default to
-   ultracode effort and an invisible Claude session name unless explicitly set.
+   high effort and an invisible Claude session name unless explicitly set.
 
    Pin one launch with `ACCOUNTS_PIN=<label> claude`.
 
