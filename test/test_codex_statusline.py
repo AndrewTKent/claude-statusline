@@ -3291,6 +3291,35 @@ class CodexStatuslineTest(unittest.TestCase):
 
         self.assertEqual(thread_ids, ["", ""])
 
+    def test_watch_stops_when_the_owner_file_disappears(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pid_file = Path(tmpdir) / "owner.pid"
+            pid_file.write_text(str(os.getpid()))
+            args = codex_statusline.parse_args(
+                ["--footer", "--watch", "1", "--owner-pid-file", str(pid_file)]
+            )
+            snapshots = mock.Mock(return_value={})
+
+            def remove_owner(_data, _args, _palette):
+                pid_file.unlink()
+                return "status"
+
+            with (
+                mock.patch.object(codex_statusline, "snapshot", snapshots),
+                mock.patch.object(codex_statusline, "render", side_effect=remove_owner),
+                mock.patch.object(
+                    codex_statusline.time,
+                    "sleep",
+                    side_effect=[None, KeyboardInterrupt],
+                ),
+            ):
+                self.assertEqual(
+                    codex_statusline.watch(args, codex_statusline.Palette(False)),
+                    0,
+                )
+
+        snapshots.assert_called_once()
+
     def test_watch_keeps_footer_on_alternate_screen(self) -> None:
         args = codex_statusline.parse_args(["--footer", "--watch", "1"])
         output = io.StringIO()

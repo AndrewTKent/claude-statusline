@@ -1227,7 +1227,31 @@ class TestRefreshDormantProfiles:
         assert accounts.refresh_dormant_profiles() == 1
         assert native_refreshes == [["work"]]
 
-    def test_native_refresh_uses_a_zero_worker_transient_daemon(
+    def test_native_binary_skips_the_router_wrapper(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        local_bin = tmp_path / ".local" / "bin"
+        versions = tmp_path / ".local" / "share" / "claude" / "versions"
+        local_bin.mkdir(parents=True)
+        versions.mkdir(parents=True)
+        wrapper = local_bin / "claude"
+        wrapper.write_text("#!/bin/sh\nexec claude-router \"$@\"\n")
+        wrapper.chmod(0o755)
+        older = versions / "2.1.246"
+        newer = versions / "2.1.247"
+        for binary in (older, newer):
+            binary.write_text("native")
+            binary.chmod(0o755)
+        os.utime(older, (1, 1))
+        os.utime(newer, (2, 2))
+        monkeypatch.setattr(accounts, "HOME", tmp_path)
+        monkeypatch.delenv("CLAUDE_REAL_BIN", raising=False)
+
+        assert accounts.native_claude_binary() == str(newer)
+
+    def test_native_refresh_uses_and_reaps_a_zero_worker_transient_daemon(
         self,
         tmp_path,
         monkeypatch,
@@ -1247,10 +1271,11 @@ class TestRefreshDormantProfiles:
                 return None
 
             def terminate(self):
-                pytest.fail("terminated Claude during native credential refresh")
+                process_events.append("terminate")
 
             def wait(self, timeout=None):
-                pytest.fail("waited for the daemon's 50-second idle timeout")
+                process_events.append(("wait", timeout))
+                return 0
 
             def kill(self):
                 pytest.fail("killed Claude during native credential refresh")
@@ -1308,7 +1333,7 @@ class TestRefreshDormantProfiles:
         assert launches[0][1]["start_new_session"] is True
         assert len(launches[0][1]["pass_fds"]) == 1
         assert json_paths[0].parent.exists()
-        assert process_events == ["poll"]
+        assert process_events == ["poll", "terminate", ("wait", 1.0)]
 
     def test_native_refresh_lock_remains_held_by_the_daemon(
         self,

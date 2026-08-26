@@ -1501,12 +1501,39 @@ def profile_live_blob(label: str) -> str | None:
         return None
 
 
+def _usable_native_claude(path: Path) -> bool:
+    try:
+        resolved = path.resolve(strict=True)
+        if not os.access(resolved, os.X_OK):
+            return False
+        with resolved.open("rb") as handle:
+            head = handle.read(512)
+    except OSError:
+        return False
+    return not (head.startswith(b"#!") and b"claude-router" in head)
+
+
 def native_claude_binary() -> str | None:
-    binary = Path(
-        os.environ.get("CLAUDE_REAL_BIN") or HOME / ".local/bin/claude"
-    )
-    if binary.is_file() and os.access(binary, os.X_OK):
-        return str(binary)
+    explicit = os.environ.get("CLAUDE_REAL_BIN")
+    if explicit and _usable_native_claude(Path(explicit)):
+        return explicit
+    native = HOME / ".local/bin/claude"
+    if _usable_native_claude(native):
+        return str(native)
+    versions = HOME / ".local/share/claude/versions"
+    try:
+        newest = max(
+            (path for path in versions.iterdir() if _usable_native_claude(path)),
+            key=lambda path: path.stat().st_mtime,
+            default=None,
+        )
+    except OSError:
+        newest = None
+    if newest is not None:
+        return str(newest)
+    binary = shutil.which("claude")
+    if binary and _usable_native_claude(Path(binary)):
+        return binary
     return None
 
 
@@ -1584,6 +1611,7 @@ def refresh_keychain_profiles(
             for label in labels
         }
         processes: list[subprocess.Popen] = []
+        json_paths: list[Path] = []
         launched: set[str] = set()
         for index, label in enumerate(labels):
             fd, json_name = tempfile.mkstemp(
@@ -1593,6 +1621,7 @@ def refresh_keychain_profiles(
             os.close(fd)
             json_path = Path(json_name)
             json_path.unlink()
+            json_paths.append(json_path)
             env = os.environ.copy()
             for name in (
                 "ANTHROPIC_API_KEY",
@@ -1628,21 +1657,32 @@ def refresh_keychain_profiles(
 
         refreshed: set[str] = set()
         deadline = time.monotonic() + wait_s
-        while launched - refreshed:
-            for label in launched - refreshed:
-                blob = profile_live_blob(label) or ""
-                expiry = blob_access_expiry(blob)
-                if blob_access_token(blob) and (
-                    blob != before[label]
-                    or (expiry is not None and expiry > now_ts)
-                ):
-                    refreshed.add(label)
+        try:
+            while launched - refreshed:
+                for label in launched - refreshed:
+                    blob = profile_live_blob(label) or ""
+                    expiry = blob_access_expiry(blob)
+                    if blob_access_token(blob) and (
+                        blob != before[label]
+                        or (expiry is not None and expiry > now_ts)
+                    ):
+                        refreshed.add(label)
+                if not launched - refreshed or time.monotonic() >= deadline:
+                    break
+                time.sleep(NATIVE_REFRESH_POLL_S)
+            return len(refreshed)
+        finally:
             for process in processes:
-                process.poll()
-            if not launched - refreshed or time.monotonic() >= deadline:
-                break
-            time.sleep(NATIVE_REFRESH_POLL_S)
-        return len(refreshed)
+                if process.poll() is not None:
+                    continue
+                process.terminate()
+                try:
+                    process.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=1.0)
+            for json_path in json_paths:
+                json_path.unlink(missing_ok=True)
 
 
 def refresh_dormant_profiles() -> int:

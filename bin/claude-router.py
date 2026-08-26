@@ -35,7 +35,8 @@ PASSTHROUGH_FLAGS = {"-h", "--help", "-p", "--print", "-v", "--version"}
 ROUTER_INTERVAL_S = 2.0
 LEASE_HEARTBEAT_S = 5.0
 FABLE_FALLBACK_MODEL = "opus"
-DEFAULT_EFFORT = "ultracode"
+DEFAULT_EFFORT = "high"
+ULTRACODE_EFFORT = "ultracode"
 DEFAULT_SESSION_NAME = "\u200b"
 LEGACY_DEFAULT_SESSION_NAMES = {" ", "\u2063"}
 ULTRACODE_ENV = "CLAUDE_ROUTER_ULTRACODE"
@@ -259,7 +260,7 @@ def routed_environment(
     effort = option_value(args, "--effort")
     if effort is not None:
         env.pop("CLAUDE_CODE_EFFORT_LEVEL", None)
-    if effort == DEFAULT_EFFORT:
+    if effort == ULTRACODE_EFFORT:
         env[ULTRACODE_ENV] = "1"
     env.update(
         {
@@ -488,7 +489,7 @@ def run_passthrough(binary: str, args: list[str]) -> int:
         env = os.environ.copy()
         env.pop("CLAUDE_CODE_EFFORT_LEVEL", None)
         env.pop(ULTRACODE_ENV, None)
-        if option_value(launch_args, "--effort") == DEFAULT_EFFORT:
+        if option_value(launch_args, "--effort") == ULTRACODE_EFFORT:
             env[ULTRACODE_ENV] = "1"
         return subprocess.call([binary, *launch_args], env=env)
     current_family = model_family(launch_args)

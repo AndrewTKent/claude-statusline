@@ -214,10 +214,12 @@ Tool duration is available only when matching start/end records are present.
 
 | Row | Shown when | What it shows |
 |-----|-----------|----------------|
-| `model` | always | Model + effort suffix (`.low`/`.medium`/`.high`/`.xhigh`/`.max`/`.ultracode`) + `⚡fast` when Settings' fast mode is on |
+| `model` | always | Model + effort (`· low`/`· medium`/`· high`/`· xhigh`/`· max`/`· ultracode`) + `⚡fast` when Settings' fast mode is on |
 | `time` | session duration available | Wall-clock (`⏱ 24:12`); adds `idle Nm` after 30s with no user turn |
 | `account` | account resolved | Tag from `ACCOUNT_LABELS`, colored per `LABEL_COLORS` |
-| `repo` | always | Dir name, `worktree`/`primary` tag, branch (dirty `*`, `↑`/`↓` ahead/behind), PR badge |
+| `repo` | always | Primary repository name |
+| `tree` | the checkout is a linked worktree | Worktree name |
+| `branch` | the checkout is in Git | Branch, dirty `*`, and `↑`/`↓` divergence |
 | `pr` | the checkout maps to an open PR | PR number and title for the checked-out branch or detached PR head |
 | `context` | always | Context-window fill — 15-dot sweet-spot bar (blue <30%, green 30–70%, yellow 70–85%, red 85%+) |
 | `session` | 5h rate-limit data available | 5h window used, 15-dot bar + `resets <time>` |
@@ -374,7 +376,10 @@ Credentials and entitlement caches are isolated; projects, transcripts, settings
 skills, and plugins are shared. Interactive sessions remain first-party
 `claude.ai` subscription sessions instead of API/setup-token sessions.
 
-For shared statusline rendering, run `accounts poll` or keep the explicit foreground loop `accounts watch --interval 60` open, then enable `SHARED_ACCOUNT_SNAPSHOT=1` in `statusline.conf`. No watcher, daemon, or launch-at-login job is installed automatically.
+For shared statusline rendering, enable `SHARED_ACCOUNT_SNAPSHOT=1` in
+`statusline.conf`. The router installer registers a launch agent that runs
+`accounts poll` every minute; `accounts watch --interval 60` is the foreground
+alternative.
 
 Install the router from a local checkout:
 
@@ -382,8 +387,9 @@ Install the router from a local checkout:
 ./install-account-router.sh
 ```
 
-The installer leaves Claude's native binary at `~/.local/bin/claude`, installs
-the router tools under `~/.local/bin`, and prepends a supervised launcher from
+The installer puts the router wrapper at `~/.local/bin/claude`, keeps native
+Claude binaries under `~/.local/share/claude/versions`, installs the router
+tools under `~/.local/bin`, and prepends a supervised launcher from
 `~/.accounts/bin` in new zsh sessions.
 
 | Command | What it does |

@@ -1520,7 +1520,28 @@ def scan_file(
     source_id = snapshot.source_id
     previous = snapshot.previous
     offset = 0
-    if previous and previous["inode"] == stat.st_ino and stat.st_size >= previous["offset"]:
+    source_replaced_or_truncated = bool(
+        previous
+        and (
+            previous["inode"] != stat.st_ino
+            or stat.st_size < previous["offset"]
+            or (
+                stat.st_size == previous["offset"]
+                and stat.st_mtime_ns != previous["mtime_ns"]
+            )
+        )
+    )
+    if source_replaced_or_truncated:
+        deleted = connection.execute(
+            "delete from events where source_id=?", (source_id,)
+        ).rowcount
+        connection.execute("delete from minute_metrics where source_id=?", (source_id,))
+        connection.execute("delete from parser_state where source_id=?", (source_id,))
+        connection.execute("delete from open_turns where source_id=?", (source_id,))
+        connection.execute("delete from open_tools where source_id=?", (source_id,))
+        if deleted:
+            set_metadata_value(connection, "minutes_dirty", "1")
+    elif previous and previous["inode"] == stat.st_ino and stat.st_size >= previous["offset"]:
         offset = previous["offset"]
     state = ParseState(provider=provider, source_id=source_id, salt=salt, account_id=account_id)
     hydrate_state(connection, state)

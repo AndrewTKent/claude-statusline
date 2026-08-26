@@ -78,6 +78,13 @@ cat > "$TEST_HOME/.accounts/statusline-snapshot.json" <<JSON
       "expired": false,
       "live_leases": 2
     },
+    "general": {
+      "five_hour": {"used_pct": 12, "resets_at": "2099-01-01T12:00:00Z", "observed_at": $NOW, "stale": false, "pending_reset": false},
+      "seven_day": {"used_pct": 24, "resets_at": "2099-01-07T12:00:00Z", "observed_at": $NOW, "stale": false, "pending_reset": false},
+      "scoped": [],
+      "expired": false,
+      "live_leases": 0
+    },
     "personal": {
       "five_hour": {"used_pct": 91, "resets_at": null, "observed_at": $NOW, "stale": true, "pending_reset": true},
       "seven_day": {"used_pct": null, "resets_at": null, "observed_at": null, "stale": true, "pending_reset": false},
@@ -96,7 +103,7 @@ SHARED_ACCOUNT_SNAPSHOT_MAX_AGE=180
 AGENT_METRICS_RECORDER=1
 AGENT_METRICS_DB="$TEST_HOME/metrics.sqlite3"
 SHOW_ACCOUNT_RESETS=1
-MAX_COLS=120
+MAX_COLS="\${MAX_COLS:-}"
 SCAN_SCRIPT="$STUBS/scanner.py"
 EOF
 
@@ -115,15 +122,38 @@ snapshot_home_files() {
 }
 
 output=$(run_statusline work)
-for expected in "Claude Test" "work" "42.5%" "66%" "17%" "fable" "Personal" "pending" "needs reauth" "15.00k" "1.23k" "project › ⌥metrics-pane" "#9" "Cached local PR"; do
+for expected in "Claude Test" "work" "42.5%" "66%" "17%" "fable" "Personal" "pending" "needs reauth" "15.00k" "1.23k" "⌥ metrics-pane" "#9" "Cached local PR"; do
     [[ "$output" == *"$expected"* ]] || { printf 'missing shared value: %s\n' "$expected" >&2; exit 1; }
 done
+plain_output=$(printf '%s' "$output" | sed $'s/\033\\[[0-9;]*m//g')
+[[ "$plain_output" == *$'model   Claude Test · high\n'* ]] || { printf 'model and effort are jammed together\n' >&2; exit 1; }
+[[ "$plain_output" == *$'repo    project\ntree    ⌥ metrics-pane\nbranch  feature/agent-metrics-w…\npr      #9 Cached local PR\n'* ]] || {
+    printf 'checkout identity is not split into readable rows\n' >&2
+    exit 1
+}
+[[ "$plain_output" != *'project ›'* ]] || { printf 'default renderer collapsed checkout identity\n' >&2; exit 1; }
 [[ "$output" == *$'\033]0;metrics-pane'* ]] || { printf 'shared renderer did not refresh terminal title\n' >&2; exit 1; }
 [[ "$output" != *"2099-01-01 12:00:00 · stale"* ]] || { printf 'fresh current window rendered stale\n' >&2; exit 1; }
 [[ "$output" != *"2099-01-01"* ]] || { printf 'raw reset timestamp leaked into renderer\n' >&2; exit 1; }
 [[ "$output" != *$'cost   '* ]] || { printf 'shared renderer added cost noise\n' >&2; exit 1; }
+general_line=""
+while IFS= read -r output_line; do
+    [[ "$output_line" == *General* ]] && general_line="$output_line"
+done <<< "$plain_output"
+[[ -n "$general_line" && "$general_line" != *"~ stale"* ]] || { printf 'fresh account without a scoped limit rendered stale\n' >&2; exit 1; }
+wide_output=$(MAX_COLS=100 COLUMNS=80 run_statusline work)
+wide_plain=$(printf '%s' "$wide_output" | sed $'s/\033\\[[0-9;]*m//g')
+wide_first_line="${wide_plain%%$'\n'*}"
+[[ "${#wide_first_line}" -eq 97 ]] || { printf 'shared renderer did not claim the usable panel width\n' >&2; exit 1; }
+wide_prefix="${wide_first_line%%model*}"
+[[ -n "$wide_prefix" ]] || { printf 'shared renderer left the status block against the margin\n' >&2; exit 1; }
+[[ "$wide_plain" == *$'\n'"${wide_prefix}time"* ]] || { printf 'shared renderer did not center rows as one block\n' >&2; exit 1; }
+narrow_output=$(MAX_COLS=20 run_statusline work)
+narrow_plain=$(printf '%s' "$narrow_output" | sed $'s/\033\\[[0-9;]*m//g')
+narrow_first_line="${narrow_plain%%$'\n'*}"
+[[ "$narrow_first_line" == "model   Claude Test · high" ]] || { printf 'narrow shared renderer padded the first row\n' >&2; exit 1; }
 compact_output=$(STATUSLINE_FORMAT=sigil run_statusline work)
-[[ "$compact_output" == *"project › ⌥metrics-pane"*"#9"* ]] || {
+[[ "$compact_output" == *"project › ⌥ metrics-pane"*"#9"* ]] || {
     printf 'compact renderer hid worktree or PR identity\n' >&2
     exit 1
 }

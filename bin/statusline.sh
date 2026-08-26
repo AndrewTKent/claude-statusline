@@ -772,7 +772,7 @@ render_shared_account_snapshot() {
             "scoped_label=" + (($scoped.label // "") | @sh),
             "scoped_pct=" + (($scoped.used_pct // "") | tostring | @sh),
             "scoped_reset=" + (($scoped.resets_at // "") | @sh),
-            "scoped_stale=" + ((if ($scoped | has("stale")) then $scoped.stale else true end) | tostring | @sh),
+            "scoped_stale=" + ((if ($scoped | length) == 0 then false elif ($scoped | has("stale")) then $scoped.stale else true end) | tostring | @sh),
             "scoped_pending=" + (($scoped.pending_reset // false) | tostring | @sh),
             "shared_rows=" + ([
                 .accounts | to_entries[] | .key as $row_label | .value as $row_account |
@@ -782,7 +782,7 @@ render_shared_account_snapshot() {
                  ($row_account.seven_day.used_pct // ""), ($row_account.seven_day.resets_at // ""),
                  (if ($row_account.seven_day | has("stale")) then $row_account.seven_day.stale else true end), ($row_account.seven_day.pending_reset // false),
                  ($row_scoped.used_pct // ""), ($row_scoped.label // $row_scoped.kind // ""), ($row_scoped.resets_at // ""),
-                 (if ($row_scoped | has("stale")) then $row_scoped.stale else true end), ($row_scoped.pending_reset // false),
+                 (if ($row_scoped | length) == 0 then false elif ($row_scoped | has("stale")) then $row_scoped.stale else true end), ($row_scoped.pending_reset // false),
                  ($row_account.expired // false), ($row_account.live_leases // 0)] | map(tostring) | join("\u001f")
             ] | join("\n") | @sh)
         ' <<< "$snapshot" 2>/dev/null) || snapshot_values=""
@@ -815,12 +815,12 @@ render_shared_account_snapshot() {
     fi
     effort_label="$EFFORT_VAL"
     case "$effort_label" in
-        low) EFFORT="${dim}.low${reset}" ;;
-        medium) EFFORT="${orange}.medium${reset}" ;;
-        high) EFFORT="${red}.high${reset}" ;;
-        xhigh) EFFORT="${red}.xhigh${reset}" ;;
-        max) EFFORT="${red}.max${reset}" ;;
-        ultracode) EFFORT="${magenta}.ultracode${reset}" ;;
+        low) EFFORT=" ${dim}·${reset} ${dim}low${reset}" ;;
+        medium) EFFORT=" ${dim}·${reset} ${orange}medium${reset}" ;;
+        high) EFFORT=" ${dim}·${reset} ${red}high${reset}" ;;
+        xhigh) EFFORT=" ${dim}·${reset} ${red}xhigh${reset}" ;;
+        max) EFFORT=" ${dim}·${reset} ${red}max${reset}" ;;
+        ultracode) EFFORT=" ${dim}·${reset} ${magenta}ultracode${reset}" ;;
         *) EFFORT="" ;;
     esac
 
@@ -855,7 +855,8 @@ render_shared_account_snapshot() {
         fi
     fi
 
-    local repo_cwd dir_name branch="" branch_name="" dirty="" repo_text git_line git_state="" git_root=""
+    local repo_cwd dir_name branch="" branch_name="" dirty="" repo_text="" tree_text="" branch_text=""
+    local git_line git_state="" git_root=""
     local git_dir="" git_common="" git_dir_real="" git_common_real="" is_worktree=false upstream="" counts="" ahead=0 behind=0
     local primary_name="" worktree_name="" pr_ref=""
     repo_cwd=$(recent_session_checkout "$SESSION_ID" "$CWD")
@@ -902,15 +903,22 @@ render_shared_account_snapshot() {
         worktree_name="${git_root##*/}"
         primary_name="${git_common_real%/.git}"
         primary_name="${primary_name##*/}"
-        repo_text="${primary_name:-$dir_name} › ⌥${worktree_name}"
+        repo_text="${primary_name:-$dir_name}"
+        tree_text="⌥ ${worktree_name}"
     elif [ -n "$git_root" ]; then
-        repo_text="${dir_name} primary"
+        repo_text="${dir_name}"
     else
         repo_text="${dir_name}"
     fi
-    repo_text+="${branch:+ (${branch}${dirty})}"
-    [ "${ahead:-0}" -gt 0 ] 2>/dev/null && repo_text+="↑${ahead}"
-    [ "${behind:-0}" -gt 0 ] 2>/dev/null && repo_text+="↓${behind}"
+    branch_text="$branch"
+    [ -n "$dirty" ] && branch_text+=" *"
+    local divergence=""
+    [ "${ahead:-0}" -gt 0 ] 2>/dev/null && divergence="↑${ahead}"
+    if [ "${behind:-0}" -gt 0 ] 2>/dev/null; then
+        [ -n "$divergence" ] && divergence+=" "
+        divergence+="↓${behind}"
+    fi
+    [ -n "$divergence" ] && branch_text+=" · ${divergence}"
     local pr_number="" pr_title=""
     pr_ref="${branch_name:-$branch}"
     if [ -n "$git_root" ] && [ -n "$pr_ref" ]; then
@@ -925,7 +933,6 @@ render_shared_account_snapshot() {
                     "pr_title=" + ((.title // "" | gsub("[\u0000-\u001f\u007f]"; " ")) | @sh)
                 else empty end
             ' "$pr_cache_file" 2>/dev/null)"
-            [ -n "$pr_number" ] && repo_text+=" #${pr_number}"
         fi
     fi
 
@@ -936,29 +943,43 @@ render_shared_account_snapshot() {
 
     local format="${STATUSLINE_FORMAT:-${FORMAT:-default}}"
     if [ "$format" = "sigil" ] || [ "$format" = "rprompt" ] || [ "$format" = "sparkline" ] || [ "$format" = "iterm2" ]; then
-        printf "%b" "${blue}◈${reset} ${blue}${MODEL}${reset}${EFFORT} ${dim}·${reset} ${CTX_COLOR:-$green}${context_int}%${reset} ${dim}·${reset} ${cyan}${repo_text}${reset}"
+        local compact_repo="$repo_text"
+        [ -n "$tree_text" ] && compact_repo+=" › ${tree_text}"
+        [ -n "$branch_text" ] && compact_repo+=" · ${branch_text}"
+        [ -n "$pr_number" ] && compact_repo+=" · #${pr_number}"
+        printf "%b" "${blue}◈${reset} ${blue}${MODEL}${reset}${EFFORT} ${dim}·${reset} ${CTX_COLOR:-$green}${context_int}%${reset} ${dim}·${reset} ${cyan}${compact_repo}${reset}"
         [ -n "$five_pct" ] && printf "%b" " ${dim}·${reset} $(color_for_pct "${five_pct%.*}")${five_pct}%${reset}"
         return
     fi
+
+    local shared_output=""
+    _shared_emit() {
+        local row_format="$1" row
+        shift
+        printf -v row "$row_format" "$@"
+        shared_output+="$row"$'\n'
+    }
 
     local unsup_badge=""
     if [ -x "$HOME/.accounts/bin/claude" ] && [ -n "$SESSION_ID" ] &&
         [[ "${ACCOUNTS_ROUTER_STATE:-}" != /tmp/claude/account-router-*.json ]]; then
         unsup_badge=" ${red}UNSUPERVISED${reset}"
     fi
-    printf "${white}%-7s${reset} %b\n" "model" "${blue}${MODEL}${reset}${EFFORT}${unsup_badge}"
-    [ -n "$pr_number" ] && printf "${white}%-7s${reset} ${cyan}#%s${reset} %s\n" "pr" "$pr_number" "$pr_title"
+    _shared_emit "${white}%-7s${reset} %b" "model" "${blue}${MODEL}${reset}${EFFORT}${unsup_badge}"
     if [ "$DURATION_MS" -gt 0 ] 2>/dev/null; then
         local elapsed_seconds=$(( DURATION_MS / 1000 ))
         if [ "$elapsed_seconds" -ge 3600 ]; then
-            printf "${white}%-7s${reset} ${dim}⏱${reset} %d:%02d:%02d\n" "time" "$(( elapsed_seconds / 3600 ))" "$(( (elapsed_seconds % 3600) / 60 ))" "$(( elapsed_seconds % 60 ))"
+            _shared_emit "${white}%-7s${reset} ${dim}⏱${reset} %d:%02d:%02d" "time" "$(( elapsed_seconds / 3600 ))" "$(( (elapsed_seconds % 3600) / 60 ))" "$(( elapsed_seconds % 60 ))"
         else
-            printf "${white}%-7s${reset} ${dim}⏱${reset} %d:%02d\n" "time" "$(( elapsed_seconds / 60 ))" "$(( elapsed_seconds % 60 ))"
+            _shared_emit "${white}%-7s${reset} ${dim}⏱${reset} %d:%02d" "time" "$(( elapsed_seconds / 60 ))" "$(( elapsed_seconds % 60 ))"
         fi
     fi
-    printf "${white}%-7s${reset} %b\n" "account" "${orange}${account_identity}${reset}${dim}${account_suffix}${route_suffix}${reset}"
-    printf "${white}%-7s${reset} %b\n" "repo" "${cyan}${repo_text}${reset}"
-    printf "${white}%-7s${reset} %b\n" "context" "${context_bar} $(color_for_context "$context_int")${CONTEXT_PCT:-0}%${reset}"
+    _shared_emit "${white}%-7s${reset} %b" "account" "${orange}${account_identity}${reset}${dim}${account_suffix}${route_suffix}${reset}"
+    _shared_emit "${white}%-7s${reset} %b" "repo" "${cyan}${repo_text}${reset}"
+    [ -n "$tree_text" ] && _shared_emit "${white}%-7s${reset} %b" "tree" "${magenta}${tree_text}${reset}"
+    [ -n "$branch_text" ] && _shared_emit "${white}%-7s${reset} %b" "branch" "${green}${branch_text}${reset}"
+    [ -n "$pr_number" ] && _shared_emit "${white}%-7s${reset} ${cyan}#%s${reset} %s" "pr" "$pr_number" "$pr_title"
+    _shared_emit "${white}%-7s${reset} %b" "context" "${context_bar} $(color_for_context "$context_int")${CONTEXT_PCT:-0}%${reset}"
 
     local pct_int pct_bar pct_color reset_text stale_text session_display="$session_tokens"
     [ "$session_tokens" -ge 1000 ] 2>/dev/null && session_display="$(( session_tokens / 1000 ))k"
@@ -966,20 +987,20 @@ render_shared_account_snapshot() {
         pct_int="${five_pct%.*}"; pct_bar=$(build_bar "$pct_int" 15); pct_color=$(color_for_pct "$pct_int")
         reset_text=$(shared_reset_text "$five_reset" "$five_pending" time)
         stale_text=""; { [ "$five_stale" = "true" ] || $snapshot_stale; } && stale_text=" · stale"
-        printf "${white}%-7s${reset} %b\n" "session" "${pct_bar} ${pct_color}$(fmt_pct "$five_pct")${reset} ${dim}resets ${reset_text}${stale_text}${reset}"
+        _shared_emit "${white}%-7s${reset} %b" "session" "${pct_bar} ${pct_color}$(fmt_pct "$five_pct")${reset} ${dim}resets ${reset_text}${stale_text}${reset}"
     fi
     if [ -n "$seven_pct" ]; then
         pct_int="${seven_pct%.*}"; pct_bar=$(build_bar "$pct_int" 15); pct_color=$(color_for_pct "$pct_int")
         reset_text=$(shared_reset_text "$seven_reset" "$seven_pending" datetime)
         stale_text=""; { [ "$seven_stale" = "true" ] || $snapshot_stale; } && stale_text=" · stale"
-        printf "${white}%-7s${reset} %b\n" "weekly" "${pct_bar} ${pct_color}$(fmt_pct "$seven_pct")${reset} ${dim}resets ${reset_text}${stale_text}${reset}"
+        _shared_emit "${white}%-7s${reset} %b" "weekly" "${pct_bar} ${pct_color}$(fmt_pct "$seven_pct")${reset} ${dim}resets ${reset_text}${stale_text}${reset}"
     fi
     if [ -n "$scoped_pct" ]; then
         pct_int="${scoped_pct%.*}"; pct_bar=$(build_bar "$pct_int" 15); pct_color=$(color_for_pct "$pct_int")
         stale_text=""; { [ "$scoped_stale" = "true" ] || $snapshot_stale; } && stale_text=" · stale"
         local scoped_display_label
         scoped_display_label=$(printf '%s' "${scoped_label:-${scoped_kind:-scoped}}" | tr '[:upper:]' '[:lower:]' | cut -c1-7)
-        printf "${white}%-7s${reset} %b\n" "$scoped_display_label" "${pct_bar} ${pct_color}$(fmt_pct "$scoped_pct")${reset}${stale_text:+ ${dim}${stale_text}${reset}}"
+        _shared_emit "${white}%-7s${reset} %b" "$scoped_display_label" "${pct_bar} ${pct_color}$(fmt_pct "$scoped_pct")${reset}${stale_text:+ ${dim}${stale_text}${reset}}"
     fi
     local today_tokens="" lifetime_tokens=0 today_display session_display_fmt lifetime_display
     local metrics_db="${AGENT_METRICS_DB:-$HOME/Library/Application Support/statusline/agent-metrics/metrics.sqlite3}"
@@ -1006,7 +1027,7 @@ render_shared_account_snapshot() {
     today_display=$(_shared_usage_fmt "${today_tokens:-0}")
     session_display_fmt=$(_shared_usage_fmt "$session_tokens")
     lifetime_display=$(_shared_usage_fmt "${lifetime_tokens:-0}")
-    printf "${white}%-7s${reset} %b\n" "usage" "${dim}today${reset} ${cyan}${today_display}${reset} ${dim}· session${reset} ${magenta}${session_display_fmt}${reset} ${dim}· lifetime${reset} ${green}${lifetime_display}${reset}"
+    _shared_emit "${white}%-7s${reset} %b" "usage" "${dim}today${reset} ${cyan}${today_display}${reset} ${dim}· session${reset} ${magenta}${session_display_fmt}${reset} ${dim}· lifetime${reset} ${green}${lifetime_display}${reset}"
 
     if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ] && [ "$snapshot_state" = "ready" ]; then
         local rows sorted_rows="" sort_key row_label row_display row_five row_five_reset row_five_stale row_five_pending
@@ -1041,7 +1062,7 @@ render_shared_account_snapshot() {
         local header_account board_header
         printf -v header_account '%-*s' "$name_width" "acct"
         board_header="  ${header_account} $(_shared_ralign "5h" 4)  $(_shared_ralign "reset" 6)   $(_shared_ralign "week" 4)   $(_shared_ralign "$board_scoped_label" 5)  $(_shared_ralign "reset" 6)"
-        printf "${dim}%s${reset}\n" "$board_header"
+        _shared_emit "${dim}%s${reset}" "$board_header"
         while IFS=$'\037' read -r row_label row_five row_five_reset row_five_stale row_five_pending \
             row_seven row_seven_reset row_seven_stale row_seven_pending row_scoped row_scoped_label \
             row_scoped_reset row_scoped_stale row_scoped_pending row_expired row_leases; do
@@ -1061,12 +1082,41 @@ render_shared_account_snapshot() {
             [ "$row_expired" = "true" ] && row_suffix+=" ${red}⚠ needs reauth${reset}"
             local padded_name
             printf -v padded_name '%-*s' "$name_width" "$row_display"
-            printf "%b${white}%s${reset} ${five_color}%s${reset}  ${dim}%s${reset}   ${seven_color}%s${reset}   ${scoped_color}%s${reset}  ${dim}%s${reset}%b\n" \
+            _shared_emit "%b${white}%s${reset} ${five_color}%s${reset}  ${dim}%s${reset}   ${seven_color}%s${reset}   ${scoped_color}%s${reset}  ${dim}%s${reset}%b" \
                 "$marker" "$padded_name" "$(_shared_ralign "$row_five" 4)" \
                 "$(_shared_ralign "$row_five_reset" 6)" "$(_shared_ralign "$row_seven" 4)" \
                 "$(_shared_ralign "$row_scoped" 5)" "$(_shared_ralign "$row_scoped_reset" 6)" "$row_suffix"
         done <<< "$rows"
     fi
+
+    local rendered="${shared_output%$'\n'}" plain max_width=0 line width
+    local terminal_width="${MAX_COLS:-0}" usable_width=0 left_pad=0 right_pad=0 index=0
+    local -a rendered_lines plain_lines
+    plain=$(printf '%s' "$rendered" | sed $'s/\033\\[[0-9;]*m//g')
+    while IFS= read -r line; do
+        rendered_lines[index]="$line"
+        index=$(( index + 1 ))
+    done <<< "$rendered"
+    index=0
+    while IFS= read -r line; do
+        plain_lines[index]="$line"
+        width=${#line}
+        [ "$width" -gt "$max_width" ] && max_width=$width
+        index=$(( index + 1 ))
+    done <<< "$plain"
+    case "$terminal_width" in ''|*[!0-9]*) terminal_width=0 ;; esac
+    if [ "$terminal_width" -le 0 ] 2>/dev/null; then
+        terminal_width="${COLUMNS:-0}"
+        case "$terminal_width" in ''|*[!0-9]*) terminal_width=0 ;; esac
+    fi
+    [ "$terminal_width" -gt 3 ] 2>/dev/null && usable_width=$(( terminal_width - 3 ))
+    [ "$usable_width" -gt "$max_width" ] && left_pad=$(( (usable_width - max_width) / 2 ))
+    for ((index=0; index<${#rendered_lines[@]}; index++)); do
+        right_pad=0
+        [ "$index" -eq 0 ] && [ "$usable_width" -ge "$max_width" ] && \
+            right_pad=$(( usable_width - left_pad - ${#plain_lines[$index]} ))
+        printf '%*s%b%*s\n' "$left_pad" '' "${rendered_lines[$index]}" "$right_pad" ''
+    done
 }
 
 if [ "${SHARED_ACCOUNT_SNAPSHOT:-0}" = "1" ]; then

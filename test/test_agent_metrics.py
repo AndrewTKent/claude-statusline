@@ -350,6 +350,37 @@ class AgentMetricsTest(unittest.TestCase):
         self.assertEqual(third["lines"], 1)
         self.assertEqual(third["events"], 1)
 
+    def test_truncated_source_replaces_removed_events_and_totals(self) -> None:
+        transcript = self.claude_projects / "truncated.jsonl"
+        records = [
+            {
+                "type": "assistant",
+                "timestamp": f"2026-08-25T17:0{index}:00Z",
+                "sessionId": "truncated-session",
+                "requestId": f"truncated-{index}",
+                "message": {
+                    "model": "claude-test",
+                    "usage": {"input_tokens": index * 10, "output_tokens": index},
+                },
+            }
+            for index in (1, 2)
+        ]
+        transcript.write_text("".join(line(record) for record in records), encoding="utf-8")
+        agent_metrics.sync(self.config)
+
+        transcript.write_text(line(records[0]), encoding="utf-8")
+        agent_metrics.sync(self.config)
+
+        with self.connection() as connection:
+            event_count, event_tokens = connection.execute(
+                "select count(*), sum(total_tokens) from events where event_kind='tokens'"
+            ).fetchone()
+            minute_count, minute_tokens = connection.execute(
+                "select count(*), sum(total_tokens) from minute_metrics"
+            ).fetchone()
+        self.assertEqual((event_count, event_tokens), (1, 11))
+        self.assertEqual((minute_count, minute_tokens), (1, 11))
+
     def test_bounded_sync_resumes_exactly_without_duplicates(self) -> None:
         transcript = self.claude_projects / "bounded.jsonl"
         records = [
@@ -1293,11 +1324,13 @@ class AgentMetricsTest(unittest.TestCase):
 
     def test_dashboard_filter_options_refresh_and_reasoning_is_not_double_stacked(self) -> None:
         script = (MODULE_PATH.parents[1] / "share/agent-metrics/app.js").read_text()
+        index = (MODULE_PATH.parents[1] / "share/agent-metrics/index.html").read_text()
         self.assertIn("select.replaceChildren", script)
         self.assertNotIn("filterOptionsReady", script)
         self.assertIn("value - Number(row.reasoning_tokens", script)
         self.assertIn("if (!document.hidden) refresh()", script)
         self.assertIn("}, 60000)", script)
+        self.assertIn("UP TO 24 HOURS · HOURLY + CUMULATIVE", index)
 
     def test_dashboard_moving_average_uses_only_present_minute_buckets(self) -> None:
         script_path = MODULE_PATH.parents[1] / "share/agent-metrics/app.js"
