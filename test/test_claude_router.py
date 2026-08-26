@@ -1338,7 +1338,7 @@ def test_fable_mode_launches_directly_on_fable(monkeypatch):
     assert claude_router.option_value(launches[0][0], "--effort") == "high"
     assert claude_router.option_value(launches[0][0], "--name") == "\u200b"
     assert "CLAUDE_CODE_EFFORT_LEVEL" not in launches[0][1]["env"]
-    assert launches[0][1]["env"]["CLAUDE_ROUTER_ULTRACODE"] == "1"
+    assert "CLAUDE_ROUTER_ULTRACODE" not in launches[0][1]["env"]
 
 
 def test_passthrough_preserves_an_explicit_profile(monkeypatch):
