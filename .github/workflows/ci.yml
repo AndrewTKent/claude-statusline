@@ -30,8 +30,8 @@ jobs:
           python-version: '3.12'
       - name: Install pytest
         run: python3 -m pip install pytest
-      - name: Claude-side tests (accounts + scan-tokens)
-        run: python3 -m pytest test/test_accounts.py test/test_claude_router.py test/test_scan_tokens.py -q
+      - name: Claude-side tests
+        run: python3 -m pytest test/test_accounts.py test/test_claude_router.py test/test_scan_tokens.py test/test_agent_metrics.py -q
 
   test:
     runs-on: ${{ matrix.os }}
@@ -40,11 +40,9 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v7
-      - name: Install jq
+      - name: Install jq and SQLite
         run: |
-          if command -v jq >/dev/null; then echo "jq already installed"; else
-            if [ "$(uname)" = "Darwin" ]; then brew install jq; else sudo apt-get install -y jq; fi
-          fi
+          if [ "$(uname)" = "Darwin" ]; then brew install jq sqlite; else sudo apt-get install -y jq sqlite3; fi
       - name: Test empty input
         run: |
           OUTPUT=$(echo '' | bash bin/statusline.sh)
@@ -66,6 +64,10 @@ jobs:
         run: bash test/test_file_mtime.sh
       - name: Test unsupervised badge
         run: bash test/test_unsupervised_badge.sh
+      - name: Test shared account snapshot renderer
+        run: bash test/test_shared_snapshot.sh
+      - name: Test Agent Metrics launcher
+        run: bash test/test_agent_metrics_wrapper.sh
       - name: Test transcript backups
         run: bash test/test_backup_scripts.sh
       - name: Test Codex monitor

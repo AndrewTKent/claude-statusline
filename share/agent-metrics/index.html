@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Agent Metrics</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header>
+      <div>
+        <p class="eyebrow">LOCAL TELEMETRY</p>
+        <h1>Agent Metrics</h1>
+      </div>
+      <div class="live"><span></span> Live overview <time id="updated">—</time></div>
+    </header>
+
+    <main>
+      <section class="filters" aria-label="Dashboard filters">
+        <label>Range
+          <select id="range">
+            <option value="3600000">Last hour</option>
+            <option value="21600000">Last 6 hours</option>
+            <option value="86400000" selected>Last 24 hours</option>
+            <option value="604800000">Last 7 days</option>
+            <option value="0">All time</option>
+          </select>
+        </label>
+        <label>Provider<select id="provider"><option value="">All</option></select></label>
+        <label>Account<select id="account"><option value="">All</option></select></label>
+        <label>Model<select id="model"><option value="">All</option></select></label>
+        <label>Effort<select id="effort"><option value="">All</option></select></label>
+        <label>Session<select id="session"><option value="">All</option></select></label>
+        <label>Agent<select id="agent"><option value="">All</option></select></label>
+      </section>
+
+      <section class="analysis-summary" id="analysis-summary" aria-label="Today compared with yesterday"></section>
+
+      <section class="panel daily-panel">
+        <div class="panel-title">
+          <div><p class="eyebrow">LAST 14 LOCAL DAYS · STACKED BY ACCOUNT</p><h2>Day-by-day token use</h2></div>
+          <p class="method-note">Today is partial. The comparison cards use yesterday at the same time of day.</p>
+        </div>
+        <div id="daily-accounts" class="daily-accounts" role="img" aria-label="Daily token use stacked by account"></div>
+        <div class="table-wrap compact-table"><table id="daily-table"><thead><tr><th>Day</th><th>Fresh</th><th>Cache read</th><th>Cache write</th><th>Total traffic</th><th>Δ vs prior day</th></tr></thead><tbody></tbody></table></div>
+      </section>
+
+      <section class="panel account-health-panel">
+        <div class="panel-title">
+          <div><p class="eyebrow">FIVE-HOUR WINDOW · 10-MINUTE OBSERVATIONS</p><h2>Account headroom</h2></div>
+          <p class="method-note">Remaining percentage falls as each account is used. An upward jump is a reset, not an account switch.</p>
+        </div>
+        <div id="quota-drawdown" class="quota-drawdown" role="img" aria-label="Remaining five-hour percentage by account"></div>
+        <div class="table-wrap compact-table"><table id="account-status-table"><thead><tr><th>Account</th><th>Today</th><th>Fresh</th><th>Remaining</th><th>Observed draw</th><th>Reset</th></tr></thead><tbody></tbody></table></div>
+      </section>
+
+      <p class="section-label">SELECTED RANGE TOTALS</p>
+      <section class="cards" id="overview" aria-label="Overview"></section>
+
+      <section class="panel timeline-panel">
+        <div class="panel-title">
+          <div><p class="eyebrow" id="timeline-mode">10m trailing average · tokens/min</p><h2>Token timeline</h2></div>
+          <div><p class="method-note" id="timeline-insight"></p><label class="smoothing-control">Smoothing
+            <select id="smoothing">
+              <option value="1">1m raw</option>
+              <option value="10" selected>10m average</option>
+              <option value="30">30m average</option>
+            </select>
+          </label></div>
+        </div>
+        <div class="legend" id="series-controls" aria-label="Token series"></div>
+        <div id="timeline" class="timeline" role="img" aria-label="Stacked token timeline"></div>
+      </section>
+
+      <section class="panel timeline-panel">
+        <div class="panel-title"><div><p class="eyebrow">UP TO 24 HOURS · HOURLY + CUMULATIVE</p><h2>Day view</h2></div></div>
+        <div id="day-view" class="day-view" role="img" aria-label="Hourly and cumulative token evolution"></div>
+      </section>
+
+      <section class="grid two">
+        <article class="panel"><h2>Accounts</h2><div id="accounts"></div></article>
+        <article class="panel"><h2>Models</h2><div id="models"></div></article>
+      </section>
+
+      <section class="grid three">
+        <article class="panel metric-detail"><p class="eyebrow">TURN LATENCY</p><div id="latency"></div></article>
+        <article class="panel metric-detail"><p class="eyebrow">COMPACTIONS</p><div id="compactions"></div></article>
+        <article class="panel"><p class="eyebrow">QUOTA SNAPSHOTS</p><div id="quota"></div></article>
+      </section>
+
+      <section class="panel">
+        <div class="panel-title">
+          <div><p class="eyebrow">EMPIRICAL FIVE-HOUR WINDOWS</p><h2>Tracked-token equivalent</h2></div>
+          <p class="method-note">Tracked-token equivalent at 100%; other clients and untracked use can bias it.</p>
+        </div>
+        <div class="table-wrap"><table id="capacity-table"><thead><tr><th>Account</th><th>Cohort</th><th>Model</th><th>Effort</th><th>Samples</th><th>Est. @ 100%</th><th>Observed tokens</th><th>Dispersion</th></tr></thead><tbody></tbody></table></div>
+      </section>
+
+      <details class="panel detail-panel">
+        <summary><span><span class="eyebrow">DRILLDOWN</span>Sessions and agents</span><span class="muted">Show raw rows</span></summary>
+        <div class="table-wrap"><table id="sessions-table"><thead><tr><th>Provider</th><th>Session / agent</th><th>Model</th><th>Effort</th><th>Tokens</th><th>Last event</th></tr></thead><tbody></tbody></table></div>
+      </details>
+
+      <details class="panel detail-panel">
+        <summary><span><span class="eyebrow">OPERATIONS</span>Tools</span><span class="muted">Show raw rows</span></summary>
+        <div class="table-wrap"><table id="tools-table"><thead><tr><th>Tool</th><th>Status</th><th>Calls</th><th>Average duration</th></tr></thead><tbody></tbody></table></div>
+      </details>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>

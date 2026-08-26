@@ -1451,6 +1451,7 @@ IDLE_AFTER_SECONDS = 600
 IDLE_POLL_SECONDS = 30.0
 WAL_GUARD_BYTES = 128 * 1024 * 1024
 WAL_GUARD_MIN_INTERVAL_SECONDS = 60.0
+OWNER_PID_GRACE_SECONDS = 5.0
 
 
 def next_sleep_seconds(interval: float, latest_activity_ms: int, now_ms: int) -> float:
@@ -3841,11 +3842,18 @@ def watch(args: argparse.Namespace, p: Palette) -> int:
 
 def watch_loop(args: argparse.Namespace, p: Palette) -> int:
     wal_attempt = 0.0
+    owner_file_seen = False
+    owner_file_deadline = time.monotonic() + OWNER_PID_GRACE_SECONDS
     while True:
         latest_activity_ms = 0
         try:
-            if args.owner_pid_file and not owner_alive(args.owner_pid_file):
-                return 0
+            if args.owner_pid_file:
+                if Path(args.owner_pid_file).exists():
+                    owner_file_seen = True
+                elif owner_file_seen or time.monotonic() >= owner_file_deadline:
+                    return 0
+                if not owner_alive(args.owner_pid_file):
+                    return 0
             if args.dynamic_width:
                 args.width = terminal_size().columns
             data = all_sessions_snapshot(args) if args.all or args.top else snapshot(args)

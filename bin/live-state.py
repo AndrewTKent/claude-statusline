@@ -33,6 +33,12 @@ from pathlib import Path
 HOME = Path(os.environ.get("HOME", os.path.expanduser("~")))
 CLAUDE_RESETS = HOME / ".claude" / "account-resets.json"
 CLAUDE_TOKEN_SUMMARY = HOME / ".claude" / "token-scan-summary.json"
+AGENT_METRICS_DB = Path(
+    os.environ.get(
+        "AGENT_METRICS_DB",
+        str(HOME / "Library/Application Support/statusline/agent-metrics/metrics.sqlite3"),
+    )
+)
 
 
 def resolve_state_db(codex_home: Path) -> Path:
@@ -103,6 +109,52 @@ def labeled_rate_limits(rate_limits: dict) -> list[tuple[str, dict]]:
     return limits
 
 
+def codex_state_from_metrics(path: Path, max_age_s: int = 900) -> dict | None:
+    if not path.is_file():
+        return None
+    try:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.1)
+        rows = connection.execute(
+            "select tool_name, quota_window_minutes, quota_used_percent, "
+            "quota_resets_at, timestamp from events "
+            "where provider='codex' and event_kind='quota' "
+            "order by timestamp desc limit 20"
+        ).fetchall()
+        session_count = connection.execute(
+            "select count(distinct session_id) from events "
+            "where provider='codex' and session_id!=''"
+        ).fetchone()[0]
+        connection.close()
+    except sqlite3.Error:
+        return None
+    if not rows or int(time.time() * 1000) - int(rows[0][4]) > max_age_s * 1000:
+        return None
+    limits = []
+    seen = set()
+    for name, window_minutes, used_percent, resets_at, _timestamp in rows:
+        if name in seen or used_percent is None:
+            continue
+        seen.add(name)
+        label = rate_limit_window_label(window_minutes, "5-hour" if name == "primary" else "weekly")
+        limit = {
+            "label": label,
+            "used_percent": used_percent,
+            "resets_at": resets_at / 1000 if resets_at is not None else None,
+        }
+        limits.append(limit)
+    if not limits:
+        return None
+    result = {"rate_limits": limits, "session_count": session_count}
+    for limit in limits:
+        if limit["label"] == "5-hour":
+            result["rate_limit_5h_pct"] = limit["used_percent"]
+            result["rate_limit_5h_resets_at"] = limit["resets_at"]
+        elif limit["label"] == "weekly":
+            result["rate_limit_7d_pct"] = limit["used_percent"]
+            result["rate_limit_7d_resets_at"] = limit["resets_at"]
+    return result
+
+
 def emit(key: str, value: object) -> None:
     """Print a shell-safe KEY=VALUE line. Skips empty values."""
     if value is None or value == "":
@@ -134,8 +186,8 @@ def collect() -> dict:
         except (OSError, json.JSONDecodeError, ValueError):
             pass
     # Codex — prefer the engine's authoritative rate_limit payload when available.
-    codex_state: dict | None = None
-    if CLAUDE_TOKEN_SUMMARY.is_file():
+    codex_state = codex_state_from_metrics(AGENT_METRICS_DB)
+    if codex_state is None and CLAUDE_TOKEN_SUMMARY.is_file():
         try:
             summary = json.loads(CLAUDE_TOKEN_SUMMARY.read_text())
             codex_block = summary.get("codex") or {}

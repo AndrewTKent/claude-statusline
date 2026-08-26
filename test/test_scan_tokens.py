@@ -11,18 +11,27 @@ Or:  python3 test/test_scan_tokens.py   # falls back to unittest main.
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BIN = REPO_ROOT / "bin"
 sys.path.insert(0, str(BIN))
 import scan_tokens_core as core  # noqa: E402
+
+DAEMON_SPEC = importlib.util.spec_from_file_location(
+    "scan_tokens_daemon", BIN / "scan-tokens-daemon.py"
+)
+assert DAEMON_SPEC and DAEMON_SPEC.loader
+scan_tokens_daemon = importlib.util.module_from_spec(DAEMON_SPEC)
+DAEMON_SPEC.loader.exec_module(scan_tokens_daemon)
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +144,23 @@ class ScanTokensTestCase(unittest.TestCase):
     def _load_summary(self) -> dict:
         with open(self.cfg().summary_file) as f:
             return json.load(f)
+
+
+class TestDaemonCadence(ScanTokensTestCase):
+
+    def test_claude_flushes_do_not_rescan_codex_each_second(self):
+        daemon = scan_tokens_daemon.Daemon(self.cfg())
+        daemon.codex_aggregates = core.CodexAggregates()
+        daemon.last_codex_scan = time.monotonic()
+
+        with mock.patch.object(core, "codex_full_scan", return_value=core.CodexAggregates()) as codex_scan:
+            daemon.maybe_scan_codex()
+            daemon.maybe_scan_codex()
+            codex_scan.assert_not_called()
+
+            daemon.last_codex_scan -= scan_tokens_daemon.CODEX_SCAN_INTERVAL_S
+            daemon.maybe_scan_codex()
+            codex_scan.assert_called_once_with(daemon.cfg)
 
 
 # ---------------------------------------------------------------------------

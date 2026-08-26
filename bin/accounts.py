@@ -25,7 +25,9 @@ import argparse
 import fcntl
 import fnmatch
 import hashlib
+import hmac
 import json
+import math
 import os
 import re
 import shlex
@@ -44,6 +46,11 @@ LIVE_SERVICE = "Claude Code-credentials"
 LOCK_PATH = HOME / ".claude" / "accounts.lock"
 RESETS_PATH = HOME / ".claude" / "account-resets.json"
 SESSION_LIMITS_PATH = HOME / ".accounts" / "session-limits.json"
+SNAPSHOT_PATH = HOME / ".accounts" / "statusline-snapshot.json"
+WATCH_LOCK_PATH = HOME / ".accounts" / "watch.lock"
+MIN_WATCH_INTERVAL = 10.0
+PANE_PINS_PATH = HOME / ".accounts" / "pane-pins"
+PANE_SALT_PATH = HOME / ".accounts" / "pane-salt"
 NATIVE_REFRESH_LOCK_PATH = HOME / ".accounts" / "native-refresh.lock"
 CONFIRM_POLL_LOCK_PATH = HOME / ".accounts" / "confirm-poll.lock"
 # Short: a live session is waiting on this request.
@@ -330,16 +337,33 @@ def usage_to_reset_row(email: str, org_uuid: str, usage: dict, now_ts: int) -> d
 
     five = usage.get("five_hour") or {}
     seven = usage.get("seven_day") or {}
+    scoped_limits = []
+    for limit in usage.get("limits") or []:
+        if not isinstance(limit, dict):
+            continue
+        scope = limit.get("scope") or {}
+        if not isinstance(scope, dict) or not scope:
+            continue
+        model = scope.get("model") if isinstance(scope, dict) else {}
+        scoped_limits.append(
+            {
+                "kind": str(limit.get("kind") or ""),
+                "label": model.get("display_name") if isinstance(model, dict) else None,
+                "used_pct": limit.get("percent"),
+                "resets_at": limit.get("resets_at"),
+            }
+        )
     return {
         "email": email,
         "org_uuid": org_uuid,
         "five_hour_reset": five.get("resets_at"),
-        "five_hour_pct": five.get("utilization") or 0,
+        "five_hour_pct": five.get("utilization"),
         "seven_day_reset": seven.get("resets_at"),
-        "seven_day_pct": seven.get("utilization") or 0,
+        "seven_day_pct": seven.get("utilization"),
         "fable_pct": weekly("percent"),
         "fable_reset": weekly("resets_at"),
         "fable_label": weekly("label"),
+        "scoped_limits": scoped_limits,
         "last_seen": now_ts,
     }
 
@@ -587,16 +611,80 @@ def load_session_limits(now_ts: float) -> dict[str, dict]:
     }
 
 
+def shared_snapshot_enabled() -> bool:
+    return _conf_var("SHARED_ACCOUNT_SNAPSHOT") == "1"
+
+
+def poll_and_write_snapshot(*, collector_locked: bool = False) -> int:
+    if not collector_locked:
+        with watch_lock():
+            return poll_and_write_snapshot(collector_locked=True)
+    blobs: dict = {"accounts": {}}
+    try:
+        with locked():
+            blobs = load_blobs()
+            sync_profile_credentials(blobs, persist=True)
+        refresh_dormant_profiles()
+        with locked():
+            blobs = load_blobs()
+        n = poll_blobs_usage(blobs)
+        if shared_snapshot_enabled():
+            write_statusline_snapshot(blobs, error=None)
+        return n
+    except Exception as exc:
+        if shared_snapshot_enabled():
+            try:
+                write_statusline_snapshot(blobs, error=type(exc).__name__)
+            except Exception:
+                pass
+        raise
+
+
 def cmd_poll(_args) -> None:
     """Query every stored account's remaining limits and repaint the board."""
-    with locked():
-        blobs = load_blobs()
-        sync_profile_credentials(blobs, persist=True)
-    refresh_dormant_profiles()
-    with locked():
-        blobs = load_blobs()
-    n = poll_blobs_usage(blobs)
+    try:
+        n = poll_and_write_snapshot()
+    except AccountsError as exc:
+        if "collector is already running" not in str(exc):
+            raise
+        print("account collector is already running; poll skipped")
+        return
     print(f"refreshed usage for {n} account(s)")
+
+
+@contextmanager
+def watch_lock():
+    WATCH_LOCK_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    handle = open(WATCH_LOCK_PATH, "a+")
+    os.chmod(WATCH_LOCK_PATH, 0o600)
+    try:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise AccountsError("account collector is already running") from exc
+        yield
+    finally:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        handle.close()
+
+
+def cmd_watch(args) -> None:
+    with watch_lock():
+        print(f"watching account usage every {args.interval:g}s; Ctrl-C stops")
+        try:
+            while True:
+                try:
+                    n = poll_and_write_snapshot(collector_locked=True)
+                    print(f"refreshed usage for {n} account(s)")
+                except Exception as exc:  # keep the foreground collector alive
+                    error = type(exc).__name__
+                    print(f"accounts: watch cycle error: {error}", file=sys.stderr)
+                time.sleep(args.interval)
+        except KeyboardInterrupt:
+            print("accounts watch stopped")
 
 
 def cmd_refresh(args) -> None:
@@ -809,7 +897,8 @@ def write_profile_credentials(label: str, blob: str) -> None:
 
 
 def _repin_known_profile_login(source_label: str, identity: dict, blobs: dict) -> None:
-    mode = load_mode()
+    global_mode = _load_global_mode_snapshot()[0]
+    mode = {"mode": global_mode["mode"], "label": global_mode.get("label")}
     if mode.get("mode") != "set" or mode.get("label") != source_label:
         return
     target_label = resolve_label(
@@ -925,32 +1014,257 @@ def sync_profile_credentials(blobs: dict, *, persist: bool) -> set[str]:
     return blocked_labels
 
 
-def load_mode_snapshot() -> tuple[dict, tuple[int, int] | None]:
-    default = {"mode": "auto", "label": None}
+def _load_global_mode_snapshot() -> tuple[dict, int]:
+    default = {"mode": "auto", "label": None, "global_generation": 0}
     try:
         with MODE_PATH.open() as mode_file:
-            stat = os.fstat(mode_file.fileno())
             try:
                 mode = json.load(mode_file)
             except json.JSONDecodeError:
                 mode = default
     except OSError:
-        return default, None
-    generation = (stat.st_ino, stat.st_mtime_ns)
-    if isinstance(mode, dict) and mode.get("mode") in ("auto", "set", "fable"):
-        return mode, generation
-    return default, generation
+        return default, 0
+    if not isinstance(mode, dict) or mode.get("mode") not in ("auto", "set", "fable"):
+        return default, 0
+    generation = mode.get("global_generation", 0)
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+        generation = 0
+    return {
+        "mode": mode["mode"],
+        "label": mode.get("label"),
+        "global_generation": generation,
+    }, generation
+
+
+_AUTO_IDENTITY = object()
+
+
+def _boot_identity() -> str | None:
+    linux_boot_id = Path("/proc/sys/kernel/random/boot_id")
+    try:
+        value = linux_boot_id.read_text().strip()
+        if value:
+            return value
+    except OSError:
+        pass
+    try:
+        result = subprocess.run(
+            ["sysctl", "-n", "kern.boottime"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
+def _controlling_tty() -> str | None:
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        try:
+            if stream.isatty():
+                return os.ttyname(stream.fileno())
+        except (AttributeError, OSError):
+            continue
+    return None
+
+
+def pane_identity_material(
+    *,
+    env: dict[str, str] | None = None,
+    tty_path: str | None | object = _AUTO_IDENTITY,
+    boot_id: str | None | object = _AUTO_IDENTITY,
+) -> bytes:
+    values = os.environ if env is None else env
+    tmux = values.get("TMUX")
+    tmux_pane = values.get("TMUX_PANE")
+    if tmux and tmux_pane:
+        server = tmux.split(",", 1)[0]
+        if server:
+            return f"tmux:{server}\0{tmux_pane}".encode()
+    iterm = values.get("ITERM_SESSION_ID")
+    if iterm:
+        return f"iterm:{iterm}".encode()
+    term_session = values.get("TERM_SESSION_ID")
+    if term_session:
+        return f"term:{term_session}".encode()
+    term_program = values.get("TERM_PROGRAM", "").lower()
+    wezterm = values.get("WEZTERM_PANE")
+    if wezterm and term_program == "wezterm":
+        return f"wezterm:{wezterm}".encode()
+    kitty = values.get("KITTY_WINDOW_ID")
+    if kitty and (term_program == "kitty" or values.get("TERM") == "xterm-kitty"):
+        return f"kitty:{kitty}".encode()
+    tty_value = _controlling_tty() if tty_path is _AUTO_IDENTITY else tty_path
+    boot_value = _boot_identity() if boot_id is _AUTO_IDENTITY else boot_id
+    if tty_value and boot_value:
+        return f"tty:{boot_value}\0{tty_value}".encode()
+    raise AccountsError("cannot identify this terminal pane unambiguously")
+
+
+def _read_pane_salt() -> bytes | None:
+    try:
+        encoded = PANE_SALT_PATH.read_text().strip()
+        salt = bytes.fromhex(encoded)
+        if len(salt) != 32:
+            raise ValueError
+        os.chmod(PANE_SALT_PATH, 0o600)
+        return salt
+    except (OSError, ValueError):
+        return None
+
+
+def _pane_salt() -> bytes:
+    salt = _read_pane_salt()
+    if salt is not None:
+        return salt
+    with locked():
+        salt = _read_pane_salt()
+        if salt is not None:
+            return salt
+        salt = os.urandom(32)
+        _write_0600(PANE_SALT_PATH, salt.hex() + "\n")
+        return salt
+
+
+def pane_key(*, env: dict[str, str] | None = None) -> str:
+    return hmac.new(_pane_salt(), pane_identity_material(env=env), hashlib.sha256).hexdigest()
+
+
+def _pane_pin_path() -> Path:
+    return PANE_PINS_PATH / f"{pane_key()}.json"
+
+
+def _load_pane_pin(global_generation: int) -> tuple[dict | None, tuple[int, int] | None]:
+    try:
+        path = _pane_pin_path()
+    except AccountsError:
+        return None, None
+    try:
+        with path.open() as pin_file:
+            stat = os.fstat(pin_file.fileno())
+            pin = json.load(pin_file)
+    except (OSError, json.JSONDecodeError):
+        return None, None
+    file_generation = (stat.st_ino, stat.st_mtime_ns)
+    if (
+        not isinstance(pin, dict)
+        or pin.get("version") != 1
+        or not isinstance(pin.get("label"), str)
+        or pin.get("base_global_generation") != global_generation
+    ):
+        return None, file_generation
+    return pin, file_generation
+
+
+def _mode_store_is_v2() -> bool:
+    try:
+        record = json.loads(MODE_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    generation = record.get("global_generation") if isinstance(record, dict) else None
+    return bool(
+        isinstance(record, dict)
+        and record.get("version") == 2
+        and isinstance(generation, int)
+        and not isinstance(generation, bool)
+        and generation >= 0
+        and record.get("mode") in ("auto", "set", "fable")
+    )
+
+
+def _migrate_mode_store() -> None:
+    if _mode_store_is_v2():
+        return
+    with locked():
+        if _mode_store_is_v2():
+            return
+        mode, generation = _load_global_mode_snapshot()
+        _write_0600(
+            MODE_PATH,
+            json.dumps(
+                {
+                    "version": 2,
+                    "mode": mode["mode"],
+                    "label": mode.get("label"),
+                    "global_generation": generation,
+                },
+                sort_keys=True,
+            )
+            + "\n",
+        )
+
+
+def load_mode_snapshot() -> tuple[dict, tuple[int, tuple[int, int] | None]]:
+    _migrate_mode_store()
+    global_mode, global_generation = _load_global_mode_snapshot()
+    pin, pane_generation = _load_pane_pin(global_generation)
+    if pin is not None:
+        return {
+            "mode": "set",
+            "label": pin["label"],
+            "global_generation": global_generation,
+            "policy_scope": "pane",
+        }, (global_generation, pane_generation)
+    return {
+        **global_mode,
+        "policy_scope": "global",
+    }, (global_generation, pane_generation)
 
 
 def load_mode() -> dict:
-    return load_mode_snapshot()[0]
+    mode = load_mode_snapshot()[0]
+    result = {"mode": mode["mode"], "label": mode.get("label")}
+    if mode.get("policy_scope") == "pane":
+        result["policy_scope"] = "pane"
+    return result
 
 
 def save_mode(mode: str, label: str | None) -> None:
-    MODE_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    tmp = MODE_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"mode": mode, "label": label}) + "\n")
-    os.replace(tmp, MODE_PATH)
+    if mode not in ("auto", "set", "fable"):
+        raise AccountsError(f"invalid routing mode: {mode}")
+    with locked():
+        _, generation = _load_global_mode_snapshot()
+        record = {
+            "version": 2,
+            "mode": mode,
+            "label": label,
+            "global_generation": generation + 1,
+        }
+        _write_0600(MODE_PATH, json.dumps(record, sort_keys=True) + "\n")
+        if PANE_PINS_PATH.exists():
+            for pin_path in PANE_PINS_PATH.glob("*.json"):
+                pin_path.unlink(missing_ok=True)
+
+
+def save_pane_pin(label: str) -> None:
+    declared = {declared_label for declared_label, _, _ in load_label_pairs()}
+    if label not in declared:
+        raise AccountsError(f"'{label}' is not a declared account label")
+    _migrate_mode_store()
+    with locked():
+        _, global_generation = _load_global_mode_snapshot()
+        path = _pane_pin_path()
+        PANE_PINS_PATH.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(PANE_PINS_PATH, 0o700)
+        _write_0600(
+            path,
+            json.dumps(
+                {
+                    "version": 1,
+                    "label": label,
+                    "base_global_generation": global_generation,
+                },
+                sort_keys=True,
+            )
+            + "\n",
+        )
+
+
+def clear_pane_pin() -> None:
+    with locked():
+        _pane_pin_path().unlink(missing_ok=True)
 
 
 def _write_0600(path: Path, text: str) -> None:
@@ -1001,13 +1315,11 @@ def load_blobs() -> dict:
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
-        # Readable but corrupt: preserve it before any capture overwrites the store,
-        # so a bad parse never silently destroys the other accounts' stored logins.
         _preserve_corrupt(BLOBS_PATH)
-        return {"version": 1, "accounts": {}}
+        raise AccountsError(f"{BLOBS_PATH} is corrupt — refusing to treat as empty")
     if not isinstance(parsed, dict):
         _preserve_corrupt(BLOBS_PATH)
-        return {"version": 1, "accounts": {}}
+        raise AccountsError(f"{BLOBS_PATH} is invalid — refusing to treat as empty")
     return parsed
 
 
@@ -1189,12 +1501,39 @@ def profile_live_blob(label: str) -> str | None:
         return None
 
 
+def _usable_native_claude(path: Path) -> bool:
+    try:
+        resolved = path.resolve(strict=True)
+        if not os.access(resolved, os.X_OK):
+            return False
+        with resolved.open("rb") as handle:
+            head = handle.read(512)
+    except OSError:
+        return False
+    return not (head.startswith(b"#!") and b"claude-router" in head)
+
+
 def native_claude_binary() -> str | None:
-    binary = Path(
-        os.environ.get("CLAUDE_REAL_BIN") or HOME / ".local/bin/claude"
-    )
-    if binary.is_file() and os.access(binary, os.X_OK):
-        return str(binary)
+    explicit = os.environ.get("CLAUDE_REAL_BIN")
+    if explicit and _usable_native_claude(Path(explicit)):
+        return explicit
+    native = HOME / ".local/bin/claude"
+    if _usable_native_claude(native):
+        return str(native)
+    versions = HOME / ".local/share/claude/versions"
+    try:
+        newest = max(
+            (path for path in versions.iterdir() if _usable_native_claude(path)),
+            key=lambda path: path.stat().st_mtime,
+            default=None,
+        )
+    except OSError:
+        newest = None
+    if newest is not None:
+        return str(newest)
+    binary = shutil.which("claude")
+    if binary and _usable_native_claude(Path(binary)):
+        return binary
     return None
 
 
@@ -1272,6 +1611,7 @@ def refresh_keychain_profiles(
             for label in labels
         }
         processes: list[subprocess.Popen] = []
+        json_paths: list[Path] = []
         launched: set[str] = set()
         for index, label in enumerate(labels):
             fd, json_name = tempfile.mkstemp(
@@ -1281,6 +1621,7 @@ def refresh_keychain_profiles(
             os.close(fd)
             json_path = Path(json_name)
             json_path.unlink()
+            json_paths.append(json_path)
             env = os.environ.copy()
             for name in (
                 "ANTHROPIC_API_KEY",
@@ -1316,21 +1657,32 @@ def refresh_keychain_profiles(
 
         refreshed: set[str] = set()
         deadline = time.monotonic() + wait_s
-        while launched - refreshed:
-            for label in launched - refreshed:
-                blob = profile_live_blob(label) or ""
-                expiry = blob_access_expiry(blob)
-                if blob_access_token(blob) and (
-                    blob != before[label]
-                    or (expiry is not None and expiry > now_ts)
-                ):
-                    refreshed.add(label)
+        try:
+            while launched - refreshed:
+                for label in launched - refreshed:
+                    blob = profile_live_blob(label) or ""
+                    expiry = blob_access_expiry(blob)
+                    if blob_access_token(blob) and (
+                        blob != before[label]
+                        or (expiry is not None and expiry > now_ts)
+                    ):
+                        refreshed.add(label)
+                if not launched - refreshed or time.monotonic() >= deadline:
+                    break
+                time.sleep(NATIVE_REFRESH_POLL_S)
+            return len(refreshed)
+        finally:
             for process in processes:
-                process.poll()
-            if not launched - refreshed or time.monotonic() >= deadline:
-                break
-            time.sleep(NATIVE_REFRESH_POLL_S)
-        return len(refreshed)
+                if process.poll() is not None:
+                    continue
+                process.terminate()
+                try:
+                    process.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=1.0)
+            for json_path in json_paths:
+                json_path.unlink(missing_ok=True)
 
 
 def refresh_dormant_profiles() -> int:
@@ -1385,6 +1737,7 @@ def poll_blobs_usage(blobs: dict) -> int:
     estimate until the account is next active and its blob refreshes."""
     now = int(time.time())
     fresh: dict[str, dict] = {}
+    failed = 0
     for label, e in (blobs.get("accounts") or {}).items():
         blob = profile_live_blob(label) or e.get("blob", "")
         exp = blob_access_expiry(blob)
@@ -1395,11 +1748,14 @@ def poll_blobs_usage(blobs: dict) -> int:
             continue
         usage = fetch_usage(token)
         if usage is None:
+            failed += 1
             continue
         fresh[f"{e.get('email')}|{e.get('org_uuid')}"] = usage_to_reset_row(
             e.get("email"), e.get("org_uuid"), usage, now
         )
     merge_reset_rows(fresh)
+    if failed:
+        raise AccountsError(f"usage poll failed for {failed} account(s)")
     return len(fresh)
 
 
@@ -1442,6 +1798,171 @@ def route_rows(blobs: dict, active_label: str | None, now_ts: float) -> list[dic
         )
     )
     return rows
+
+
+def _snapshot_window(
+    used_pct: object,
+    resets_at: object,
+    observed_at: object,
+    now_ts: float,
+    *,
+    hard_limited: bool = False,
+) -> dict:
+    try:
+        used = float(used_pct) if used_pct is not None else None
+    except (TypeError, ValueError):
+        used = None
+    try:
+        observed = float(observed_at) if observed_at is not None else None
+    except (TypeError, ValueError):
+        observed = None
+    reset_text = resets_at if isinstance(resets_at, str) else None
+    reset = parse_iso(reset_text)
+    reset_ts = reset.timestamp() if reset is not None else None
+    pending_reset = bool(
+        reset_ts is not None
+        and now_ts >= reset_ts
+        and (observed is None or observed < reset_ts)
+    )
+    if reset_ts is not None and now_ts >= reset_ts and not pending_reset and used is not None:
+        used = 0.0
+    if hard_limited:
+        used = 100.0
+    return {
+        "used_pct": used,
+        "resets_at": reset_text,
+        "observed_at": observed,
+        "stale": observed is None or now_ts - observed > STALE_AFTER_S,
+        "pending_reset": pending_reset,
+    }
+
+
+def _snapshot_scoped_limits(row: dict) -> list[dict]:
+    scoped = row.get("scoped_limits")
+    if isinstance(scoped, list):
+        return [limit for limit in scoped if isinstance(limit, dict)]
+    if any(row.get(key) is not None for key in ("fable_pct", "fable_reset", "fable_label")):
+        return [
+            {
+                "kind": "weekly_scoped",
+                "label": row.get("fable_label"),
+                "used_pct": row.get("fable_pct"),
+                "resets_at": row.get("fable_reset"),
+            }
+        ]
+    return []
+
+
+def _previous_snapshot() -> dict | None:
+    try:
+        snapshot = json.loads(SNAPSHOT_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return snapshot if isinstance(snapshot, dict) else None
+
+
+def _snapshot_previous_success() -> int | None:
+    snapshot = _previous_snapshot()
+    if snapshot is None:
+        return None
+    health = snapshot.get("health")
+    value = health.get("last_success_at") if isinstance(health, dict) else None
+    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def write_statusline_snapshot(blobs: dict, *, error: str | None) -> dict:
+    now_ts = int(time.time())
+    _migrate_mode_store()
+    mode, global_generation = _load_global_mode_snapshot()
+    declared = {label for label, _, _ in load_label_pairs()}
+    mode_label = mode.get("label")
+    if mode_label not in declared:
+        mode_label = None
+    resets = load_resets()
+    session_limits = load_session_limits(now_ts)
+    lease_counts: dict[str, int] = {}
+    for lease in load_session_leases(now_ts):
+        label = lease.get("label")
+        if label in declared:
+            lease_counts[label] = lease_counts.get(label, 0) + 1
+    previous = _previous_snapshot()
+    previous_accounts = previous.get("accounts") if isinstance(previous, dict) else None
+    accounts_snapshot: dict[str, dict] = (
+        dict(previous_accounts)
+        if error is not None and isinstance(previous_accounts, dict)
+        else {}
+    )
+    for label, entry in (blobs.get("accounts") or {}).items():
+        if label not in declared or not isinstance(entry, dict):
+            continue
+        email = entry.get("email")
+        org_uuid = entry.get("org_uuid")
+        key = f"{email}|{org_uuid}"
+        row = resets_row(resets, email, org_uuid)
+        observed_at = row.get("last_seen")
+        scoped_snapshot = []
+        scoped_hard_limit = f"{key}|fable" in session_limits
+        raw_scoped = _snapshot_scoped_limits(row)
+        for limit in raw_scoped:
+            label_text = limit.get("label")
+            matches_detected_limit = bool(
+                scoped_hard_limit
+                and (
+                    len(raw_scoped) == 1
+                    or (isinstance(label_text, str) and "fable" in label_text.lower())
+                )
+            )
+            window = _snapshot_window(
+                limit.get("used_pct"),
+                limit.get("resets_at"),
+                observed_at,
+                now_ts,
+                hard_limited=matches_detected_limit,
+            )
+            scoped_snapshot.append(
+                {
+                    "kind": str(limit.get("kind") or ""),
+                    "label": label_text if isinstance(label_text, str) else None,
+                    **window,
+                }
+            )
+        accounts_snapshot[label] = {
+            "five_hour": _snapshot_window(
+                row.get("five_hour_pct"),
+                row.get("five_hour_reset"),
+                observed_at,
+                now_ts,
+                hard_limited=key in session_limits,
+            ),
+            "seven_day": _snapshot_window(
+                row.get("seven_day_pct"),
+                row.get("seven_day_reset"),
+                observed_at,
+                now_ts,
+            ),
+            "scoped": scoped_snapshot,
+            "expired": entry_needs_login(entry, now_ts),
+            "live_leases": lease_counts.get(label, 0),
+        }
+    last_success = _snapshot_previous_success()
+    if error is None:
+        last_success = now_ts
+    snapshot = {
+        "version": 1,
+        "generated_at": now_ts,
+        "health": {
+            "last_success_at": last_success,
+            "error": error,
+        },
+        "mode": {
+            "mode": mode["mode"],
+            "label": mode_label,
+            "global_generation": global_generation,
+        },
+        "accounts": accounts_snapshot,
+    }
+    _write_0600(SNAPSHOT_PATH, json.dumps(snapshot, indent=2, sort_keys=True) + "\n")
+    return snapshot
 
 
 def binding_pct(*pcts: float | None) -> float:
@@ -1805,6 +2326,8 @@ def _fable_first(rows: list[dict]) -> list[dict]:
 
 def _route_preferences() -> tuple[dict, str | None, bool]:
     mode = load_mode()
+    if mode.get("policy_scope") == "pane":
+        return mode, mode.get("label"), True
     session_pin = os.environ.get("ACCOUNTS_PIN") or None
     if session_pin is not None:
         return mode, session_pin, False
@@ -2186,6 +2709,30 @@ def _fable_rank(r: dict) -> tuple:
     )
 
 
+def cmd_pane_set(args) -> None:
+    declared = {label for label, _, _ in load_label_pairs()}
+    if args.label not in declared:
+        raise AccountsError(f"'{args.label}' is not a declared account label")
+    with locked():
+        blobs = load_blobs()
+        blocked_labels = sync_profile_credentials(blobs, persist=True)
+        if args.label in blocked_labels:
+            raise AccountsError(f"'{args.label}' has an unverified profile login")
+        entry = (blobs.get("accounts") or {}).get(args.label)
+        if not entry:
+            raise AccountsError(f"'{args.label}' has no stored OAuth login")
+        if entry_needs_login(entry, time.time()):
+            raise AccountsError(f"'{args.label}' login is unusable — /login it first")
+        ensure_native_profile(args.label, entry)
+        save_pane_pin(args.label)
+    print(f"PANE → {args.label}")
+
+
+def cmd_pane_clear(_args) -> None:
+    clear_pane_pin()
+    print("PANE → global policy")
+
+
 def cmd_set(args) -> None:
     """Force supervised sessions onto <label>."""
     with locked():
@@ -2259,7 +2806,8 @@ def cmd_status(_args) -> None:
     ]
     excludes = excluded_labels()
     if mode["mode"] == "set":
-        tag = f"SET → {mode['label']}"
+        scope = "PANE" if mode.get("policy_scope") == "pane" else "SET"
+        tag = f"{scope} → {mode['label']}"
         ordered = rows
         pin = mode["label"]
         force_pin = True
@@ -2343,8 +2891,19 @@ def cmd_ls(_args) -> None:
         print("EXPIRED = stored refresh token dead; switch to it needs a fresh /login")
 
 
-def main(argv: list[str] | None = None) -> None:
-    retire_legacy_route_agent()
+def positive_interval(value: str) -> float:
+    try:
+        interval = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("interval must be a number greater than zero") from exc
+    if not math.isfinite(interval) or interval < MIN_WATCH_INTERVAL:
+        raise argparse.ArgumentTypeError(
+            f"interval must be at least {MIN_WATCH_INTERVAL:g} seconds"
+        )
+    return interval
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="accounts", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -2354,6 +2913,15 @@ def main(argv: list[str] | None = None) -> None:
     )
     p_set.add_argument("label")
     p_set.set_defaults(fn=cmd_set)
+
+    p_pane = sub.add_parser("pane", help="set or clear this terminal pane's account policy")
+    pane_sub = p_pane.add_subparsers(dest="pane_command", required=True)
+    p_pane_set = pane_sub.add_parser("set", help="pin this terminal pane to a declared label")
+    p_pane_set.add_argument("label")
+    p_pane_set.set_defaults(fn=cmd_pane_set)
+    pane_sub.add_parser("clear", help="return this pane to the global policy").set_defaults(
+        fn=cmd_pane_clear
+    )
 
     sub.add_parser(
         "auto",
@@ -2370,6 +2938,10 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser(
         "poll", help="refresh the usage board for all stored accounts now"
     ).set_defaults(fn=cmd_poll)
+
+    p_watch = sub.add_parser("watch", help="poll all accounts in this foreground process")
+    p_watch.add_argument("--interval", type=positive_interval, default=60.0)
+    p_watch.set_defaults(fn=cmd_watch)
 
     p_mint = sub.add_parser("mint", help="mint + vault a 1-year token via claude setup-token")
     p_mint.add_argument("label", help="account label (from ACCOUNT_LABELS)")
@@ -2397,6 +2969,12 @@ def main(argv: list[str] | None = None) -> None:
     p_pick_env.set_defaults(fn=cmd_pick_env)
 
     sub.add_parser("ls", help="list stored accounts with headroom").set_defaults(fn=cmd_ls)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    retire_legacy_route_agent()
+    parser = build_parser()
 
     args = parser.parse_args(argv)
     try:

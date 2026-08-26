@@ -31,7 +31,7 @@
 # Map full email addresses → payer labels for the "payer" dimension in
 # scan-tokens.py. This shows "which plan paid" independently of "what work."
 # Tokens from emails not in this map fall into "unknown".
-# EMAIL_PAYER_MAP="work:andrew@company.com personal:me@gmail.com alumni:me@alumni.example.edu"
+# EMAIL_PAYER_MAP="work:you@company.com personal:you@example.com alumni:you@alumni.example.edu"
 
 # Show a "resets" line listing next 5-hour reset + current utilization for
 # every account the statusline has polled. Eventually consistent — an
@@ -40,6 +40,17 @@
 # is highlighted, and the soonest-to-reset gets a "→" marker. Set to 1 to
 # enable.
 # SHOW_ACCOUNT_RESETS=1
+
+# Read account identity, routing mode, and quota windows only from the private
+# snapshot written by `accounts poll` or foreground `accounts watch`. This
+# disables statusline credential inspection, OAuth calls, shared ledgers, and
+# the full token-scan fallback. The current row maps only through the router's
+# ACCOUNTS_ROUTED_LABEL; snapshot keys must be declared short labels.
+# SHARED_ACCOUNT_SNAPSHOT=1
+# SHARED_ACCOUNT_SNAPSHOT_FILE="$HOME/.accounts/statusline-snapshot.json"
+# SHARED_ACCOUNT_SNAPSHOT_MAX_AGE=180
+# AGENT_METRICS_RECORDER=1
+# AGENT_METRICS_DB="$HOME/Library/Application Support/statusline/agent-metrics/metrics.sqlite3"
 
 # ─── Token classifier (optional; for scan-tokens.py) ───────────────────────
 # Classify each token request as work / personal / unknown. Independent of

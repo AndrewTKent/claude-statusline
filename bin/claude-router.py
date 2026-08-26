@@ -244,6 +244,7 @@ def routed_environment(
     selected: dict,
     state_path: Path,
     args: list[str],
+    policy_scope: str = "global",
 ) -> dict[str, str]:
     env = os.environ.copy()
     for key in (
@@ -252,6 +253,7 @@ def routed_environment(
         "ACCOUNTS_ROUTED_LABEL",
         "ACCOUNTS_ROUTED_EMAIL",
         "ACCOUNTS_ROUTED_ORG_UUID",
+        "ACCOUNTS_POLICY_SCOPE",
         ULTRACODE_ENV,
     ):
         env.pop(key, None)
@@ -266,6 +268,7 @@ def routed_environment(
             "ACCOUNTS_ROUTED_LABEL": selected["label"],
             "ACCOUNTS_ROUTED_EMAIL": selected["email"],
             "ACCOUNTS_ROUTED_ORG_UUID": selected["org_uuid"],
+            "ACCOUNTS_POLICY_SCOPE": policy_scope,
             "ACCOUNTS_ROUTER_STATE": str(state_path),
         }
     )
@@ -530,14 +533,11 @@ def run_supervised(binary: str, args: list[str]) -> int:
         if option_value(args, "--model") and current_family != "fable"
         else None
     )
-    if (
-        mode.get("mode") == "fable"
-        and current_family != "fable"
-        and user_pinned_model is None
-    ):
+    if mode.get("mode") == "fable" and user_pinned_model is None:
         current_model = "fable"
         current_family = "fable"
-        launch_args = replace_model_args(launch_args, current_model)
+        if option_value(launch_args, "--model") != current_model:
+            launch_args = replace_model_args(launch_args, current_model)
     model_override = None
     selected = accounts.select_profile(
         require_fable=current_family == "fable",
@@ -560,13 +560,19 @@ def run_supervised(binary: str, args: list[str]) -> int:
     if selected is None:
         print("accounts: no account has enough quota for this model", file=sys.stderr)
         return 1
+    os.environ.pop("ACCOUNTS_PIN", None)
 
     if os.environ.pop("ACCOUNTS_ROUTER_OUTPUT_FROZEN", "") == "1":
         set_synchronized_output(False)
     try:
         while True:
             state_path.unlink(missing_ok=True)
-            env = routed_environment(selected, state_path, launch_args)
+            env = routed_environment(
+                selected,
+                state_path,
+                launch_args,
+                mode.get("policy_scope", "global"),
+            )
             accounts.upsert_session_lease(
                 router_pid,
                 session_id,
@@ -662,10 +668,48 @@ def run_supervised(binary: str, args: list[str]) -> int:
                     mode, mode_generation = accounts.load_mode_snapshot()
                     mode_changed = mode_generation != applied_mode_generation
                     if mode_changed and mode.get("mode") == "fable":
-                        # Re-issuing `accounts fable` means everything back
-                        # on fable, including sessions the user pinned away.
                         user_pinned_model = None
-                    if (
+                        next_profile = accounts.select_profile(
+                            require_fable=True,
+                            lease_pid=router_pid,
+                        )
+                        if next_profile is None:
+                            next_model = os.environ.get(
+                                "ACCOUNTS_FABLE_FALLBACK_MODEL",
+                                FABLE_FALLBACK_MODEL,
+                            )
+                            next_override = next_model
+                            next_profile = accounts.select_profile(
+                                require_fable=False,
+                                prefer_fable=False,
+                                lease_pid=router_pid,
+                            )
+                        else:
+                            next_model = "fable"
+                            next_override = None
+                        if next_profile is None:
+                            continue
+                    elif mode_changed and mode.get("mode") in ("auto", "set"):
+                        next_model = model_override or current_model
+                        next_override = model_override
+                        next_profile = accounts.select_profile(
+                            require_fable=current_family == "fable",
+                            lease_pid=router_pid,
+                        )
+                        if next_profile is None and current_family == "fable":
+                            next_model = os.environ.get(
+                                "ACCOUNTS_FABLE_FALLBACK_MODEL",
+                                FABLE_FALLBACK_MODEL,
+                            )
+                            next_override = next_model
+                            next_profile = accounts.select_profile(
+                                require_fable=False,
+                                prefer_fable=False,
+                                lease_pid=router_pid,
+                            )
+                        if next_profile is None:
+                            continue
+                    elif (
                         mode.get("mode") == "fable"
                         and current_family != "fable"
                         and user_pinned_model is None
@@ -712,8 +756,6 @@ def run_supervised(binary: str, args: list[str]) -> int:
                             if next_profile is None:
                                 continue
                         else:
-                            if mode_changed:
-                                applied_mode_generation = mode_generation
                             continue
                     elif (
                         mode.get("mode") == "set"
@@ -757,9 +799,6 @@ def run_supervised(binary: str, args: list[str]) -> int:
                             continue
                         next_model = model_override or current_model
                         next_override = model_override
-                    elif mode_changed:
-                        applied_mode_generation = mode_generation
-                        continue
                     else:
                         continue
                     applied_mode_generation = mode_generation

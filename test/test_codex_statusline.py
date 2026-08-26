@@ -35,7 +35,7 @@ class CodexStatuslineTest(unittest.TestCase):
         self.assertEqual(codex_statusline.format_tokens(1_900_000), "1.9M")
 
     def test_decode_jwt_payload(self) -> None:
-        payload = {"email": "andrew@example.com"}
+        payload = {"email": "developer@example.invalid"}
         encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
         self.assertEqual(codex_statusline.decode_jwt_payload(f"x.{encoded}.y"), payload)
 
@@ -3140,6 +3140,96 @@ class CodexStatuslineTest(unittest.TestCase):
         self.assertIn("codex 7d: 96%", result.stdout)
         self.assertNotIn("codex 5h:", result.stdout)
 
+    def test_live_state_ignores_stale_agent_metrics_quota(self) -> None:
+        live_state = MODULE_PATH.with_name("live-state.py")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            claude_home = home / ".claude"
+            claude_home.mkdir()
+            (claude_home / "token-scan-summary.json").write_text(
+                json.dumps(
+                    {
+                        "codex": {
+                            "rate_limit": {
+                                "primary": {
+                                    "used_percent": 99.0,
+                                    "window_minutes": 300,
+                                }
+                            }
+                        }
+                    }
+                )
+            )
+            metrics = home / "metrics.sqlite3"
+            connection = sqlite3.connect(metrics)
+            connection.execute(
+                "create table events(provider text, event_kind text, tool_name text, "
+                "quota_window_minutes integer, quota_used_percent real, quota_resets_at integer, "
+                "timestamp integer, session_id text)"
+            )
+            connection.execute(
+                "insert into events values('codex','quota','primary',10080,44,1788272012000,1,'session')"
+            )
+            connection.commit()
+            connection.close()
+
+            result = subprocess.run(
+                [sys.executable, str(live_state), "--render"],
+                text=True,
+                capture_output=True,
+                check=True,
+                env={**os.environ, "HOME": str(home), "AGENT_METRICS_DB": str(metrics)},
+            )
+
+        self.assertIn("codex 5h: 99%", result.stdout)
+        self.assertNotIn("codex 7d: 44%", result.stdout)
+
+    def test_live_state_prefers_fresh_agent_metrics_quota(self) -> None:
+        live_state = MODULE_PATH.with_name("live-state.py")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            claude_home = home / ".claude"
+            claude_home.mkdir()
+            (claude_home / "token-scan-summary.json").write_text(
+                json.dumps(
+                    {
+                        "codex": {
+                            "rate_limit": {
+                                "primary": {
+                                    "used_percent": 99.0,
+                                    "window_minutes": 300,
+                                }
+                            }
+                        }
+                    }
+                )
+            )
+            metrics = home / "metrics.sqlite3"
+            connection = sqlite3.connect(metrics)
+            connection.execute(
+                "create table events(provider text, event_kind text, tool_name text, "
+                "quota_window_minutes integer, quota_used_percent real, quota_resets_at integer, "
+                "timestamp integer, session_id text)"
+            )
+            connection.execute(
+                "insert into events values('codex','quota','primary',10080,44,1788272012000,?,"
+                "'session')",
+                (int(time.time() * 1000),),
+            )
+            connection.commit()
+            connection.close()
+
+            result = subprocess.run(
+                [sys.executable, str(live_state), "--render"],
+                text=True,
+                capture_output=True,
+                check=True,
+                env={**os.environ, "HOME": str(home), "AGENT_METRICS_DB": str(metrics)},
+            )
+
+        self.assertIn("codex 7d: 44%", result.stdout)
+        self.assertNotIn("codex 5h: 99%", result.stdout)
+
     def test_watch_refreshes_footer_width_from_terminal(self) -> None:
         args = codex_statusline.parse_args(["--footer", "--watch", "1"])
         widths = []
@@ -3200,6 +3290,35 @@ class CodexStatuslineTest(unittest.TestCase):
             self.assertEqual(codex_statusline.watch(args, codex_statusline.Palette(False)), 0)
 
         self.assertEqual(thread_ids, ["", ""])
+
+    def test_watch_stops_when_the_owner_file_disappears(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pid_file = Path(tmpdir) / "owner.pid"
+            pid_file.write_text(str(os.getpid()))
+            args = codex_statusline.parse_args(
+                ["--footer", "--watch", "1", "--owner-pid-file", str(pid_file)]
+            )
+            snapshots = mock.Mock(return_value={})
+
+            def remove_owner(_data, _args, _palette):
+                pid_file.unlink()
+                return "status"
+
+            with (
+                mock.patch.object(codex_statusline, "snapshot", snapshots),
+                mock.patch.object(codex_statusline, "render", side_effect=remove_owner),
+                mock.patch.object(
+                    codex_statusline.time,
+                    "sleep",
+                    side_effect=[None, KeyboardInterrupt],
+                ),
+            ):
+                self.assertEqual(
+                    codex_statusline.watch(args, codex_statusline.Palette(False)),
+                    0,
+                )
+
+        snapshots.assert_called_once()
 
     def test_watch_keeps_footer_on_alternate_screen(self) -> None:
         args = codex_statusline.parse_args(["--footer", "--watch", "1"])
