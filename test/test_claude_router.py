@@ -98,13 +98,13 @@ def test_new_session_gets_a_stable_session_id():
     assert str(uuid.UUID(session_id)) == session_id
 
 
-def test_interactive_session_defaults_to_ultracode():
+def test_interactive_session_defaults_to_high():
     assert claude_router.with_default_effort(
         ["--dangerously-skip-permissions"]
     ) == [
         "--dangerously-skip-permissions",
         "--effort",
-        "ultracode",
+        "high",
     ]
 
 
@@ -112,10 +112,10 @@ def test_interactive_session_defaults_to_ultracode():
     "args",
     [
         ["--effort", "max"],
-        ["--effort=high"],
+        ["--effort=ultracode"],
     ],
 )
-def test_explicit_effort_overrides_the_ultracode_default(args):
+def test_explicit_effort_overrides_the_high_default(args):
     assert claude_router.with_default_effort(args) == args
 
 
@@ -1335,10 +1335,10 @@ def test_fable_mode_launches_directly_on_fable(monkeypatch):
     assert claude_router.run_supervised("/real/claude", []) == 0
     assert selections[0]["require_fable"] is True
     assert launches[0][0][-2:] == ["--model", "fable"]
-    assert claude_router.option_value(launches[0][0], "--effort") == "ultracode"
+    assert claude_router.option_value(launches[0][0], "--effort") == "high"
     assert claude_router.option_value(launches[0][0], "--name") == "\u200b"
     assert "CLAUDE_CODE_EFFORT_LEVEL" not in launches[0][1]["env"]
-    assert launches[0][1]["env"]["CLAUDE_ROUTER_ULTRACODE"] == "1"
+    assert "CLAUDE_ROUTER_ULTRACODE" not in launches[0][1]["env"]
 
 
 def test_passthrough_preserves_an_explicit_profile(monkeypatch):
@@ -1359,7 +1359,7 @@ def test_passthrough_preserves_an_explicit_profile(monkeypatch):
     assert calls == [("call", ["/real/claude", "auth", "status"], {})]
 
 
-def test_print_inference_defaults_to_ultracode(monkeypatch):
+def test_print_inference_defaults_to_high(monkeypatch):
     calls = []
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/profiles/explicit")
     monkeypatch.setattr(
@@ -1373,7 +1373,7 @@ def test_print_inference_defaults_to_ultracode(monkeypatch):
         ["--print", "hello"],
     ) == 0
 
-    assert claude_router.option_value(calls[0][0], "--effort") == "ultracode"
+    assert claude_router.option_value(calls[0][0], "--effort") == "high"
 
 
 def test_print_explicit_effort_clears_an_inherited_override(monkeypatch):
@@ -1430,7 +1430,7 @@ def test_fable_print_requires_fable_headroom(monkeypatch):
         "--print",
         "hello",
     ]
-    assert claude_router.option_value(calls[1][1], "--effort") == "ultracode"
+    assert claude_router.option_value(calls[1][1], "--effort") == "high"
     assert calls[1][2]["env"]["CLAUDE_CONFIG_DIR"] == "/profiles/fable"
 
 
@@ -1478,7 +1478,7 @@ def test_fable_print_falls_back_to_opus(monkeypatch):
         "hello",
     ]
     assert claude_router.option_value(calls[2][1], "--model") == "opus"
-    assert claude_router.option_value(calls[2][1], "--effort") == "ultracode"
+    assert claude_router.option_value(calls[2][1], "--effort") == "high"
     assert calls[2][2]["env"]["CLAUDE_CONFIG_DIR"] == "/profiles/general"
 
 
