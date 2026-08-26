@@ -22,6 +22,11 @@ claude_router = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(claude_router)
 
 
+@pytest.fixture(autouse=True)
+def disable_host_hard_session_limit(monkeypatch):
+    monkeypatch.setenv("ACCOUNTS_HARD_SESSION_LIMIT", "0")
+
+
 def read_exact(fd, size):
     data = bytearray()
     deadline = time.monotonic() + 1
@@ -1160,6 +1165,11 @@ def test_running_supervisor_ignores_advisory_quota_changes(monkeypatch):
         ),
     )
     monkeypatch.setattr(
+        claude_router.accounts,
+        "hard_session_limit_enabled",
+        lambda: False,
+    )
+    monkeypatch.setattr(
         claude_router.subprocess,
         "Popen",
         lambda command, **_kwargs: launches.append(command) or Child(),
@@ -1177,6 +1187,176 @@ def test_running_supervisor_ignores_advisory_quota_changes(monkeypatch):
 
     assert claude_router.run_supervised("/real/claude", []) == 0
     assert len(launches) == 1
+
+
+def test_opt_in_hard_session_limit_stops_without_a_safe_account(
+    monkeypatch,
+    capsys,
+):
+    session_id = str(uuid.uuid4())
+    selected = {
+        "profile": "/profiles/first",
+        "label": "first",
+        "email": "first@example.com",
+        "org_uuid": "org-first",
+    }
+    stopped = []
+
+    class Child:
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(
+        claude_router,
+        "initial_session_args",
+        lambda _args: (["--resume", session_id], session_id),
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "select_profile",
+        lambda **_kwargs: selected,
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "hard_session_limit_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "profile_session_limit_reached",
+        lambda _label: True,
+    )
+    monkeypatch.setattr(
+        claude_router,
+        "session_limit_route",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "load_mode_snapshot",
+        lambda: ({"mode": "set", "label": "first"}, (1, 1)),
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "upsert_session_lease",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "remove_session_lease",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        claude_router.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: Child(),
+    )
+    monkeypatch.setattr(claude_router.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        claude_router,
+        "read_router_state",
+        lambda _path: {"session_id": session_id, "model": "Opus 5"},
+    )
+    monkeypatch.setattr(
+        claude_router,
+        "stop_for_handoff",
+        lambda child: stopped.append(child),
+    )
+
+    assert claude_router.run_supervised("/real/claude", []) == 1
+    assert len(stopped) == 1
+    assert "hard session limit" in capsys.readouterr().err
+
+
+def test_opt_in_hard_session_limit_resumes_on_a_safe_account(monkeypatch):
+    session_id = str(uuid.uuid4())
+    first = {
+        "profile": "/profiles/first",
+        "label": "first",
+        "email": "first@example.com",
+        "org_uuid": "org-first",
+    }
+    second = {
+        "profile": "/profiles/second",
+        "label": "second",
+        "email": "second@example.com",
+        "org_uuid": "org-second",
+    }
+    launches = []
+    stopped = []
+
+    class Child:
+        def __init__(self, running):
+            self.running = running
+
+        def poll(self):
+            return None if self.running else 0
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(
+        claude_router,
+        "initial_session_args",
+        lambda _args: (["--resume", session_id], session_id),
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "select_profile",
+        lambda **_kwargs: first,
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "hard_session_limit_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "profile_session_limit_reached",
+        lambda label: label == "first",
+    )
+    monkeypatch.setattr(
+        claude_router,
+        "session_limit_route",
+        lambda *_args, **_kwargs: (second, None),
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "load_mode_snapshot",
+        lambda: ({"mode": "set", "label": "first"}, (1, 1)),
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "upsert_session_lease",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "remove_session_lease",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        claude_router.subprocess,
+        "Popen",
+        lambda command, **_kwargs: launches.append(command)
+        or Child(len(launches) == 1),
+    )
+    monkeypatch.setattr(claude_router.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        claude_router,
+        "read_router_state",
+        lambda _path: {"session_id": session_id, "model": "Opus 5"},
+    )
+    monkeypatch.setattr(
+        claude_router,
+        "stop_for_handoff",
+        lambda child: stopped.append(child),
+    )
+
+    assert claude_router.run_supervised("/real/claude", []) == 0
+    assert len(stopped) == 1
+    assert len(launches) == 2
+    assert launches[1][-2:] == ["--session-id", session_id]
 
 
 @pytest.mark.parametrize("requested_mode", ["fable", "set"])

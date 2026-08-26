@@ -352,6 +352,7 @@ Create `~/.claude/statusline.conf` (bash, sourced directly). Full annotated vers
 - `SHOW_ACCOUNT_RESETS=1` — adds a per-account board (5h%, reset, week%, fable%, reset, work-unit cap) below the main rows
 - `SHARED_ACCOUNT_SNAPSHOT=1` — read account/routing/quota rows only from the private accounts snapshot; use `accounts watch --interval 60` to refresh it explicitly
 - `SHARED_ACCOUNT_SNAPSHOT_FILE` / `SHARED_ACCOUNT_SNAPSHOT_MAX_AGE` — override the snapshot path or stale threshold
+- `ACCOUNTS_HARD_SESSION_LIMIT=1` — opt in to stopping routed Claude sessions at 100% five-hour utilization; account pins are bypassed only at that boundary
 
 **Token classifier** (feeds the `tokens` row's work/personal split — see `bin/scan-tokens.py`)
 - `WORK_PATHS` / `PERSONAL_PATHS` — comma-separated cwd/file-path substrings
@@ -391,6 +392,10 @@ The installer puts the router wrapper at `~/.local/bin/claude`, keeps native
 Claude binaries under `~/.local/share/claude/versions`, installs the router
 tools under `~/.local/bin`, and prepends a supervised launcher from
 `~/.accounts/bin` in new zsh sessions.
+
+`ACCOUNTS_HARD_SESSION_LIMIT=1` is an opt-in overage guard. A supervised
+session resumes on another safe account on the next supervisor check after
+100% five-hour utilization is observed, or terminates when none is available.
 
 | Command | What it does |
 |---------|---------------|

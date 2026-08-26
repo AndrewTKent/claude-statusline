@@ -398,6 +398,13 @@ def _conf_var(name: str) -> str:
         return ""
 
 
+def hard_session_limit_enabled() -> bool:
+    value = os.environ.get("ACCOUNTS_HARD_SESSION_LIMIT") or _conf_var(
+        "ACCOUNTS_HARD_SESSION_LIMIT"
+    )
+    return value == "1"
+
+
 def load_label_pairs() -> list[tuple[str, str, str | None]]:
     pairs: list[tuple[str, str, str | None]] = []
     for pair in _conf_var("ACCOUNT_LABELS").split():
@@ -2414,26 +2421,47 @@ def select_profile(
     """Pick a routable profile, confirming a stale candidate if nothing else
     qualifies. The first pass is network-free; the retry only happens when
     staleness alone is what left no candidate."""
+    effective_avoid = set(avoid_labels or ())
+    ignore_policy = False
+    effective_force_label = force_label
     picked = _select_profile_once(
-        avoid_labels=avoid_labels,
+        avoid_labels=effective_avoid,
         require_fable=require_fable,
         prefer_fable=prefer_fable,
         lease_pid=lease_pid,
-        force_label=force_label,
+        force_label=effective_force_label,
+        ignore_policy=ignore_policy,
     )
-    if picked is not None or force_label is not None:
+    if (
+        picked is not None
+        and hard_session_limit_enabled()
+        and profile_session_limit_reached(picked["label"])
+    ):
+        effective_avoid.add(picked["label"])
+        effective_force_label = None
+        ignore_policy = True
+        picked = _select_profile_once(
+            avoid_labels=effective_avoid,
+            require_fable=require_fable,
+            prefer_fable=prefer_fable,
+            lease_pid=lease_pid,
+            force_label=effective_force_label,
+            ignore_policy=ignore_policy,
+        )
+    if picked is not None or (force_label is not None and not ignore_policy):
         return picked
     if not confirm_stale_candidate(
-        excludes=excluded_labels() | (avoid_labels or set()),
+        excludes=excluded_labels() | effective_avoid,
         require_fable=require_fable,
     ):
         return None
     return _select_profile_once(
-        avoid_labels=avoid_labels,
+        avoid_labels=effective_avoid,
         require_fable=require_fable,
         prefer_fable=prefer_fable,
         lease_pid=lease_pid,
-        force_label=force_label,
+        force_label=effective_force_label,
+        ignore_policy=ignore_policy,
     )
 
 
@@ -2444,12 +2472,16 @@ def _select_profile_once(
     prefer_fable: bool | None = None,
     lease_pid: int | None = None,
     force_label: str | None = None,
+    ignore_policy: bool = False,
 ) -> dict | None:
     avoid_labels = avoid_labels or set()
     with locked():
         blobs = load_blobs()
         blocked_labels = sync_profile_credentials(blobs, persist=True)
         mode, pin, force_pin = _route_preferences()
+        if ignore_policy:
+            pin = None
+            force_pin = False
         if force_label is not None:
             pin = force_label
             force_pin = True
@@ -2459,7 +2491,9 @@ def _select_profile_once(
             if row["label"] not in blocked_labels
         ]
         if prefer_fable is None:
-            prefer_fable = require_fable or mode.get("mode") == "fable"
+            prefer_fable = require_fable or (
+                not ignore_policy and mode.get("mode") == "fable"
+            )
         leases = load_session_leases()
         rows = rank_profile_rows(
             rows,
@@ -2574,6 +2608,23 @@ def profile_general_exhausted(label: str) -> bool:
         return False
 
 
+def profile_session_limit_reached(label: str) -> bool:
+    try:
+        rows = route_rows(load_blobs(), label, time.time())
+        row = next(
+            (candidate for candidate in rows if candidate["label"] == label),
+            None,
+        )
+        # Last-observed 100% stays unsafe until a post-reset poll proves headroom.
+        return bool(
+            row
+            and row["five_hour"] is not None
+            and row["five_hour"] >= SESSION_HARD_LIMIT_PCT
+        )
+    except Exception:
+        return False
+
+
 def profile_near_wall(label: str) -> bool:
     """True when the active account is close enough to a rate wall to leave now.
 
@@ -2682,6 +2733,7 @@ SEVEN_DAY_CAP_PCT = 90.0
 # Above this on either axis an account is genuinely walled and never a
 # last-resort pick.
 HARD_WALL_PCT = 97.0
+SESSION_HARD_LIMIT_PCT = 100.0
 FABLE_CAP_PCT = 100.0
 # Leave the active account here. Deliberately later than RATE_CAP_PCT, the bar a
 # row must clear to RECEIVE work: moving a live session costs a stop and resume,

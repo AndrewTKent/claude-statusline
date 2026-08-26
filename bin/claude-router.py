@@ -524,6 +524,7 @@ def run_supervised(binary: str, args: list[str]) -> int:
     state_path = Path(f"/tmp/claude/account-router-{router_pid}.json")
     interval = float(os.environ.get("ACCOUNTS_ROUTER_INTERVAL", ROUTER_INTERVAL_S))
     mode, applied_mode_generation = accounts.load_mode_snapshot()
+    hard_session_limit = accounts.hard_session_limit_enabled()
     current_model = model_name(args)
     current_effort = option_value(args, "--effort")
     current_family = "fable" if current_model == "fable" else "general"
@@ -641,7 +642,18 @@ def run_supervised(binary: str, args: list[str]) -> int:
                     if detected_limit is not None and limit_rejected is None:
                         limit_rejected = detected_limit
                         mark_detected_limit(selected, detected_limit)
-                if limit_rejected:
+                hard_limit_reached = bool(
+                    hard_session_limit
+                    and accounts.profile_session_limit_reached(selected["label"])
+                )
+                if hard_limit_reached:
+                    limit_route = session_limit_route(
+                        selected,
+                        current_family,
+                        "session",
+                        router_pid,
+                    )
+                elif limit_rejected:
                     limit_route = session_limit_route(
                         selected,
                         current_family,
@@ -657,9 +669,19 @@ def run_supervised(binary: str, args: list[str]) -> int:
                         current_family,
                     )
                     last_heartbeat = now
+                if hard_limit_reached and (not session_id or limit_route is None):
+                    stop_for_handoff(child)
+                    print(
+                        "accounts: hard session limit reached; no safe account is available",
+                        file=sys.stderr,
+                    )
+                    return 1
                 if not session_id:
                     continue
-                if limit_rejected:
+                if hard_limit_reached:
+                    next_profile, next_override = limit_route
+                    next_model = next_override or current_model
+                elif limit_rejected:
                     if limit_route is None:
                         continue
                     next_profile, next_override = limit_route
