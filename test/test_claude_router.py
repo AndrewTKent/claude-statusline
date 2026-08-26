@@ -2464,3 +2464,168 @@ def test_live_switch_back_to_fable_clears_the_pin(monkeypatch):
     assert len(handoffs) == 1
     assert claude_router.option_value(launches[-1], "--model") == "fable"
     assert launches[-1][-2:] == ["--session-id", session_id]
+
+
+def test_live_pane_pin_handoffs_only_this_supervisor_and_resumes_session(monkeypatch):
+    session_id = str(uuid.uuid4())
+    first = {"profile": "/p/first", "label": "first", "email": "first@x", "org_uuid": "o1"}
+    second = {"profile": "/p/second", "label": "second", "email": "second@x", "org_uuid": "o2"}
+    snapshots = iter(
+        [
+            ({"mode": "auto", "label": None, "global_generation": 1, "policy_scope": "global"}, (1, None)),
+            ({"mode": "set", "label": "second", "global_generation": 1, "policy_scope": "pane"}, (1, (2, 3))),
+        ]
+    )
+    launches = []
+    selections = []
+
+    class Child:
+        def __init__(self, running):
+            self.running = running
+
+        def poll(self):
+            return None if self.running else 0
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(claude_router.accounts, "load_mode_snapshot", lambda: next(snapshots))
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "select_profile",
+        lambda **kwargs: second if kwargs.get("avoid_labels") else first,
+    )
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "handoff_target",
+        lambda *_args, **_kwargs: "second",
+    )
+    monkeypatch.setattr(
+        claude_router.subprocess,
+        "Popen",
+        lambda command, **kwargs: launches.append(command) or Child(len(launches) == 1),
+    )
+    monkeypatch.setattr(claude_router, "read_router_state", lambda _path: {"session_id": session_id})
+    monkeypatch.setattr(claude_router, "stop_for_handoff", lambda _child: None)
+    _pin_test_harness(monkeypatch, session_id, selections)
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "select_profile",
+        lambda **kwargs: selections.append(kwargs)
+        or (first if len(selections) == 1 else second),
+    )
+
+    assert claude_router.run_supervised("/real/claude", []) == 0
+    assert len(launches) == 2
+    assert launches[1][-2:] == ["--session-id", session_id]
+
+
+def test_global_generation_change_restarts_same_account_session(monkeypatch):
+    session_id = str(uuid.uuid4())
+    first = {"profile": "/p/first", "label": "first", "email": "first@x", "org_uuid": "o1"}
+    calls = []
+    launches = []
+    snapshots = iter(
+        [
+            ({"mode": "set", "label": "first", "global_generation": 1, "policy_scope": "pane"}, (1, (2, 3))),
+            ({"mode": "set", "label": "first", "global_generation": 2, "policy_scope": "global"}, (2, None)),
+        ]
+    )
+
+    class Child:
+        def __init__(self, running):
+            self.running = running
+
+        def poll(self):
+            calls.append(True)
+            return None if self.running and len(calls) == 1 else 0
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(claude_router.accounts, "load_mode_snapshot", lambda: next(snapshots))
+    monkeypatch.setattr(
+        claude_router.subprocess,
+        "Popen",
+        lambda command, **_kwargs: launches.append(command)
+        or Child(len(launches) == 1),
+    )
+    monkeypatch.setattr(claude_router, "read_router_state", lambda _path: {"session_id": session_id})
+    monkeypatch.setattr(claude_router, "stop_for_handoff", lambda _child: None)
+    selections = []
+    _pin_test_harness(monkeypatch, session_id, selections)
+    monkeypatch.setattr(claude_router.accounts, "select_profile", lambda **kwargs: first)
+
+    assert claude_router.run_supervised("/real/claude", []) == 0
+    assert len(launches) == 2
+    assert launches[1][-2:] == ["--session-id", session_id]
+
+
+def test_global_auto_change_applies_the_global_selection(monkeypatch):
+    session_id = str(uuid.uuid4())
+    first = {"profile": "/p/first", "label": "first", "email": "first@x", "org_uuid": "o1"}
+    second = {"profile": "/p/second", "label": "second", "email": "second@x", "org_uuid": "o2"}
+    snapshots = iter(
+        [
+            ({"mode": "set", "label": "first", "global_generation": 1, "policy_scope": "pane"}, (1, (2, 3))),
+            ({"mode": "auto", "label": None, "global_generation": 2, "policy_scope": "global"}, (2, None)),
+        ]
+    )
+    launches = []
+    selections = []
+
+    class Child:
+        def __init__(self, running):
+            self.running = running
+
+        def poll(self):
+            return None if self.running else 0
+
+        def wait(self):
+            return 0
+
+    def select_profile(**kwargs):
+        selections.append(kwargs)
+        return first if len(selections) == 1 else second
+
+    monkeypatch.setattr(claude_router.accounts, "load_mode_snapshot", lambda: next(snapshots))
+    monkeypatch.setattr(claude_router.accounts, "select_profile", select_profile)
+    monkeypatch.setattr(
+        claude_router.subprocess,
+        "Popen",
+        lambda command, **kwargs: launches.append(command) or Child(len(launches) == 1),
+    )
+    monkeypatch.setattr(claude_router, "read_router_state", lambda _path: {"session_id": session_id})
+    monkeypatch.setattr(claude_router, "stop_for_handoff", lambda _child: None)
+    _pin_test_harness(monkeypatch, session_id, selections)
+    monkeypatch.setattr(claude_router.accounts, "select_profile", select_profile)
+
+    assert claude_router.run_supervised("/real/claude", ["--model", "opus"]) == 0
+    assert len(launches) == 2
+    assert launches[1][-2:] == ["--session-id", session_id]
+
+
+def test_accounts_pin_is_launch_only_for_a_live_supervisor(monkeypatch):
+    session_id = str(uuid.uuid4())
+    selected = {"profile": "/p/first", "label": "first", "email": "first@x", "org_uuid": "o1"}
+
+    class Child:
+        def poll(self):
+            return 0
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setenv("ACCOUNTS_PIN", "first")
+    monkeypatch.setattr(
+        claude_router.accounts,
+        "load_mode_snapshot",
+        lambda: ({"mode": "auto", "label": None}, (1, None)),
+    )
+    monkeypatch.setattr(claude_router.subprocess, "Popen", lambda *_args, **_kwargs: Child())
+    monkeypatch.setattr(claude_router, "read_router_state", lambda _path: {})
+    _pin_test_harness(monkeypatch, session_id, [])
+    monkeypatch.setattr(claude_router.accounts, "select_profile", lambda **kwargs: selected)
+
+    assert claude_router.run_supervised("/real/claude", []) == 0
+    assert "ACCOUNTS_PIN" not in os.environ

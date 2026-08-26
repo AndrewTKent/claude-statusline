@@ -2,7 +2,7 @@
 # shellcheck disable=SC2059,SC2034,SC2154,SC2153,SC1090,SC2329,SC2016
 set -f
 
-input=$(cat)
+IFS= read -r -d '' input || true
 
 # Config: ~/.claude/statusline.conf (sourced as bash)
 #   DAILY_BUDGET=20           # Daily cost ceiling in $ (enables budget bar)
@@ -15,7 +15,7 @@ input=$(cat)
 #                             # auto-detection — useful when Claude Code's
 #                             # status panel is narrower than the terminal)
 
-if [ -z "$input" ]; then
+if [[ "$input" =~ ^[[:space:]]*$ ]]; then
     printf "Claude"
     exit 0
 fi
@@ -164,6 +164,57 @@ session_topic() {
         END { if (last != "") { if (length(last) > 48) last = substr(last, 1, 47) "…"; print last } }
     ')
     [ -n "$topic" ] && printf '%s' "$topic" > "$cache" && printf '%s\n' "$topic"
+}
+
+recent_session_checkout() {
+    local sid="$1" cwd="$2"
+    [ -z "$sid" ] || [ -z "$cwd" ] && return
+    local launch_root project_dir session_file cache cached
+    launch_root=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null)
+    [ -n "$launch_root" ] || return
+    project_dir=$(printf '%s' "$cwd" | tr '/' '-')
+    session_file="$HOME/.claude/projects/${project_dir}/${sid}.jsonl"
+    [ -f "$session_file" ] || return
+    cache="/tmp/claude/statusline-checkout-${sid}.txt"
+    if [ -f "$cache" ] && [ "$cache" -nt "$session_file" ]; then
+        cached=$(<"$cache")
+        if [ -d "$cached" ] && git -C "$cached" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            printf '%s\n' "$cached"
+        fi
+        return
+    fi
+
+    local activity selected="$launch_root" selected_line=0 worktree_line candidate candidate_alias line
+    activity=$(tail -n 300 "$session_file" 2>/dev/null | jq -r '
+        select(.type == "assistant")
+        | .message.content[]?
+        | select(.type == "tool_use")
+        | [.input.command?, .input.cwd?, .input.workdir?, .input.file_path?, .input.path?, .input.args?]
+        | .. | strings
+    ' 2>/dev/null)
+    while IFS= read -r worktree_line; do
+        case "$worktree_line" in
+            'worktree '*) candidate="${worktree_line#worktree }" ;;
+            *) continue ;;
+        esac
+        candidate_alias="$candidate"
+        [[ "$candidate_alias" == /private/* ]] && candidate_alias="${candidate_alias#/private}"
+        line=$(awk -v needle="$candidate" -v alias="$candidate_alias" '
+            index($0, needle) || index($0, alias) { found = NR }
+            END { if (found) print found }
+        ' <<< "$activity")
+        if [ -n "$line" ] && [ "$line" -ge "$selected_line" ] 2>/dev/null; then
+            selected="$candidate"
+            selected_line="$line"
+        fi
+    done < <(git -C "$launch_root" worktree list --porcelain 2>/dev/null)
+
+    mkdir -p "${cache%/*}" 2>/dev/null
+    local cache_tmp="${cache}.tmp.$$"
+    printf '%s\n' "$selected" > "$cache_tmp" 2>/dev/null &&
+        chmod 600 "$cache_tmp" 2>/dev/null &&
+        mv "$cache_tmp" "$cache" 2>/dev/null
+    printf '%s\n' "$selected"
 }
 
 #   PCT        integer 0..100
@@ -423,7 +474,7 @@ update_ledger() {
 # Caches result for 30s to avoid scanning on every render.
 SUBAGENT_TOKENS=0
 get_subagent_tokens() {
-    local sid="$1" cwd="$2"
+    local sid="$1" cwd="$2" current_epoch="${3:-}"
     SUBAGENT_TOKENS=0
     [ -z "$sid" ] || [ -z "$cwd" ] && return
 
@@ -434,10 +485,17 @@ get_subagent_tokens() {
     if [ -f "$cache_file" ]; then
         local cache_age
         local cache_mtime
-        cache_mtime=$(file_mtime "$cache_file")
-        cache_age=$(( $(date +%s) - cache_mtime ))
+        if [ -n "$current_epoch" ] && [[ "$OSTYPE" == darwin* ]]; then
+            cache_mtime=$(stat -f %m "$cache_file" 2>/dev/null)
+        elif [ -n "$current_epoch" ]; then
+            cache_mtime=$(stat -c %Y "$cache_file" 2>/dev/null)
+        else
+            cache_mtime=$(file_mtime "$cache_file")
+        fi
+        [ -z "$current_epoch" ] && current_epoch=$(date +%s)
+        cache_age=$(( current_epoch - cache_mtime ))
         if [ "$cache_age" -lt 30 ]; then
-            SUBAGENT_TOKENS=$(cat "$cache_file" 2>/dev/null)
+            SUBAGENT_TOKENS=$(<"$cache_file")
             [ -z "$SUBAGENT_TOKENS" ] && SUBAGENT_TOKENS=0
             return
         fi
@@ -565,7 +623,11 @@ format_reset_time() {
 }
 
 # ── Parse JSON (single jq call for performance) ────────
-eval "$(echo "$input" | jq -r '
+if [ "${SHARED_ACCOUNT_SNAPSHOT:-0}" = "1" ]; then
+    MODEL="unknown" COST=0 DURATION_MS=0 CONTEXT_PCT=0 CWD=""
+    INPUT_TOKENS=0 OUTPUT_TOKENS=0 SESSION_ID="" EFFORT_VAL=""
+else
+    eval "$(jq -r '
     "MODEL=" + (.model.display_name // "unknown" | @sh),
     "COST=" + (.cost.total_cost_usd // 0 | tostring | @sh),
     "DURATION_MS=" + (.cost.total_duration_ms // 0 | tostring | @sh),
@@ -580,12 +642,13 @@ eval "$(echo "$input" | jq -r '
     "SESSION_ID=" + (.session_id // "" | @sh),
     "EFFORT_VAL=" + (.effort.level // .effort_level // "" | @sh),
     "CTX_SIZE=" + (.context_window.context_window_size // 200000 | tostring | @sh)
-' 2>/dev/null)"
+' <<< "$input" 2>/dev/null)"
+fi
 
 # ── Effort level ───────────────────────────────────────
 EFFORT=""
 effort_val="${EFFORT_VAL:-}"
-if [ -z "$effort_val" ]; then
+if [ -z "$effort_val" ] && [ "${SHARED_ACCOUNT_SNAPSHOT:-0}" != "1" ]; then
     settings_path="$HOME/.claude/settings.json"
     [ -f "$settings_path" ] && effort_val=$(jq -r '.effortLevel // empty' "$settings_path" 2>/dev/null)
 fi
@@ -608,6 +671,435 @@ case "$effort_label" in
     max)    EFFORT="${red}.max${reset}" ;;
     ultracode) EFFORT="${magenta}.ultracode${reset}" ;;
 esac
+
+shared_snapshot_identity() {
+    local identity
+    if [[ "$OSTYPE" == darwin* ]]; then
+        identity=$(stat -f '%i:%m' "$1" 2>/dev/null)
+    else
+        identity=$(stat -c '%i:%Y' "$1" 2>/dev/null)
+    fi
+    case "$identity" in ''|*[!0-9:]*) return 1 ;; esac
+    printf '%s' "$identity"
+}
+
+shared_reset_text() {
+    local resets_at="$1" pending="$2" style="${3:-time}"
+    if [ "$pending" = "true" ]; then
+        printf 'pending'
+        return
+    fi
+    [ -z "$resets_at" ] || [ "$resets_at" = "null" ] && { printf '—'; return; }
+    format_reset_time "$resets_at" "$style"
+}
+
+shared_reset_relative() {
+    local resets_at="$1" pending="$2" epoch now delta
+    if [ "$pending" = "true" ]; then
+        printf 'pending'
+        return
+    fi
+    [ -z "$resets_at" ] || [ "$resets_at" = "null" ] && { printf '—'; return; }
+    epoch=$(iso_to_epoch "$resets_at")
+    [ -z "$epoch" ] && { printf '—'; return; }
+    now=$(date +%s)
+    delta=$(( epoch - now ))
+    [ "$delta" -le 0 ] && { printf 'now'; return; }
+    if [ "$delta" -lt 3600 ]; then
+        printf '%dm' "$(( delta / 60 ))"
+    elif [ "$delta" -lt 86400 ]; then
+        printf '%dh%dm' "$(( delta / 3600 ))" "$(( (delta % 3600) / 60 ))"
+    else
+        printf '%dd' "$(( delta / 86400 ))"
+    fi
+}
+
+render_shared_account_snapshot() {
+    local snapshot_file="${SHARED_ACCOUNT_SNAPSHOT_FILE:-$HOME/.accounts/statusline-snapshot.json}"
+    local before="" after="" snapshot="" snapshot_state="missing" snapshot_values="" shared_status_parsed=false
+    if [ -r "$snapshot_file" ]; then
+        before=$(shared_snapshot_identity "$snapshot_file")
+        snapshot=$(<"$snapshot_file")
+        after=$(shared_snapshot_identity "$snapshot_file")
+        if [ -n "$before" ] && [ "$before" != "$after" ]; then
+            snapshot_state="changing"
+        elif [ -n "$before" ]; then
+            snapshot_state="stable"
+        else
+            snapshot_state="invalid"
+        fi
+    fi
+
+    local routed_label="${ACCOUNTS_ROUTED_LABEL:-}" now_epoch snapshot_max_age
+    local snapshot_age_source=0 snapshot_has_error=false snapshot_stale=true current_exists=false
+    local mode_value="" mode_label="" five_pct="" five_reset="" five_stale=true five_pending=false
+    local seven_pct="" seven_reset="" seven_stale=true seven_pending=false
+    local scoped_kind="" scoped_label="" scoped_pct="" scoped_reset="" scoped_stale=true scoped_pending=false
+    local shared_rows=""
+    snapshot_max_age="${SHARED_ACCOUNT_SNAPSHOT_MAX_AGE:-180}"
+    case "$snapshot_max_age" in
+        ''|*[!0-9]*|0) snapshot_max_age=180 ;;
+    esac
+    now_epoch=$(date +%s)
+    if [ "$snapshot_state" = "stable" ]; then
+        snapshot_values=$(jq -r --arg label "$routed_label" --argjson status "$input" '
+            if .version != 1 or (.accounts | type != "object") then error("invalid snapshot") else . end |
+            (.accounts[$label] // null) as $account |
+            (($account.scoped // [] | map(select((.label // "" | ascii_downcase) == "fable")) | first) // {}) as $scoped |
+            "MODEL=" + ($status.model.display_name // "unknown" | @sh),
+            "COST=" + ($status.cost.total_cost_usd // 0 | tostring | @sh),
+            "DURATION_MS=" + ($status.cost.total_duration_ms // 0 | tostring | @sh),
+            "CONTEXT_PCT=" + ($status.context_window.used_percentage // 0 | tostring | @sh),
+            "CWD=" + ($status.workspace.current_dir // "" | @sh),
+            "INPUT_TOKENS=" + ($status.context_window.total_input_tokens // 0 | tostring | @sh),
+            "OUTPUT_TOKENS=" + ($status.context_window.total_output_tokens // 0 | tostring | @sh),
+            "SESSION_ID=" + ($status.session_id // "" | @sh),
+            "EFFORT_VAL=" + ($status.effort.level // $status.effort_level // "" | @sh),
+            "snapshot_age_source=" + (((.health.last_success_at // .generated_at // 0) | tonumber? // 0 | floor) | tostring | @sh),
+            "snapshot_has_error=" + ((.health.error != null) | tostring | @sh),
+            "mode_value=" + ((.mode.mode // "") | @sh),
+            "mode_label=" + ((.mode.label // "") | @sh),
+            "current_exists=" + (($account != null) | tostring | @sh),
+            "five_pct=" + (($account.five_hour.used_pct // "") | tostring | @sh),
+            "five_reset=" + (($account.five_hour.resets_at // "") | @sh),
+            "five_stale=" + ((if ($account.five_hour | has("stale")) then $account.five_hour.stale else true end) | tostring | @sh),
+            "five_pending=" + (($account.five_hour.pending_reset // false) | tostring | @sh),
+            "seven_pct=" + (($account.seven_day.used_pct // "") | tostring | @sh),
+            "seven_reset=" + (($account.seven_day.resets_at // "") | @sh),
+            "seven_stale=" + ((if ($account.seven_day | has("stale")) then $account.seven_day.stale else true end) | tostring | @sh),
+            "seven_pending=" + (($account.seven_day.pending_reset // false) | tostring | @sh),
+            "scoped_kind=" + (($scoped.kind // "") | @sh),
+            "scoped_label=" + (($scoped.label // "") | @sh),
+            "scoped_pct=" + (($scoped.used_pct // "") | tostring | @sh),
+            "scoped_reset=" + (($scoped.resets_at // "") | @sh),
+            "scoped_stale=" + ((if ($scoped | has("stale")) then $scoped.stale else true end) | tostring | @sh),
+            "scoped_pending=" + (($scoped.pending_reset // false) | tostring | @sh),
+            "shared_rows=" + ([
+                .accounts | to_entries[] | .key as $row_label | .value as $row_account |
+                (($row_account.scoped // [] | map(select((.label // "" | ascii_downcase) == "fable")) | first) // {}) as $row_scoped |
+                [$row_label, ($row_account.five_hour.used_pct // ""), ($row_account.five_hour.resets_at // ""),
+                 (if ($row_account.five_hour | has("stale")) then $row_account.five_hour.stale else true end), ($row_account.five_hour.pending_reset // false),
+                 ($row_account.seven_day.used_pct // ""), ($row_account.seven_day.resets_at // ""),
+                 (if ($row_account.seven_day | has("stale")) then $row_account.seven_day.stale else true end), ($row_account.seven_day.pending_reset // false),
+                 ($row_scoped.used_pct // ""), ($row_scoped.label // $row_scoped.kind // ""), ($row_scoped.resets_at // ""),
+                 (if ($row_scoped | has("stale")) then $row_scoped.stale else true end), ($row_scoped.pending_reset // false),
+                 ($row_account.expired // false), ($row_account.live_leases // 0)] | map(tostring) | join("\u001f")
+            ] | join("\n") | @sh)
+        ' <<< "$snapshot" 2>/dev/null) || snapshot_values=""
+        if [ -n "$snapshot_values" ]; then
+            eval "$snapshot_values"
+            shared_status_parsed=true
+            snapshot_state="ready"
+            snapshot_stale=false
+            local snapshot_age=$(( now_epoch - snapshot_age_source ))
+            if [ "$snapshot_has_error" = "true" ] || [ "$snapshot_age_source" -le 0 ] 2>/dev/null ||
+                [ "$snapshot_age" -lt 0 ] 2>/dev/null || [ "$snapshot_age" -gt "$snapshot_max_age" ] 2>/dev/null; then
+                snapshot_stale=true
+            fi
+        else
+            snapshot_state="invalid"
+        fi
+    fi
+    if ! $shared_status_parsed; then
+        eval "$(jq -r '
+            "MODEL=" + (.model.display_name // "unknown" | @sh),
+            "COST=" + (.cost.total_cost_usd // 0 | tostring | @sh),
+            "DURATION_MS=" + (.cost.total_duration_ms // 0 | tostring | @sh),
+            "CONTEXT_PCT=" + (.context_window.used_percentage // 0 | tostring | @sh),
+            "CWD=" + (.workspace.current_dir // "" | @sh),
+            "INPUT_TOKENS=" + (.context_window.total_input_tokens // 0 | tostring | @sh),
+            "OUTPUT_TOKENS=" + (.context_window.total_output_tokens // 0 | tostring | @sh),
+            "SESSION_ID=" + (.session_id // "" | @sh),
+            "EFFORT_VAL=" + (.effort.level // .effort_level // "" | @sh)
+        ' <<< "$input" 2>/dev/null)"
+    fi
+    effort_label="$EFFORT_VAL"
+    case "$effort_label" in
+        low) EFFORT="${dim}.low${reset}" ;;
+        medium) EFFORT="${orange}.medium${reset}" ;;
+        high) EFFORT="${red}.high${reset}" ;;
+        xhigh) EFFORT="${red}.xhigh${reset}" ;;
+        max) EFFORT="${red}.max${reset}" ;;
+        ultracode) EFFORT="${magenta}.ultracode${reset}" ;;
+        *) EFFORT="" ;;
+    esac
+
+    local current_label="unknown" account_identity="unknown" account_suffix=""
+    if [ "$current_exists" = "true" ] && [ -n "$routed_label" ]; then
+        current_label="$routed_label"
+    else
+        account_suffix=" ~ stale"
+    fi
+    if $snapshot_stale && [[ "$account_suffix" != *"stale"* ]]; then
+        account_suffix=" ~ stale"
+    fi
+    [ "$snapshot_has_error" = "true" ] && account_suffix+=" · snapshot error"
+    account_identity="$current_label"
+
+    local route_suffix="" policy_scope="${ACCOUNTS_POLICY_SCOPE:-global}"
+    if [ "$current_exists" = "true" ]; then
+        [ "$account_identity" != "$current_label" ] && route_suffix=" · ${current_label}"
+        if [ "$policy_scope" = "pane" ]; then
+            route_suffix+=" · pane pinned"
+        else
+            case "$mode_value" in
+                auto|fable) route_suffix+=" · ${mode_value}" ;;
+                set)
+                    if [ -n "$mode_label" ] && [ "$mode_label" != "$current_label" ]; then
+                    route_suffix+=" · set ${mode_label} pending"
+                    else
+                        route_suffix+=" · pinned"
+                    fi
+                    ;;
+            esac
+        fi
+    fi
+
+    local repo_cwd dir_name branch="" branch_name="" dirty="" repo_text git_line git_state="" git_root=""
+    local git_dir="" git_common="" git_dir_real="" git_common_real="" is_worktree=false upstream="" counts="" ahead=0 behind=0
+    local primary_name="" worktree_name="" pr_ref=""
+    repo_cwd=$(recent_session_checkout "$SESSION_ID" "$CWD")
+    [ -n "$repo_cwd" ] || repo_cwd="$CWD"
+    SHARED_REPO_CWD="$repo_cwd"
+    dir_name="${repo_cwd##*/}"
+    if [ -d "$repo_cwd" ]; then
+        git_root=$(git -C "$repo_cwd" rev-parse --show-toplevel 2>/dev/null)
+        git_state=$(git --no-optional-locks -C "$repo_cwd" status --porcelain=v2 --branch --untracked-files=no 2>/dev/null || true)
+        while IFS= read -r git_line; do
+            case "$git_line" in
+                '# branch.head '*) branch="${git_line#\# branch.head }" ;;
+                '# branch.oid '*) [ "$branch" = "(detached)" ] && branch="${git_line#\# branch.oid }" && branch="${branch:0:8}" ;;
+                '# '*) ;;
+                ?*) dirty="*" ;;
+            esac
+        done <<< "$git_state"
+        branch_name="$branch"
+        git_dir=$(git -C "$repo_cwd" rev-parse --git-dir 2>/dev/null)
+        git_common=$(git -C "$repo_cwd" rev-parse --git-common-dir 2>/dev/null)
+        if [ -n "$git_dir" ] && [ -n "$git_common" ]; then
+            git_dir_real=$(cd "$repo_cwd" && cd "$git_dir" 2>/dev/null && pwd)
+            git_common_real=$(cd "$repo_cwd" && cd "$git_common" 2>/dev/null && pwd)
+            [ "$git_dir_real" != "$git_common_real" ] && is_worktree=true
+        fi
+        if [ -n "$branch_name" ] && [ "$branch_name" != "(detached)" ]; then
+            upstream=$(git -C "$repo_cwd" rev-parse --abbrev-ref "${branch_name}@{upstream}" 2>/dev/null)
+            if [ -n "$upstream" ]; then
+                counts=$(git -C "$repo_cwd" rev-list --left-right --count HEAD..."$upstream" 2>/dev/null)
+                ahead="${counts%%[[:space:]]*}"
+                behind="${counts##*[[:space:]]}"
+            fi
+        fi
+    fi
+    if [ -n "${BRANCH_PREFIX_STRIP:-}" ]; then
+        branch="${branch#"$BRANCH_PREFIX_STRIP"}"
+    fi
+    local max_branch="${MAX_BRANCH:-24}"
+    [ "${#branch}" -gt "$max_branch" ] && branch="${branch:0:$(( max_branch - 1 ))}…"
+    if [ -n "$git_root" ]; then
+        dir_name="${git_root##*/}"
+    fi
+    if $is_worktree; then
+        worktree_name="${git_root##*/}"
+        primary_name="${git_common_real%/.git}"
+        primary_name="${primary_name##*/}"
+        repo_text="${primary_name:-$dir_name} › ⌥${worktree_name}"
+    elif [ -n "$git_root" ]; then
+        repo_text="${dir_name} primary"
+    else
+        repo_text="${dir_name}"
+    fi
+    repo_text+="${branch:+ (${branch}${dirty})}"
+    [ "${ahead:-0}" -gt 0 ] 2>/dev/null && repo_text+="↑${ahead}"
+    [ "${behind:-0}" -gt 0 ] 2>/dev/null && repo_text+="↓${behind}"
+    local pr_number="" pr_title=""
+    pr_ref="${branch_name:-$branch}"
+    if [ -n "$git_root" ] && [ -n "$pr_ref" ]; then
+        local pr_cache_key pr_cache_file
+        pr_cache_key=$(printf '%s\0%s' "$git_root" "$pr_ref" | cksum)
+        pr_cache_key="${pr_cache_key%% *}"
+        pr_cache_file="/tmp/claude/statusline-pr-${pr_cache_key}.json"
+        if [ -r "$pr_cache_file" ]; then
+            eval "$(jq -r '
+                if .state == "OPEN" then
+                    "pr_number=" + ((.number // "") | tostring | @sh),
+                    "pr_title=" + ((.title // "" | gsub("[\u0000-\u001f\u007f]"; " ")) | @sh)
+                else empty end
+            ' "$pr_cache_file" 2>/dev/null)"
+            [ -n "$pr_number" ] && repo_text+=" #${pr_number}"
+        fi
+    fi
+
+    local context_int session_tokens context_bar
+    printf -v context_int '%.0f' "${CONTEXT_PCT:-0}"
+    context_bar=$(build_context_bar "$context_int" 15)
+    session_tokens=$(( INPUT_TOKENS + OUTPUT_TOKENS ))
+
+    local format="${STATUSLINE_FORMAT:-${FORMAT:-default}}"
+    if [ "$format" = "sigil" ] || [ "$format" = "rprompt" ] || [ "$format" = "sparkline" ] || [ "$format" = "iterm2" ]; then
+        printf "%b" "${blue}◈${reset} ${blue}${MODEL}${reset}${EFFORT} ${dim}·${reset} ${CTX_COLOR:-$green}${context_int}%${reset} ${dim}·${reset} ${cyan}${repo_text}${reset}"
+        [ -n "$five_pct" ] && printf "%b" " ${dim}·${reset} $(color_for_pct "${five_pct%.*}")${five_pct}%${reset}"
+        return
+    fi
+
+    local unsup_badge=""
+    if [ -x "$HOME/.accounts/bin/claude" ] && [ -n "$SESSION_ID" ] &&
+        [[ "${ACCOUNTS_ROUTER_STATE:-}" != /tmp/claude/account-router-*.json ]]; then
+        unsup_badge=" ${red}UNSUPERVISED${reset}"
+    fi
+    printf "${white}%-7s${reset} %b\n" "model" "${blue}${MODEL}${reset}${EFFORT}${unsup_badge}"
+    [ -n "$pr_number" ] && printf "${white}%-7s${reset} ${cyan}#%s${reset} %s\n" "pr" "$pr_number" "$pr_title"
+    if [ "$DURATION_MS" -gt 0 ] 2>/dev/null; then
+        local elapsed_seconds=$(( DURATION_MS / 1000 ))
+        if [ "$elapsed_seconds" -ge 3600 ]; then
+            printf "${white}%-7s${reset} ${dim}⏱${reset} %d:%02d:%02d\n" "time" "$(( elapsed_seconds / 3600 ))" "$(( (elapsed_seconds % 3600) / 60 ))" "$(( elapsed_seconds % 60 ))"
+        else
+            printf "${white}%-7s${reset} ${dim}⏱${reset} %d:%02d\n" "time" "$(( elapsed_seconds / 60 ))" "$(( elapsed_seconds % 60 ))"
+        fi
+    fi
+    printf "${white}%-7s${reset} %b\n" "account" "${orange}${account_identity}${reset}${dim}${account_suffix}${route_suffix}${reset}"
+    printf "${white}%-7s${reset} %b\n" "repo" "${cyan}${repo_text}${reset}"
+    printf "${white}%-7s${reset} %b\n" "context" "${context_bar} $(color_for_context "$context_int")${CONTEXT_PCT:-0}%${reset}"
+
+    local pct_int pct_bar pct_color reset_text stale_text session_display="$session_tokens"
+    [ "$session_tokens" -ge 1000 ] 2>/dev/null && session_display="$(( session_tokens / 1000 ))k"
+    if [ -n "$five_pct" ]; then
+        pct_int="${five_pct%.*}"; pct_bar=$(build_bar "$pct_int" 15); pct_color=$(color_for_pct "$pct_int")
+        reset_text=$(shared_reset_text "$five_reset" "$five_pending" time)
+        stale_text=""; { [ "$five_stale" = "true" ] || $snapshot_stale; } && stale_text=" · stale"
+        printf "${white}%-7s${reset} %b\n" "session" "${pct_bar} ${pct_color}$(fmt_pct "$five_pct")${reset} ${dim}resets ${reset_text}${stale_text}${reset}"
+    fi
+    if [ -n "$seven_pct" ]; then
+        pct_int="${seven_pct%.*}"; pct_bar=$(build_bar "$pct_int" 15); pct_color=$(color_for_pct "$pct_int")
+        reset_text=$(shared_reset_text "$seven_reset" "$seven_pending" datetime)
+        stale_text=""; { [ "$seven_stale" = "true" ] || $snapshot_stale; } && stale_text=" · stale"
+        printf "${white}%-7s${reset} %b\n" "weekly" "${pct_bar} ${pct_color}$(fmt_pct "$seven_pct")${reset} ${dim}resets ${reset_text}${stale_text}${reset}"
+    fi
+    if [ -n "$scoped_pct" ]; then
+        pct_int="${scoped_pct%.*}"; pct_bar=$(build_bar "$pct_int" 15); pct_color=$(color_for_pct "$pct_int")
+        stale_text=""; { [ "$scoped_stale" = "true" ] || $snapshot_stale; } && stale_text=" · stale"
+        local scoped_display_label
+        scoped_display_label=$(printf '%s' "${scoped_label:-${scoped_kind:-scoped}}" | tr '[:upper:]' '[:lower:]' | cut -c1-7)
+        printf "${white}%-7s${reset} %b\n" "$scoped_display_label" "${pct_bar} ${pct_color}$(fmt_pct "$scoped_pct")${reset}${stale_text:+ ${dim}${stale_text}${reset}}"
+    fi
+    local today_tokens="" lifetime_tokens=0 today_display session_display_fmt lifetime_display
+    local metrics_db="${AGENT_METRICS_DB:-$HOME/Library/Application Support/statusline/agent-metrics/metrics.sqlite3}"
+    if [ "${AGENT_METRICS_RECORDER:-0}" = "1" ] && [ -r "$metrics_db" ] && command -v sqlite3 >/dev/null 2>&1; then
+        today_tokens=$(sqlite3 -readonly -cmd '.timeout 1000' "$metrics_db" \
+            "select coalesce(sum(input_tokens + output_tokens), 0) from minute_metrics where provider='claude' and minute >= strftime('%s','now','localtime','start of day','utc') * 1000" \
+            2>/dev/null)
+    fi
+    if [[ ! "$today_tokens" =~ ^[0-9]+$ ]] && [ -r "$HOME/.claude/token-scan-summary.json" ]; then
+        today_tokens=$(jq -r '.today.total_tokens // 0 | floor' "$HOME/.claude/token-scan-summary.json" 2>/dev/null)
+    fi
+    [[ "$today_tokens" =~ ^[0-9]+$ ]] || today_tokens=0
+    if [ -r "$HOME/.claude/usage-ledger.json" ]; then
+        lifetime_tokens=$(jq -r '[.days[] | .[] | (.input + .output + .cache_read + .cache_write + (.cache_write_1h // 0))] | add // 0 | floor' "$HOME/.claude/usage-ledger.json" 2>/dev/null)
+    fi
+    _shared_usage_fmt() {
+        awk -v value="$1" 'BEGIN {
+            if (value >= 1e9) printf "%.2fB", value / 1e9;
+            else if (value >= 1e6) printf "%.2fM", value / 1e6;
+            else if (value >= 1e3) printf "%.2fk", value / 1e3;
+            else printf "%d", value
+        }'
+    }
+    today_display=$(_shared_usage_fmt "${today_tokens:-0}")
+    session_display_fmt=$(_shared_usage_fmt "$session_tokens")
+    lifetime_display=$(_shared_usage_fmt "${lifetime_tokens:-0}")
+    printf "${white}%-7s${reset} %b\n" "usage" "${dim}today${reset} ${cyan}${today_display}${reset} ${dim}· session${reset} ${magenta}${session_display_fmt}${reset} ${dim}· lifetime${reset} ${green}${lifetime_display}${reset}"
+
+    if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ] && [ "$snapshot_state" = "ready" ]; then
+        local rows sorted_rows="" sort_key row_label row_display row_five row_five_reset row_five_stale row_five_pending
+        local row_seven row_seven_reset row_seven_stale row_seven_pending row_scoped row_scoped_label
+        local row_scoped_reset row_scoped_stale row_scoped_pending row_expired row_leases marker
+        local name_width=9
+        while IFS=$'\037' read -r row_label row_five row_five_reset row_five_stale row_five_pending \
+            row_seven row_seven_reset row_seven_stale row_seven_pending row_scoped row_scoped_label \
+            row_scoped_reset row_scoped_stale row_scoped_pending row_expired row_leases; do
+            [ -z "$row_label" ] && continue
+            account_label_is_excluded "$row_label" && continue
+            row_display="$(printf '%s' "${row_label:0:1}" | tr '[:lower:]' '[:upper:]')${row_label:1}"
+            [ "${#row_display}" -gt "$name_width" ] && name_width=${#row_display}
+            sort_key="${row_five_reset:-9999}"
+            sorted_rows+="${sort_key}"$'\t'"${row_label}"$'\037'"${row_five}"$'\037'"${row_five_reset}"$'\037'"${row_five_stale}"$'\037'"${row_five_pending}"$'\037'"${row_seven}"$'\037'"${row_seven_reset}"$'\037'"${row_seven_stale}"$'\037'"${row_seven_pending}"$'\037'"${row_scoped}"$'\037'"${row_scoped_label}"$'\037'"${row_scoped_reset}"$'\037'"${row_scoped_stale}"$'\037'"${row_scoped_pending}"$'\037'"${row_expired}"$'\037'"${row_leases}"$'\n'
+        done <<< "$shared_rows"
+        rows=$(printf '%s' "$sorted_rows" | sort | cut -f2-)
+        local board_scoped_label
+        board_scoped_label=$(printf '%s' "${scoped_label:-scoped}" | tr '[:upper:]' '[:lower:]' | cut -c1-7)
+        _shared_pad() {
+            local value="$1" width="$2" padding
+            padding=$(( width - ${#value} ))
+            [ "$padding" -lt 0 ] && padding=0
+            printf '%s%*s' "$value" "$padding" ''
+        }
+        _shared_ralign() {
+            local value="$1" width="$2" padding
+            padding=$(( width - ${#value} ))
+            [ "$padding" -lt 0 ] && padding=0
+            printf '%*s%s' "$padding" '' "$value"
+        }
+        local header_account board_header
+        printf -v header_account '%-*s' "$name_width" "acct"
+        board_header="  ${header_account} $(_shared_ralign "5h" 4)  $(_shared_ralign "reset" 6)   $(_shared_ralign "week" 4)   $(_shared_ralign "$board_scoped_label" 5)  $(_shared_ralign "reset" 6)"
+        printf "${dim}%s${reset}\n" "$board_header"
+        while IFS=$'\037' read -r row_label row_five row_five_reset row_five_stale row_five_pending \
+            row_seven row_seven_reset row_seven_stale row_seven_pending row_scoped row_scoped_label \
+            row_scoped_reset row_scoped_stale row_scoped_pending row_expired row_leases; do
+            [ -z "$row_label" ] && continue
+            row_display="$(printf '%s' "${row_label:0:1}" | tr '[:lower:]' '[:upper:]')${row_label:1}"
+            marker="${dim}·${reset} "; [ "$row_label" = "$routed_label" ] && marker="${white}*${reset} "
+            [ -z "$row_five" ] && row_five="—" || printf -v row_five '%.0f%%' "$row_five"
+            [ -z "$row_seven" ] && row_seven="—" || printf -v row_seven '%.0f%%' "$row_seven"
+            [ -z "$row_scoped" ] && row_scoped="—" || printf -v row_scoped '%.0f%%' "$row_scoped"
+            row_five_reset=$(shared_reset_relative "$row_five_reset" "$row_five_pending")
+            row_scoped_reset=$(shared_reset_relative "$row_scoped_reset" "$row_scoped_pending")
+            local row_suffix="" five_color="$dim" seven_color="$dim" scoped_color="$dim"
+            [ "$row_five" != "—" ] && five_color=$(color_for_pct "${row_five%\%}")
+            [ "$row_seven" != "—" ] && seven_color=$(color_for_pct "${row_seven%\%}")
+            [ "$row_scoped" != "—" ] && scoped_color=$(color_for_pct "${row_scoped%\%}")
+            { [ "$row_five_stale" = "true" ] || [ "$row_seven_stale" = "true" ] || [ "$row_scoped_stale" = "true" ]; } && row_suffix=" ${dim}~ stale${reset}"
+            [ "$row_expired" = "true" ] && row_suffix+=" ${red}⚠ needs reauth${reset}"
+            local padded_name
+            printf -v padded_name '%-*s' "$name_width" "$row_display"
+            printf "%b${white}%s${reset} ${five_color}%s${reset}  ${dim}%s${reset}   ${seven_color}%s${reset}   ${scoped_color}%s${reset}  ${dim}%s${reset}%b\n" \
+                "$marker" "$padded_name" "$(_shared_ralign "$row_five" 4)" \
+                "$(_shared_ralign "$row_five_reset" 6)" "$(_shared_ralign "$row_seven" 4)" \
+                "$(_shared_ralign "$row_scoped" 5)" "$(_shared_ralign "$row_scoped_reset" 6)" "$row_suffix"
+        done <<< "$rows"
+    fi
+}
+
+if [ "${SHARED_ACCOUNT_SNAPSHOT:-0}" = "1" ]; then
+    render_shared_account_snapshot
+    if [[ "${ACCOUNTS_ROUTER_STATE:-}" == /tmp/claude/account-router-*.json ]] &&
+        [ -n "$SESSION_ID" ]; then
+        _router_state_dir="${ACCOUNTS_ROUTER_STATE%/*}"
+        mkdir -p "$_router_state_dir" 2>/dev/null && chmod 700 "$_router_state_dir" 2>/dev/null
+        _router_state_tmp="${ACCOUNTS_ROUTER_STATE}.tmp.$$"
+        jq -cn \
+            --arg session_id "$SESSION_ID" \
+            --arg model "$MODEL" \
+            --arg effort "$effort_label" \
+            --arg label "${ACCOUNTS_ROUTED_LABEL:-}" \
+            --arg cwd "$CWD" \
+            '{session_id:$session_id,model:$model,effort:$effort,label:$label,cwd:$cwd}' \
+            > "$_router_state_tmp" 2>/dev/null &&
+            chmod 600 "$_router_state_tmp" 2>/dev/null &&
+            mv "$_router_state_tmp" "$ACCOUNTS_ROUTER_STATE" 2>/dev/null
+    fi
+    _shared_repo_cwd="${SHARED_REPO_CWD:-$CWD}"
+    _shared_root=$(git -C "$_shared_repo_cwd" rev-parse --show-toplevel 2>/dev/null)
+    _shared_tab_title="${_shared_root##*/}"
+    [ -z "$_shared_tab_title" ] && _shared_tab_title="${_shared_repo_cwd##*/}"
+    _shared_branch=$(git --no-optional-locks -C "$_shared_repo_cwd" symbolic-ref --short -q HEAD 2>/dev/null)
+    if [ -n "$_shared_branch" ] && [ "$_shared_branch" != "main" ] && [ "$_shared_branch" != "master" ]; then
+        _shared_tab_title+=" (${_shared_branch:0:24})"
+    fi
+    _shared_topic=$(session_topic "$SESSION_ID" "$CWD")
+    [ -n "$_shared_topic" ] && _shared_tab_title="${_shared_topic} — ${_shared_tab_title}"
+    printf '\033]0;%s\007' "$_shared_tab_title"
+    exit 0
+fi
 
 # ── OAuth token resolution ──────────────────────────────
 get_oauth_token() {

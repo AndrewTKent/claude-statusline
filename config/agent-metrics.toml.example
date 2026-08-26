@@ -1,0 +1,42 @@
+# Agent Metrics is opt-in. Copy this file with `bin/agent-metrics init`, then
+# run `sync` explicitly whenever you want to ingest new local events.
+
+[paths]
+claude_projects = "~/.claude/projects"
+claude_account_spans = "~/.claude/session-accounts.json"
+codex_sessions = "~/.codex/sessions"
+codex_auth = "~/.codex/auth.json"
+claude_statusline_config = "~/.claude/statusline.conf"
+claude_utilization_history = "~/.claude/utilization-history.jsonl"
+shared_account_snapshot = "~/.accounts/statusline-snapshot.json"
+
+[storage]
+# database = "~/Library/Application Support/statusline/agent-metrics/metrics.sqlite3"
+retention_days = 365
+
+[ui]
+bind = "127.0.0.1"
+port = 8765
+
+[accounts]
+# Reuse only declared short ACCOUNT_LABELS tags; patterns stay in memory.
+reuse_claude_statusline_labels = true
+
+# Keys are provider:identity or provider:identity|organization-id. Identities
+# are read only during sync; the database receives a salted hash and this label.
+[account_aliases]
+# "claude:developer@example.invalid|organization-uuid" = "Work"
+# "codex:account-id-from-auth-json" = "Personal"
+
+# Optional declared-label cohorts for empirical five-hour analysis. These are
+# configuration labels only; Agent Metrics never infers a tier from identity.
+[account_tiers]
+# Work = "20x"
+# Personal = "5x"
+
+# Pricing is retained as local configuration for future derived views. Agent
+# Metrics currently records cost only when a source event explicitly exposes it.
+[pricing]
+# [pricing."claude-opus-model-id"]
+# input_per_million = 15.0
+# output_per_million = 75.0

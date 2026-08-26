@@ -1139,7 +1139,8 @@ class TestUsageMapping:
     def test_missing_weekly_is_none(self):
         row = accounts.usage_to_reset_row("e@x.io", "org1", {"five_hour": {}, "seven_day": {}}, 1)
         assert row["fable_pct"] is None and row["fable_label"] is None
-        assert row["five_hour_pct"] == 0  # None utilization -> 0
+        assert row["five_hour_pct"] is None
+        assert row["seven_day_pct"] is None
 
     def test_access_expiry_ms_to_s(self):
         blob = json.dumps({"claudeAiOauth": {"expiresAt": 1784337371728}})
@@ -1277,6 +1278,11 @@ class TestRefreshDormantProfiles:
             accounts,
             "native_profile_path",
             lambda label: tmp_path / "profiles" / label,
+        )
+        monkeypatch.setattr(
+            accounts,
+            "NATIVE_REFRESH_LOCK_PATH",
+            tmp_path / "native-refresh.lock",
         )
         monkeypatch.setattr(
             accounts,
@@ -1505,6 +1511,7 @@ class TestRefreshDormantProfiles:
             "locked",
             lambda blocking=True: TrackingLock(),
         )
+        monkeypatch.setattr(accounts, "watch_lock", nullcontext)
         monkeypatch.setattr(accounts, "load_blobs", lambda: next(snapshots))
         monkeypatch.setattr(
             accounts,
@@ -1525,10 +1532,16 @@ class TestRefreshDormantProfiles:
             "poll_blobs_usage",
             lambda value: calls.append(("poll", value)) or 4,
         )
+        monkeypatch.setattr(
+            accounts,
+            "write_statusline_snapshot",
+            lambda value, error: calls.append(("snapshot", value, error)),
+        )
+        monkeypatch.setattr(accounts, "shared_snapshot_enabled", lambda: True)
 
         accounts.cmd_poll(types.SimpleNamespace())
 
-        assert calls == [("refresh",), ("poll", after)]
+        assert calls == [("refresh",), ("poll", after), ("snapshot", after, None)]
         assert "refreshed usage for 4 account(s)" in capsys.readouterr().out
 
 
@@ -1799,7 +1812,12 @@ class TestCmdSet:
         live = _live_blob("a")
         monkeypatch.setattr(accounts, "load_blobs", lambda: {"accounts": {"B": {"blob": live}}})
         accounts.cmd_set(types.SimpleNamespace(label="B"))
-        assert json.loads(accounts.MODE_PATH.read_text()) == {"mode": "set", "label": "B"}
+        assert json.loads(accounts.MODE_PATH.read_text()) == {
+            "version": 2,
+            "mode": "set",
+            "label": "B",
+            "global_generation": 1,
+        }
         assert (accounts.PROFILES_PATH / "B" / ".credentials.json").read_text() == live
         assert not accounts.CRED_FILE.exists()
 
@@ -1843,6 +1861,23 @@ class TestCmdStatus:
         output = capsys.readouterr().out
         assert "gmail" in output
         assert "[excluded]" in output
+
+    def test_labels_pane_local_set_mode(self, monkeypatch, capsys):
+        monkeypatch.setattr(accounts, "locked", lambda blocking=True: nullcontext())
+        monkeypatch.setattr(accounts, "load_blobs", lambda: {"accounts": {}})
+        monkeypatch.setattr(accounts, "capture_live_to_blobs", lambda blobs: None)
+        monkeypatch.setattr(accounts, "sync_profile_credentials", lambda blobs, persist: set())
+        monkeypatch.setattr(
+            accounts,
+            "load_mode",
+            lambda: {"mode": "set", "label": "work", "policy_scope": "pane"},
+        )
+        monkeypatch.setattr(accounts, "route_rows", lambda blobs, active, now: [])
+        monkeypatch.setattr(accounts, "excluded_labels", set)
+
+        accounts.cmd_status(types.SimpleNamespace())
+
+        assert "mode: PANE → work" in capsys.readouterr().out
 
     def test_set_mode_status_matches_the_forced_runtime_target(
         self,
@@ -2265,11 +2300,12 @@ class TestLoadBlobs:
         blobs_path.write_text("NOT JSON {{{")
         monkeypatch.setattr(accounts, "BLOBS_PATH", blobs_path)
         monkeypatch.setattr(accounts, "MIRROR_LOG", tmp_path / "log")  # keep log_line off real paths
-        assert accounts.load_blobs() == {"version": 1, "accounts": {}}
+        with pytest.raises(accounts.AccountsError, match="corrupt"):
+            accounts.load_blobs()
         backups = list(tmp_path.glob("blobs.json.corrupt.*"))
         assert len(backups) == 1 and backups[0].read_text() == "NOT JSON {{{"
-        # still-corrupt on the next read: no second identical backup piles up
-        assert accounts.load_blobs() == {"version": 1, "accounts": {}}
+        with pytest.raises(accounts.AccountsError, match="corrupt"):
+            accounts.load_blobs()
         assert len(list(tmp_path.glob("blobs.json.corrupt.*"))) == 1
 
     def test_missing_store_returns_empty_without_backup(self, tmp_path, monkeypatch):
@@ -2290,12 +2326,13 @@ class TestLoadBlobs:
         finally:
             blobs_path.chmod(0o600)
 
-    def test_non_dict_store_is_preserved_and_empty(self, tmp_path, monkeypatch):
+    def test_non_dict_store_is_preserved_and_rejected(self, tmp_path, monkeypatch):
         blobs_path = tmp_path / "blobs.json"
         blobs_path.write_text("[1, 2, 3]")
         monkeypatch.setattr(accounts, "BLOBS_PATH", blobs_path)
         monkeypatch.setattr(accounts, "MIRROR_LOG", tmp_path / "log")
-        assert accounts.load_blobs() == {"version": 1, "accounts": {}}
+        with pytest.raises(accounts.AccountsError, match="invalid"):
+            accounts.load_blobs()
         assert len(list(tmp_path.glob("blobs.json.corrupt.*"))) == 1
 
 
@@ -2337,6 +2374,269 @@ class TestLoadModeFable:
         p.write_text(json.dumps({"mode": "bogus", "label": None}))
         monkeypatch.setattr(accounts, "MODE_PATH", p)
         assert accounts.load_mode() == {"mode": "auto", "label": None}
+
+    def test_v1_mode_migrates_without_changing_selection(self, tmp_path, monkeypatch):
+        path = tmp_path / "mode.json"
+        path.write_text(json.dumps({"mode": "fable", "label": None}))
+        monkeypatch.setattr(accounts, "LOCK_PATH", tmp_path / "accounts.lock")
+        monkeypatch.setattr(accounts, "MODE_PATH", path)
+        monkeypatch.setattr(accounts, "PANE_PINS_PATH", tmp_path / "pane-pins")
+        monkeypatch.setattr(accounts, "_lock_depth", 0)
+
+        assert accounts.load_mode() == {"mode": "fable", "label": None}
+        assert json.loads(path.read_text()) == {
+            "version": 2,
+            "mode": "fable",
+            "label": None,
+            "global_generation": 0,
+        }
+
+
+class TestPanePolicy:
+    def _paths(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(accounts, "LOCK_PATH", tmp_path / "accounts.lock")
+        monkeypatch.setattr(accounts, "MODE_PATH", tmp_path / "mode.json")
+        monkeypatch.setattr(accounts, "PANE_PINS_PATH", tmp_path / "pane-pins")
+        monkeypatch.setattr(accounts, "PANE_SALT_PATH", tmp_path / "pane-salt")
+        monkeypatch.setattr(accounts, "_lock_depth", 0)
+
+    def test_identity_precedence_and_hashing(self, tmp_path, monkeypatch):
+        self._paths(tmp_path, monkeypatch)
+        env = {
+            "TMUX": "/private/tmp/tmux-501/default,123,0",
+            "TMUX_PANE": "%7",
+            "ITERM_SESSION_ID": "w0t0p0:other",
+        }
+        key = accounts.pane_key(env=env)
+
+        assert key == accounts.pane_key(env=env)
+        assert len(key) == 64
+        assert "/private/tmp" not in key
+        assert "%7" not in key
+        assert (accounts.PANE_SALT_PATH.stat().st_mode & 0o777) == 0o600
+
+        changed_tmux = {**env, "TMUX_PANE": "%8"}
+        assert accounts.pane_key(env=changed_tmux) != key
+
+    @pytest.mark.parametrize(
+        ("env", "prefix"),
+        [
+            ({"ITERM_SESSION_ID": "iterm", "TERM_SESSION_ID": "term"}, "iterm"),
+            ({"TERM_SESSION_ID": "term", "WEZTERM_PANE": "9", "TERM_PROGRAM": "WezTerm"}, "term"),
+            ({"WEZTERM_PANE": "9", "TERM_PROGRAM": "WezTerm"}, "wezterm"),
+            ({"KITTY_WINDOW_ID": "4", "TERM": "xterm-kitty"}, "kitty"),
+        ],
+    )
+    def test_identity_sources_are_ordered(self, env, prefix):
+        material = accounts.pane_identity_material(env=env, tty_path=None, boot_id=None)
+        assert material.decode().startswith(f"{prefix}:")
+
+    def test_unverified_terminal_ids_and_no_tty_are_ambiguous(self):
+        with pytest.raises(accounts.AccountsError, match="terminal pane"):
+            accounts.pane_identity_material(
+                env={"WEZTERM_PANE": "9", "KITTY_WINDOW_ID": "4"},
+                tty_path=None,
+                boot_id=None,
+            )
+
+    def test_pin_survives_relaunch_and_isolated_by_pane(self, tmp_path, monkeypatch):
+        self._paths(tmp_path, monkeypatch)
+        monkeypatch.setattr(accounts, "load_label_pairs", lambda: [("work", "*", None)])
+        monkeypatch.setattr(accounts, "pane_key", lambda env=None: "a" * 64)
+        accounts.save_mode("auto", None)
+        accounts.save_pane_pin("work")
+
+        mode, generation = accounts.load_mode_snapshot()
+        assert mode["mode"] == "set"
+        assert mode["label"] == "work"
+        assert mode["policy_scope"] == "pane"
+        assert generation[0] == mode["global_generation"]
+
+        monkeypatch.setattr(accounts, "pane_key", lambda env=None: "b" * 64)
+        other_mode, _ = accounts.load_mode_snapshot()
+        assert other_mode["mode"] == "auto"
+        assert other_mode["policy_scope"] == "global"
+
+    def test_global_change_invalidates_all_pins_and_increments_generation(
+        self, tmp_path, monkeypatch
+    ):
+        self._paths(tmp_path, monkeypatch)
+        accounts.save_mode("auto", None)
+        first_generation = accounts.load_mode_snapshot()[0]["global_generation"]
+        accounts.PANE_PINS_PATH.mkdir()
+        for key in ("a" * 64, "b" * 64):
+            accounts._write_0600(
+                accounts.PANE_PINS_PATH / f"{key}.json",
+                json.dumps({"version": 1, "label": "work", "base_global_generation": first_generation}),
+            )
+
+        accounts.save_mode("set", "work")
+
+        mode, _ = accounts.load_mode_snapshot()
+        assert mode["global_generation"] == first_generation + 1
+        assert list(accounts.PANE_PINS_PATH.glob("*.json")) == []
+        assert json.loads(accounts.MODE_PATH.read_text())["version"] == 2
+
+    def test_pane_pin_precedes_legacy_launch_pin(self, monkeypatch):
+        monkeypatch.setenv("ACCOUNTS_PIN", "legacy")
+        monkeypatch.setattr(
+            accounts,
+            "load_mode",
+            lambda: {"mode": "set", "label": "pane", "policy_scope": "pane"},
+        )
+
+        mode, pin, hard = accounts._route_preferences()
+
+        assert mode["policy_scope"] == "pane"
+        assert pin == "pane"
+        assert hard is True
+
+
+class TestStatuslineSnapshot:
+    def _paths(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(accounts, "SNAPSHOT_PATH", tmp_path / "statusline-snapshot.json")
+        monkeypatch.setattr(accounts, "MODE_PATH", tmp_path / "mode.json")
+        monkeypatch.setattr(accounts, "RESETS_PATH", tmp_path / "account-resets.json")
+        monkeypatch.setattr(accounts, "SESSION_LIMITS_PATH", tmp_path / "session-limits.json")
+        monkeypatch.setattr(accounts, "PANE_PINS_PATH", tmp_path / "pane-pins")
+        monkeypatch.setattr(accounts, "LOCK_PATH", tmp_path / "accounts.lock")
+        monkeypatch.setattr(accounts, "_lock_depth", 0)
+
+    def test_schema_redaction_reset_semantics_and_hard_limit(self, tmp_path, monkeypatch):
+        self._paths(tmp_path, monkeypatch)
+        now = datetime(2026, 8, 25, 18, 0, tzinfo=timezone.utc)
+        observed = (now - timedelta(hours=2)).timestamp()
+        reset = (now - timedelta(hours=1)).isoformat()
+        monkeypatch.setattr(accounts.time, "time", lambda: now.timestamp())
+        monkeypatch.setattr(accounts, "now_utc", lambda: now)
+        monkeypatch.setattr(accounts, "load_label_pairs", lambda: [("work", "secret@example.com", "org-secret")])
+        monkeypatch.setattr(accounts, "load_session_leases", lambda now_ts=None: [{"label": "work"}])
+        accounts.save_mode("auto", None)
+        accounts.RESETS_PATH.write_text(json.dumps({
+            "secret@example.com|org-secret": {
+                "five_hour_pct": 74,
+                "five_hour_reset": reset,
+                "seven_day_pct": 22,
+                "seven_day_reset": (now + timedelta(days=2)).isoformat(),
+                "last_seen": observed,
+                "scoped_limits": [
+                    {"kind": "weekly_scoped", "label": "Model X", "used_pct": 31,
+                     "resets_at": (now + timedelta(days=3)).isoformat()}
+                ],
+            }
+        }))
+        accounts.SESSION_LIMITS_PATH.write_text(json.dumps({
+            "secret@example.com|org-secret": {"expires_at": now.timestamp() + 100}
+        }))
+        blobs = {"accounts": {"work": {
+            "blob": _live_blob("token-secret"),
+            "email": "secret@example.com",
+            "org_uuid": "org-secret",
+            "account_uuid": "account-secret",
+        }, "undeclared": {"blob": "credential-body"}}}
+
+        snapshot = accounts.write_statusline_snapshot(blobs, error=None)
+        encoded = accounts.SNAPSHOT_PATH.read_text()
+
+        assert snapshot["version"] == 1
+        assert snapshot["accounts"]["work"]["five_hour"] == {
+            "used_pct": 100.0,
+            "resets_at": reset,
+            "observed_at": observed,
+            "stale": False,
+            "pending_reset": True,
+        }
+        assert snapshot["accounts"]["work"]["scoped"][0]["label"] == "Model X"
+        assert snapshot["accounts"]["work"]["live_leases"] == 1
+        assert "undeclared" not in snapshot["accounts"]
+        for secret in ("token-secret", "secret@example.com", "org-secret", "account-secret"):
+            assert secret not in encoded
+        assert (accounts.SNAPSHOT_PATH.stat().st_mode & 0o777) == 0o600
+
+    def test_error_preserves_last_success(self, tmp_path, monkeypatch):
+        self._paths(tmp_path, monkeypatch)
+        monkeypatch.setattr(accounts, "load_label_pairs", list)
+        monkeypatch.setattr(accounts, "load_session_leases", lambda now_ts=None: [])
+        moments = iter([100.0, 200.0])
+        monkeypatch.setattr(accounts.time, "time", lambda: next(moments))
+        accounts.save_mode("auto", None)
+
+        accounts.write_statusline_snapshot({"accounts": {}}, error=None)
+        failed = accounts.write_statusline_snapshot({"accounts": {}}, error="RuntimeError")
+
+        assert failed["generated_at"] == 200.0
+        assert failed["health"] == {"last_success_at": 100.0, "error": "RuntimeError"}
+
+
+class TestWatch:
+    def test_rejects_nonpositive_interval(self):
+        parser = accounts.build_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["watch", "--interval", "0"])
+
+    def test_singleton_and_clean_ctrl_c(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(accounts, "WATCH_LOCK_PATH", tmp_path / "watch.lock")
+        calls = []
+        monkeypatch.setattr(
+            accounts,
+            "poll_and_write_snapshot",
+            lambda *, collector_locked=False: calls.append(collector_locked) or 1,
+        )
+        monkeypatch.setattr(accounts.time, "sleep", lambda _seconds: (_ for _ in ()).throw(KeyboardInterrupt))
+
+        accounts.cmd_watch(types.SimpleNamespace(interval=10.0))
+
+        assert calls == [True]
+        assert "stopped" in capsys.readouterr().out
+        with accounts.watch_lock():
+            with pytest.raises(accounts.AccountsError, match="already running"):
+                with accounts.watch_lock():
+                    pass
+
+    def test_failed_poll_writes_error_health_without_repolling(self, monkeypatch):
+        blobs = {"accounts": {}}
+        polls = []
+        snapshots = []
+        monkeypatch.setattr(accounts, "locked", lambda blocking=True: nullcontext())
+        monkeypatch.setattr(accounts, "load_blobs", lambda: blobs)
+        monkeypatch.setattr(accounts, "sync_profile_credentials", lambda *_args, **_kwargs: set())
+        monkeypatch.setattr(accounts, "refresh_dormant_profiles", lambda: 0)
+        monkeypatch.setattr(accounts, "shared_snapshot_enabled", lambda: True)
+
+        def fail_poll(_blobs):
+            polls.append(True)
+            raise RuntimeError("secret credential body")
+
+        monkeypatch.setattr(accounts, "poll_blobs_usage", fail_poll)
+        monkeypatch.setattr(
+            accounts,
+            "write_statusline_snapshot",
+            lambda value, error: snapshots.append((value, error)),
+        )
+
+        with pytest.raises(RuntimeError):
+            accounts.poll_and_write_snapshot(collector_locked=True)
+
+        assert polls == [True]
+        assert snapshots == [(blobs, "RuntimeError")]
+
+    def test_snapshot_is_not_written_without_opt_in(self, monkeypatch):
+        blobs = {"accounts": {}}
+        snapshots = []
+        monkeypatch.setattr(accounts, "locked", lambda blocking=True: nullcontext())
+        monkeypatch.setattr(accounts, "load_blobs", lambda: blobs)
+        monkeypatch.setattr(accounts, "sync_profile_credentials", lambda *_args, **_kwargs: set())
+        monkeypatch.setattr(accounts, "refresh_dormant_profiles", lambda: 0)
+        monkeypatch.setattr(accounts, "poll_blobs_usage", lambda _blobs: 0)
+        monkeypatch.setattr(accounts, "shared_snapshot_enabled", lambda: False)
+        monkeypatch.setattr(
+            accounts,
+            "write_statusline_snapshot",
+            lambda *_args, **_kwargs: snapshots.append(True),
+        )
+
+        assert accounts.poll_and_write_snapshot(collector_locked=True) == 0
+        assert snapshots == []
 
 
 class TestFableEligible:

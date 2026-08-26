@@ -25,12 +25,13 @@
 
 ---
 
-Four tools, one repo, shared data files:
+Five tools, one repo, shared data files:
 
 - **Claude Code statusline** (`bin/statusline.sh`) — the multi-line dashboard below
 - **Codex statusline** (`bin/codex-statusline`, `codex-top`) — the same idea for the Codex CLI
 - **`accounts`** (`bin/accounts.py`) — native-profile account routing and headroom board
 - **Token scanning & redaction** (`bin/scan-tokens*`) — attribute every token, redact before sharing
+- **Agent Metrics** (`bin/agent-metrics`) — opt-in local telemetry and dashboard
 
 ```
 model   Fable 5.ultracode
@@ -72,7 +73,7 @@ Or manually — copy the script, add one key to settings:
 cp bin/statusline.sh ~/.claude/statusline.sh && chmod +x ~/.claude/statusline.sh
 ```
 ```json
-{ "statusLine": { "type": "command", "command": "~/.claude/statusline.sh", "padding": 0 } }
+{ "statusLine": { "type": "command", "command": "~/.claude/statusline.sh", "padding": 0, "refreshInterval": 60 } }
 ```
 
 Restart Claude Code. Done.
@@ -127,6 +128,84 @@ calls an API. Use `codex-watch --details` for expanded session details or
 `codex-statusline --json` for a machine-readable snapshot (renderer-only first flags
 dispatch to the renderer; anything else launches Codex). `codex-top` monitors existing sessions.
 
+### Agent Metrics (optional)
+
+Agent Metrics is an opt-in, local-first history and dashboard add-on for Claude
+Code and Codex. It is not installed or started by either default installer.
+Nothing is collected until one of its explicit commands is run. It requires
+Python 3.11 or newer; set `AGENT_METRICS_PYTHON` to a compatible interpreter
+when the system `python3` is older.
+
+```bash
+bin/agent-metrics init
+bin/agent-metrics sync --max-lines 5000
+bin/agent-metrics watch --interval 60 --max-lines 5000
+bin/agent-metrics serve
+# In another terminal, only when you want a browser window:
+bin/agent-metrics open
+```
+
+`init` creates private runtime storage and a configuration file. On macOS the
+default is `~/Library/Application Support/statusline/agent-metrics/`; on Linux
+it is `${XDG_DATA_HOME:-~/.local/share}/statusline/agent-metrics/`. Override it
+with `--data-dir` or `AGENT_METRICS_DATA_DIR`. Runtime data is never written to
+this repository.
+
+`sync` incrementally scans local Claude Code and Codex JSONL files into raw,
+event-level SQLite rows and rebuilds derived one-minute metrics. Repeated scans
+are idempotent. `--max-lines` bounds one invocation; omit it for an unlimited
+manual backfill. Bounded scans reserve capacity for appended live files and for
+both providers while rotating through older sources by salted source ID.
+`watch` is an explicit foreground loop that defaults to 5,000 lines every 60
+seconds, measured after each completed cycle. It prints live/backfill progress
+and remaining file/byte counts; Ctrl-C stops it cleanly. There is no daemon,
+autostart, or launch-at-login integration. The local dashboard polls that database for a stacked token
+timeline with selectable token series, one-minute raw or trailing moving-average views, a trailing-day hourly/cumulative view, provider/account/model/effort/session/agent filters, account and model
+totals, parent/child agent drilldown, compactions, tool outcomes and durations,
+turn latency, quota snapshots, and explicitly exposed cost. `serve` does not
+scan automatically and binds only to a loopback address; non-loopback binds are
+rejected. Its HTML, CSS, and JavaScript have no network dependencies or
+analytics.
+`open` passes a private local capability to the browser; dashboard API reads
+without that capability are rejected, including requests from other local processes.
+
+The database stores numerical metadata plus provider, model, effort, opaque
+session/request/call IDs, and tool names/statuses. It never stores prompts,
+transcript text, tool arguments or output, source text, source paths,
+credentials, token values, emails, or account-holder names. Account and source
+identities use a local salt. Claude attribution matches each event timestamp to
+`session-accounts.json` using half-open `[from,to)` spans; the organization ID
+participates in the account hash. Codex reads only the explicit current
+`account_id` field from `auth.json`; it never decodes or stores access, refresh,
+or identity tokens.
+
+Configuration lives in the runtime directory's `config.toml`; the generic
+template is [`config/agent-metrics.toml.example`](config/agent-metrics.toml.example).
+Source paths, account aliases, pricing metadata, retention, bind address, and
+port are configurable. Agent Metrics can reuse declared short Claude account
+labels from `ACCOUNT_LABELS` in a configurable `statusline.conf`; explicit
+`[account_aliases]` entries win, and the feature can be disabled. Patterns,
+emails, and organization IDs are matched only in memory and are never stored.
+Pricing is not applied to infer event cost.
+
+Optional `[account_tiers]` entries map declared account labels to `5x` or
+`20x`. Agent Metrics records minute quota observations from the shared account
+snapshot and incrementally backfills the existing Claude utilization history
+when a declared label matches in memory. It excludes stale, pending-reset,
+reset-crossing, and zero/negative-utilization intervals, then compares tracked
+token deltas with positive five-hour utilization deltas by plan cohort, model,
+and reasoning effort. The dashboard reports samples, dispersion, and observed
+token ranges as a **tracked-token equivalent**. This is empirical local data,
+not an Anthropic-published fixed quota; other clients and untracked usage can
+bias it. For accounts without safe declared-label history, inference starts
+with new shared snapshots.
+
+Current capture limits: Codex local history does not expose historical account
+handoffs, so newly ingested Codex rows receive the account active at their first
+sync. Some Claude records omit reasoning effort, context limits, compaction
+details, quota, or cost; those fields remain empty rather than being inferred.
+Tool duration is available only when matching start/end records are present.
+
 ---
 
 ## What You See
@@ -165,6 +244,14 @@ PR badge states: `[draft]`, `[PR✗]` checks failing, `[PR△]` changes requeste
 ### Account tagging
 
 All cost and token ledgers are tagged with your account label (e.g., `work` or `personal`), derived from your OAuth email via `ACCOUNT_LABELS`. This lets you aggregate spend by account after the fact. Two related but distinct dimensions live inside the token scanner itself: `EMAIL_PAYER_MAP` (which plan paid) and the work/personal path/keyword classifier (what the work was) — see Configure.
+
+Set `SHARED_ACCOUNT_SNAPSHOT=1` to make account and quota rendering read-only and snapshot-only. Run `accounts poll` for one refresh or `accounts watch --interval 60` as an explicit foreground loop. The renderer reads `~/.accounts/statusline-snapshot.json` once, maps the current account only through `ACCOUNTS_ROUTED_LABEL`, and displays only declared short labels. It does not inspect credentials, call the profile or usage APIs, write shared ledgers, or start the full token scanner. Missing, stale, pending-reset, and error data remain unknown or visibly stale; they are never rendered as zero. `SHARED_ACCOUNT_SNAPSHOT_FILE` and `SHARED_ACCOUNT_SNAPSHOT_MAX_AGE` are configurable.
+
+Shared mode uses its own lightweight presentation: the default layout keeps the
+account board, while compact terminal formats use one line. It still refreshes
+the terminal title and router state, but skips legacy notifications and history writes.
+
+Claude Code's `statusLine.refreshInterval` controls renderer cadence. A 60-second interval matches the foreground account watcher and avoids repeated work for minute-resolution quota data.
 
 ### Terminal tab titles
 
@@ -261,6 +348,8 @@ Create `~/.claude/statusline.conf` (bash, sourced directly). Full annotated vers
 - `LABEL_COLORS="work:cyan personal:magenta"` — tag → color for the `account` row (unmapped tags default to orange)
 - `EMAIL_PAYER_MAP="work:you@company.com personal:me@gmail.com"` — which plan paid, for the token scanner's `payer` dimension (independent of the work/personal classifier below)
 - `SHOW_ACCOUNT_RESETS=1` — adds a per-account board (5h%, reset, week%, fable%, reset, work-unit cap) below the main rows
+- `SHARED_ACCOUNT_SNAPSHOT=1` — read account/routing/quota rows only from the private accounts snapshot; use `accounts watch --interval 60` to refresh it explicitly
+- `SHARED_ACCOUNT_SNAPSHOT_FILE` / `SHARED_ACCOUNT_SNAPSHOT_MAX_AGE` — override the snapshot path or stale threshold
 
 **Token classifier** (feeds the `tokens` row's work/personal split — see `bin/scan-tokens.py`)
 - `WORK_PATHS` / `PERSONAL_PATHS` — comma-separated cwd/file-path substrings
@@ -285,6 +374,8 @@ Credentials and entitlement caches are isolated; projects, transcripts, settings
 skills, and plugins are shared. Interactive sessions remain first-party
 `claude.ai` subscription sessions instead of API/setup-token sessions.
 
+For shared statusline rendering, run `accounts poll` or keep the explicit foreground loop `accounts watch --interval 60` open, then enable `SHARED_ACCOUNT_SNAPSHOT=1` in `statusline.conf`. No watcher, daemon, or launch-at-login job is installed automatically.
+
 Install the router from a local checkout:
 
 ```bash
@@ -298,6 +389,8 @@ the router tools under `~/.local/bin`, and prepends a supervised launcher from
 | Command | What it does |
 |---------|---------------|
 | `accounts set <label>` | Force every supervised session onto `<label>` |
+| `accounts pane set <label>` | Pin only the current terminal pane to `<label>` |
+| `accounts pane clear` | Return the current pane to the global policy |
 | `accounts auto` | Route supervised sessions to the freshest account |
 | `accounts fable` | Switch live supervised sessions to Fable while headroom is available |
 | `accounts status` | Mode + per-account 5h/7d/Fable headroom + ⚠login flags |
@@ -424,6 +517,7 @@ Claude Code                    statusline.sh
 | Account switch | OAuth token hash + credential mtime tracking, synchronous identity validation before ledger writes |
 | Subagent scan | File-based cache with 30s TTL, scoped to current session |
 | Token bar | `jq` read from `token-scan-summary.json` (fallback: `token-scan-cache.json`); the actual JSONL rescan runs in the background via `scan-tokens.py`, never inline |
+| Shared account snapshot | One stable inode+mtime read; no credential/profile/usage calls or shared-ledger writes |
 
 ### Files
 
@@ -442,6 +536,7 @@ Claude Code                    statusline.sh
 | `~/.claude/rprompt.txt` | Zsh RPROMPT (`rprompt` format) | Updated each render |
 | `~/.claude/usage-ledger.json` | Durable per-day/per-model token ledger (`bin/usage-ledger.py`) | Permanent |
 | `~/.claude/statusline-tz` | Optional timezone override for reset-time display | Permanent |
+| `~/.accounts/statusline-snapshot.json` | Private declared-label routing and quota snapshot (`SHARED_ACCOUNT_SNAPSHOT=1`) | Written only by explicit `accounts poll`/`accounts watch` |
 | `~/.claude/.credentials.json` | Claude Code's own OAuth credential — read-only, mtime-tracked | Claude-Code-managed |
 | `/tmp/claude/statusline-usage-cache-<profile>.json` | Account-keyed rate-limit API cache | 60s TTL |
 | `/tmp/claude/statusline-profile-cache-<profile>.json` | Account-keyed profile API cache | 5min TTL |
@@ -451,7 +546,7 @@ Claude Code                    statusline.sh
 | `/tmp/claude/ctx-history-<sid>.txt` | Context-fill samples, for the fill-ETA calc | Rolling |
 | `/tmp/claude/statusline-pr-<repo-ref-key>.json` | PR status cache | 90s TTL |
 | `/tmp/claude/statusline-pr-<repo-ref-key>.json.lock` | PR refresh lock | Persistent file, transient lock |
-| `/tmp/claude/statusline-raw.json` | Raw status blob, for macOS apps | Updated each render |
+| `/tmp/claude/statusline-raw.json` | Raw status blob, for macOS apps | Updated each legacy render; not used in shared snapshot mode |
 | `/tmp/claude/statusline-notif-state.json` | Notification dedup state | Per-threshold |
 | `/tmp/claude/statusline-refresh-<profile>.lock` | Account-keyed background refresh lock | Transient |
 | `/tmp/claude/statusline-creds-mtime-<profile>` | Account-keyed credential mtime detector | Persistent |

@@ -13,6 +13,12 @@ set -uo pipefail
 
 LAUNCHD_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ACTION="${1:-install}"
+AGENT_METRICS_RECORDER="${AGENT_METRICS_RECORDER:-0}"
+if [ -r "$HOME/.claude/statusline.conf" ]; then
+    set -a
+    source "$HOME/.claude/statusline.conf"
+    set +a
+fi
 
 # launchctl registers against the live login session, not $HOME, so a run with
 # a sandboxed HOME would unload the real agents and replace them with plists
@@ -42,7 +48,10 @@ run() {
 
 # fswatch is the watcher's only external dependency; without it launchd would
 # crash-loop the agent every 10s instead of reporting one clear failure.
-if [ "$ACTION" = "install" ] && ! command -v fswatch >/dev/null 2>&1; then
+if [ "$ACTION" = "install" ] && [ "$AGENT_METRICS_RECORDER" = "1" ]; then
+    "$LAUNCHD_DIR/install-daemon.sh" --remove
+    echo "Agent Metrics recorder enabled — legacy token scanner disabled"
+elif [ "$ACTION" = "install" ] && ! command -v fswatch >/dev/null 2>&1; then
     echo "[!] fswatch not installed — skipping token-scan watcher"
     echo "    brew install fswatch, then re-run this script"
 else

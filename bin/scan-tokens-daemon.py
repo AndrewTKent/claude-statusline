@@ -42,6 +42,7 @@ import scan_tokens_core as core  # noqa: E402
 # fresh-enough data without hammering the SSD or triggering fsevents loops.
 SUMMARY_FLUSH_INTERVAL_S = 1.0
 CACHE_FLUSH_INTERVAL_S = 30.0
+CODEX_SCAN_INTERVAL_S = 60.0
 
 # When the main loop is idle, we still need to wake periodically to check
 # midnight rollover and perform deferred flushes. A 1s select timeout keeps
@@ -74,6 +75,7 @@ class Daemon:
         self.cache_dirty = False
         self.last_summary_flush = 0.0
         self.last_cache_flush = 0.0
+        self.last_codex_scan = 0.0
         self.last_midnight_check = 0.0
 
     # -----------------------------------------------------------------------
@@ -91,6 +93,7 @@ class Daemon:
         self.files = {fp: core.FileCacheEntry.from_dict(d) for fp, d in new_files_raw.items()}
         self.aggregates = aggregates
         self.codex_aggregates = core.codex_full_scan(self.cfg)
+        self.last_codex_scan = time.monotonic()
 
         # Prime session_classifications for subagent inheritance.
         for fp, entry in self.files.items():
@@ -273,6 +276,18 @@ class Daemon:
         self.summary_dirty = True
         self._log("midnight: today bucket rebuilt")
 
+    def maybe_scan_codex(self) -> None:
+        now = time.monotonic()
+        if now - self.last_codex_scan < CODEX_SCAN_INTERVAL_S:
+            return
+        previous = self.codex_aggregates
+        self.codex_aggregates = core.codex_full_scan(self.cfg)
+        self.last_codex_scan = now
+        if self.codex_aggregates == previous:
+            return
+        self.summary_dirty = True
+        self.cache_dirty = True
+
     # -----------------------------------------------------------------------
     # Periodic external-config reload
     # -----------------------------------------------------------------------
@@ -336,9 +351,6 @@ class Daemon:
 
     def _current_cache_payload(self, elapsed_s: float) -> dict:
         new_files_raw = {fp: entry.to_dict() for fp, entry in self.files.items()}
-        # Codex sessions get rescanned each flush — cheap (few rollouts, small files).
-        # Incremental codex tracking would need its own fswatch; not worth the complexity yet.
-        self.codex_aggregates = core.codex_full_scan(self.cfg)
         payload = core.build_cache_payload(
             self.cfg, new_files_raw, self.aggregates, files_rescanned=0,
             codex_aggregates=self.codex_aggregates,
@@ -476,6 +488,7 @@ def main() -> int:
                 daemon.handle_event(path)
 
         daemon.maybe_roll_midnight()
+        daemon.maybe_scan_codex()
         daemon.reload_external_config_if_stale()
         daemon.flush()
 
