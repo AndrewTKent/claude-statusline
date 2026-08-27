@@ -29,6 +29,13 @@ Run `/setup-statusline` first — both tools share `~/.claude/statusline.conf`.
    SHOW_ACCOUNT_RESETS=1
    ```
 
+   To prevent routed sessions from consuming paid overage after the five-hour
+   window reaches 100%, opt in locally:
+
+   ```bash
+   ACCOUNTS_HARD_SESSION_LIMIT=1
+   ```
+
    Labels must match the email address shown by Claude. Same email in two
    organizations requires `|org-uuid` suffixes.
 

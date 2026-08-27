@@ -55,6 +55,11 @@
 # AGENT_METRICS_RECORDER=1
 # AGENT_METRICS_DB="$HOME/Library/Application Support/statusline/agent-metrics/metrics.sqlite3"
 
+# Stop routed Claude sessions when the active account's fresh or last-known
+# 5-hour utilization reaches 100%. Overrides account pins and routes to another
+# safe account when possible. Off by default.
+# ACCOUNTS_HARD_SESSION_LIMIT=1
+
 # ─── Token classifier (optional; for scan-tokens.py) ───────────────────────
 # Classify each token request as work / personal / unknown. Independent of
 # EMAIL_PAYER_MAP — email is about payment, work-type is about what you did.

@@ -121,6 +121,65 @@ class TestEffectivePcts:
         assert accounts.effective_pcts(row, now)["fable"] == 0.0
 
 
+def test_hard_session_limit_setting_is_opt_in(tmp_path, monkeypatch):
+    config = tmp_path / "statusline.conf"
+    monkeypatch.setattr(accounts, "CONF_PATH", config)
+    monkeypatch.delenv("ACCOUNTS_HARD_SESSION_LIMIT", raising=False)
+
+    assert accounts.hard_session_limit_enabled() is False
+
+    config.write_text("ACCOUNTS_HARD_SESSION_LIMIT=1\n")
+
+    assert accounts.hard_session_limit_enabled() is True
+
+    monkeypatch.setenv("ACCOUNTS_HARD_SESSION_LIMIT", "0")
+
+    assert accounts.hard_session_limit_enabled() is False
+
+    monkeypatch.setenv("ACCOUNTS_HARD_SESSION_LIMIT", "1")
+
+    assert accounts.hard_session_limit_enabled() is True
+
+
+@pytest.mark.parametrize(("usage", "reached"), [(99.9, False), (100.0, True)])
+def test_profile_session_limit_uses_the_five_hour_boundary(
+    usage,
+    reached,
+    monkeypatch,
+):
+    monkeypatch.setattr(accounts, "load_blobs", lambda: {})
+    monkeypatch.setattr(
+        accounts,
+        "route_rows",
+        lambda *_args: [{"label": "work", "five_hour": usage}],
+    )
+
+    assert accounts.profile_session_limit_reached("work") is reached
+
+
+def test_hard_session_limit_bypasses_a_forced_exhausted_pin(monkeypatch):
+    exhausted = {"label": "pinned"}
+    safe = {"label": "safe"}
+    selections = []
+
+    def select_once(**kwargs):
+        selections.append(kwargs)
+        return exhausted if len(selections) == 1 else safe
+
+    monkeypatch.setattr(accounts, "_select_profile_once", select_once)
+    monkeypatch.setattr(accounts, "hard_session_limit_enabled", lambda: True)
+    monkeypatch.setattr(
+        accounts,
+        "profile_session_limit_reached",
+        lambda label: label == "pinned",
+    )
+
+    assert accounts.select_profile(force_label="pinned") == safe
+    assert selections[1]["avoid_labels"] == {"pinned"}
+    assert selections[1]["force_label"] is None
+    assert selections[1]["ignore_policy"] is True
+
+
 def test_mark_session_limit_quarantines_stale_usage_until_reset(
     tmp_path,
     monkeypatch,
