@@ -724,11 +724,13 @@ class TestHandoffTarget:
             require_fable=True,
         ) == "other"
 
+    # Reversal of "ignores general window ceilings": a rate-wall 429 costs the
+    # turn plus an hours-long lockout, so near-wall fable sessions depart too.
     @pytest.mark.parametrize(
         ("five_hour", "seven_day"),
         [(100.0, 20.0), (20.0, 100.0)],
     )
-    def test_fable_session_ignores_general_window_ceilings(
+    def test_fable_session_departs_a_rate_wall(
         self,
         five_hour,
         seven_day,
@@ -742,6 +744,103 @@ class TestHandoffTarget:
                 fable=99.0,
             ),
             accounts_row("other", 10.0, seven_day=20.0, fable=1.0),
+        ]
+        self._wire(monkeypatch, rows, mode="fable")
+
+        assert accounts.handoff_target(
+            "current",
+            require_fable=True,
+        ) == "other"
+
+    def test_fable_session_ignores_advisory_usage_below_the_threshold(
+        self,
+        monkeypatch,
+    ):
+        rows = [
+            accounts_row(
+                "current",
+                accounts.DEPART_PCT - 0.1,
+                seven_day=10.0,
+                fable=99.0,
+            ),
+            accounts_row("other", 10.0, seven_day=20.0, fable=1.0),
+        ]
+        self._wire(monkeypatch, rows, mode="fable")
+
+        assert accounts.handoff_target(
+            "current",
+            require_fable=True,
+        ) is None
+
+    def test_fable_departure_leaves_the_lowest_fable_account(self, monkeypatch):
+        # The incident shape: fable mode parks sessions on the lowest-fable
+        # account, so the walled row ranks first and must not pick itself.
+        rows = [
+            accounts_row("current", 95.0, seven_day=10.0, fable=1.0),
+            accounts_row("other", 10.0, seven_day=20.0, fable=50.0),
+        ]
+        self._wire(monkeypatch, rows, mode="fable")
+
+        assert accounts.handoff_target(
+            "current",
+            require_fable=True,
+        ) == "other"
+
+    def test_fable_departure_fires_exactly_at_the_threshold(self, monkeypatch):
+        rows = [
+            accounts_row(
+                "current",
+                accounts.DEPART_PCT,
+                seven_day=10.0,
+                fable=99.0,
+            ),
+            accounts_row("other", 10.0, seven_day=20.0, fable=1.0),
+        ]
+        self._wire(monkeypatch, rows, mode="fable")
+
+        assert accounts.handoff_target(
+            "current",
+            require_fable=True,
+        ) == "other"
+
+    def test_fable_departure_stays_without_enough_gain(self, monkeypatch):
+        rows = [
+            accounts_row("current", 95.0, seven_day=10.0, fable=99.0),
+            accounts_row(
+                "other",
+                95.0 - accounts.HANDOFF_MARGIN_PCT + 1.0,
+                seven_day=20.0,
+                fable=1.0,
+            ),
+        ]
+        self._wire(monkeypatch, rows, mode="fable")
+
+        assert accounts.handoff_target(
+            "current",
+            require_fable=True,
+        ) is None
+
+    def test_fable_departure_accepts_exactly_the_margin(self, monkeypatch):
+        rows = [
+            accounts_row("current", 95.0, seven_day=10.0, fable=99.0),
+            accounts_row(
+                "other",
+                95.0 - accounts.HANDOFF_MARGIN_PCT,
+                seven_day=20.0,
+                fable=1.0,
+            ),
+        ]
+        self._wire(monkeypatch, rows, mode="fable")
+
+        assert accounts.handoff_target(
+            "current",
+            require_fable=True,
+        ) == "other"
+
+    def test_fable_departure_never_lands_on_a_walled_peer(self, monkeypatch):
+        rows = [
+            accounts_row("current", 95.0, seven_day=10.0, fable=99.0),
+            accounts_row("walled", 100.0, seven_day=10.0, fable=1.0),
         ]
         self._wire(monkeypatch, rows, mode="fable")
 

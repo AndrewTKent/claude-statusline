@@ -261,7 +261,9 @@ The script sets the terminal tab title (via ANSI escape) to `repo-name` on main/
 
 ### Background — Notifications
 
-macOS Notification Center alerts fire automatically (once per threshold, deduped):
+macOS Notification Center alerts are off by default; opt in with
+`STATUSLINE_NOTIFY=1` (exported, or set in `~/.claude/statusline.conf`).
+When enabled they fire once per threshold, deduped:
 - **Rate limit** at 80%, 90%, 95%
 - **Context** at 80%, 95%
 - **Budget** at 90%, 100%
@@ -338,7 +340,8 @@ Pushes structured data to iTerm2 via `OSC 1337;SetUserVar` or sets the Kitty win
 Create `~/.claude/statusline.conf` (bash, sourced directly). Full annotated version with every knob: [`config/statusline.conf.example`](config/statusline.conf.example). All settings are optional — the script works with no config file at all.
 
 **Cost & format**
-- `DAILY_BUDGET=20` — daily cost ceiling; enables the `budget` row + 90%/100% notifications
+- `DAILY_BUDGET=20` — daily cost ceiling; enables the `budget` row + 90%/100% notifications (when opted in)
+- `STATUSLINE_NOTIFY=1` — opt in to macOS Notification Center threshold alerts (default off)
 - `FORMAT=default` — `default | compact | narrow | sigil | sparkline | rprompt | iterm2`
 
 **Branch display**
@@ -485,7 +488,7 @@ Claude Code pipes a JSON status blob into the script via stdin on every tool cal
 7. **Interpolates** usage between polls — tracks velocity across consecutive API responses for smooth fractional percentages
 8. **Builds** the budget row (if `DAILY_BUDGET` is set) and the optional multi-account reset board (if `SHOW_ACCOUNT_RESETS=1`)
 9. **Sets** terminal tab title to repo + branch
-10. **Checks** notification thresholds (fires once per crossing, deduped)
+10. **Checks** notification thresholds when `STATUSLINE_NOTIFY=1` (fires once per crossing, deduped)
 11. **Renders** in your chosen format, falling back to `narrow` under `NARROW_THRESHOLD` columns
 
 ### Architecture

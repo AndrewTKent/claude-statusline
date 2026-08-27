@@ -4,6 +4,9 @@
 # Daily cost ceiling in $ (enables budget progress bar)
 # DAILY_BUDGET=20
 
+# macOS Notification Center threshold alerts (rate/context/budget), default off
+# STATUSLINE_NOTIFY=1
+
 # Render format: default | compact | narrow | sigil | sparkline | rprompt | iterm2
 # FORMAT=default
 
