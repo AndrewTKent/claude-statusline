@@ -903,24 +903,55 @@ def write_profile_credentials(label: str, blob: str) -> None:
         _write_0600(profile / ".credentials.json", blob)
 
 
-def _repin_known_profile_login(source_label: str, identity: dict, blobs: dict) -> None:
-    global_mode = _load_global_mode_snapshot()[0]
-    mode = {"mode": global_mode["mode"], "label": global_mode.get("label")}
-    if mode.get("mode") != "set" or mode.get("label") != source_label:
-        return
+def _token_matches_entry_identity(token: str | None, entry: dict) -> bool:
+    profile = fetch_profile(token) if token else None
+    if not profile:
+        return False
+    identity = identity_from_profile(profile)
+    return (
+        identity["email"] == entry.get("email")
+        and identity["org_uuid"] == entry.get("org_uuid")
+    )
+
+
+def _pin_known_profile_login(
+    source_label: str,
+    identity: dict,
+    login_blob: str,
+    blobs: dict,
+) -> tuple[str | None, bool]:
+    mode = load_mode()
     target_label = resolve_label(
         identity.get("email"),
         identity.get("org_uuid"),
         load_label_pairs(),
     )
     target = (blobs.get("accounts") or {}).get(target_label)
-    if target_label == source_label or not target or entry_needs_login(target, time.time()):
-        return
-    save_mode("set", target_label)
+    if target_label == source_label or not target:
+        return None, False
+    transferred = False
+    if entry_needs_login(target, time.time()):
+        keychain_service = profile_keychain_service(target_label)
+        if kc_read(keychain_service) and not kc_delete(keychain_service):
+            return None, False
+        clear_profile_account_state(target_label)
+        set_entry_blob(target, login_blob)
+        target["email"] = identity["email"] or target.get("email")
+        target["org_uuid"] = identity["org_uuid"] or target.get("org_uuid")
+        target["org_type"] = identity["org_type"] or target.get("org_type")
+        write_profile_credentials(target_label, login_blob)
+        transferred = True
+    if mode.get("policy_scope") == "pane":
+        if mode.get("label") == source_label:
+            _save_pane_pin(target_label)
+    else:
+        save_mode("set", target_label)
+    return target_label, transferred
 
 
 def sync_profile_credentials(blobs: dict, *, persist: bool) -> set[str]:
     changed = False
+    persist_login = False
     blocked_labels: set[str] = set()
     for label, entry in (blobs.get("accounts") or {}).items():
         credentials = native_profile_path(label) / ".credentials.json"
@@ -1004,7 +1035,15 @@ def sync_profile_credentials(blobs: dict, *, persist: bool) -> set[str]:
             set_entry_blob(entry, stored_blob)
             entry["email"] = expected_email
             entry["org_uuid"] = expected_org_uuid
-            _repin_known_profile_login(label, identity, blobs)
+            pinned_label, transferred = _pin_known_profile_login(
+                label,
+                identity,
+                profile_blob,
+                blobs,
+            )
+            if pinned_label:
+                blocked_labels.discard(pinned_label)
+            persist_login = persist_login or transferred
             changed = True
             print(
                 f"warning: repaired {label} profile login from its stored identity",
@@ -1016,7 +1055,7 @@ def sync_profile_credentials(blobs: dict, *, persist: bool) -> set[str]:
         entry["org_uuid"] = identity["org_uuid"] or entry.get("org_uuid")
         entry["org_type"] = identity["org_type"] or entry.get("org_type")
         changed = True
-    if changed and persist:
+    if changed and (persist or persist_login):
         save_blobs(blobs)
     return blocked_labels
 
@@ -1249,6 +1288,11 @@ def save_pane_pin(label: str) -> None:
     declared = {declared_label for declared_label, _, _ in load_label_pairs()}
     if label not in declared:
         raise AccountsError(f"'{label}' is not a declared account label")
+
+    _save_pane_pin(label)
+
+
+def _save_pane_pin(label: str) -> None:
     _migrate_mode_store()
     with locked():
         _, global_generation = _load_global_mode_snapshot()
@@ -1692,7 +1736,7 @@ def refresh_keychain_profiles(
                 json_path.unlink(missing_ok=True)
 
 
-def refresh_dormant_profiles() -> int:
+def refresh_dormant_profiles(labels: set[str] | None = None) -> int:
     now = time.time()
     refreshed = 0
     changed = False
@@ -1704,6 +1748,8 @@ def refresh_dormant_profiles() -> int:
         }
         excluded = excluded_labels()
         for label, entry in (blobs.get("accounts") or {}).items():
+            if labels is not None and label not in labels:
+                continue
             if label in active_labels or label in excluded:
                 continue
             blob = profile_live_blob(label) or entry.get("blob", "")
@@ -1728,6 +1774,8 @@ def refresh_dormant_profiles() -> int:
                 continue
             if not new_blob:
                 continue
+            if not _token_matches_entry_identity(blob_access_token(new_blob), entry):
+                continue
             set_entry_blob(entry, new_blob)
             write_profile_credentials(label, new_blob)
             refreshed += 1
@@ -1746,12 +1794,15 @@ def poll_blobs_usage(blobs: dict) -> int:
     fresh: dict[str, dict] = {}
     failed = 0
     for label, e in (blobs.get("accounts") or {}).items():
-        blob = profile_live_blob(label) or e.get("blob", "")
+        stored_blob = e.get("blob", "")
+        blob = profile_live_blob(label) or stored_blob
         exp = blob_access_expiry(blob)
         if exp is not None and now >= exp:
             continue
         token = blob_access_token(blob)
         if not token:
+            continue
+        if blob != stored_blob and not _token_matches_entry_identity(token, e):
             continue
         usage = fetch_usage(token)
         if usage is None:
@@ -2383,26 +2434,41 @@ def confirm_stale_candidate(
                     return False
             os.utime(CONFIRM_POLL_LOCK_PATH, None)
             label = candidates[0]["label"]
-            entry = (blobs.get("accounts") or {}).get(label) or {}
+            entry = (blobs.get("accounts") or {}).get(label)
+            if not entry:
+                return False
             now = int(time.time())
             blob = profile_live_blob(label) or entry.get("blob", "")
             expiry = blob_access_expiry(blob)
             if expiry is not None and now >= expiry:
-                return False
+                refresh_dormant_profiles({label})
+                blobs = load_blobs()
+                entry = (blobs.get("accounts") or {}).get(label)
+                if not entry:
+                    return False
+                now = int(time.time())
+                blob = profile_live_blob(label) or entry.get("blob", "")
+                expiry = blob_access_expiry(blob)
+                if expiry is not None and now >= expiry:
+                    return False
             token = blob_access_token(blob)
             if not token:
+                return False
+            email = entry.get("email")
+            org_uuid = entry.get("org_uuid")
+            if not email or not org_uuid:
+                return False
+            if blob != entry.get("blob", "") and not _token_matches_entry_identity(
+                token,
+                entry,
+            ):
                 return False
             usage = fetch_usage(token, timeout=CONFIRM_POLL_TIMEOUT_S)
             if usage is None:
                 return False
             merge_reset_rows(
                 {
-                    f"{entry.get('email')}|{entry.get('org_uuid')}": usage_to_reset_row(
-                        entry.get("email"),
-                        entry.get("org_uuid"),
-                        usage,
-                        now,
-                    )
+                    f"{email}|{org_uuid}": usage_to_reset_row(email, org_uuid, usage, now)
                 }
             )
             return True
@@ -2814,20 +2880,19 @@ def cmd_set(args) -> None:
 
 def cmd_auto(_args) -> None:
     """Route supervised sessions to the freshest account."""
-    save_mode("auto", None)
     blobs = load_blobs()
     blocked_labels = sync_profile_credentials(blobs, persist=False)
     rows = [
         row for row in route_rows(blobs, None, time.time()) if row["label"] not in blocked_labels
     ]
     pick = pick_profile_route(rows, excluded_labels(), None)
+    save_mode("auto", None)
     print("AUTO — supervised sessions use the freshest safe account")
     print(f"  next: {pick or '(none free)'}")
 
 
 def cmd_fable(_args) -> None:
     """Run supervised sessions on Fable while Fable headroom is available."""
-    save_mode("fable", None)
     blobs = load_blobs()
     blocked_labels = sync_profile_credentials(blobs, persist=False)
     rows = [
@@ -2844,6 +2909,7 @@ def cmd_fable(_args) -> None:
         ),
         key=_fable_rank,
     )
+    save_mode("fable", None)
     print("FABLE — supervised sessions switch to Fable when headroom is available")
     if not usable:
         print(
