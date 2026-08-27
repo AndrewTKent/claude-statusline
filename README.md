@@ -82,7 +82,7 @@ Restart Claude Code. Done.
 
 ### Codex
 
-**Requires:** Codex CLI &middot; Python 3 &middot; `tmux` &middot; `~/.local/bin` on `PATH` &middot; Optional: [`gh`](https://cli.github.com/) for PR linkage
+**Requires:** Codex CLI &middot; Python 3 &middot; `~/.local/bin` on `PATH` &middot; Legacy dashboard: `tmux` &middot; Optional: [`gh`](https://cli.github.com/) for PR linkage
 
 ```bash
 ./install-codex.sh
@@ -90,7 +90,13 @@ codex-statusline
 codex-statusline --sandbox read-only --ask-for-approval on-request
 ```
 
-`codex-statusline` launches Codex in tmux with a fixed bottom pane matching the
+Set `CODEX_STATUSLINE_NATIVE=1` in `~/.codex/statusline.conf` to launch Codex
+with its native themed status line and `--no-alt-screen`. The native line shows
+model, project, branch, context, usage limits, tokens, permissions, approval
+mode, and task progress while preserving normal terminal selection and
+scrollback. Set it to `0` for the legacy tmux dashboard described below.
+
+The legacy mode launches Codex in tmux with a fixed bottom pane matching the
 multi-line Claude Code status view. It shows the current model, elapsed time,
 account, repository, linked pull request, context use, 5-hour and weekly limits,
 remaining purchased credits, tokens, agents, and running tools. It binds each
@@ -115,8 +121,8 @@ The launcher defaults to Codex YOLO mode by passing
 `--dangerously-bypass-approvals-and-sandbox`. An explicit `-a/--ask-for-approval`,
 `-s/--sandbox`, or dangerous-bypass flag replaces that default; profile (`-p`) or
 `-c` approval overrides do not. Set
-`CODEX_STATUSLINE_MANAGE_APPROVALS=0` to pass no permission default. The launcher also uses
-`tui.status_line=[]` so Codex keeps only its compact built-in prompt footer while
+`CODEX_STATUSLINE_MANAGE_APPROVALS=0` to pass no permission default. In legacy
+mode, `tui.status_line=[]` keeps only Codex's compact built-in prompt footer while
 the detailed dashboard stays in the fixed pane.
 Settings load from `${CODEX_HOME:-~/.codex}/statusline.conf`; non-empty environment
 variables override file values, and `CODEX_STATUSLINE_CONFIG` points at a

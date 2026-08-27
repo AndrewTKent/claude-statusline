@@ -277,6 +277,172 @@ class CodexStatuslineTest(unittest.TestCase):
             self.assertTrue(detached_lines[detached_repo_index + 1].startswith("pr"))
             self.assertIn(f"#{pr_number}", detached_lines[detached_repo_index + 1])
 
+    def test_claude_statusline_infers_only_live_executed_worktrees(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir).resolve()
+            home = tmp / "home"
+            cache = tmp / "cache"
+            project = tmp / "project"
+            worktree = tmp / "feature tree"
+            fake_bin = tmp / "bin"
+            for path in (home / ".claude", cache, project, fake_bin):
+                path.mkdir(parents=True, exist_ok=True)
+            (home / ".claude/statusline.conf").write_text("MAX_COLS=100\n")
+            (fake_bin / "gh").write_text("#!/usr/bin/env bash\nexit 1\n")
+            (fake_bin / "gh").chmod(0o755)
+
+            subprocess.run(["git", "init", "-b", "main"], cwd=project, check=True, capture_output=True)
+            (project / "README.md").write_text("fixture\n")
+            subprocess.run(["git", "add", "README.md"], cwd=project, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Statusline Test",
+                    "-c",
+                    "user.email=statusline@example.invalid",
+                    "commit",
+                    "-m",
+                    "fixture",
+                ],
+                cwd=project,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "worktree", "add", "-b", "feature/worktree", str(worktree)],
+                cwd=project,
+                check=True,
+                capture_output=True,
+            )
+
+            script = tmp / "statusline.sh"
+            script.write_text(
+                (MODULE_PATH.with_name("statusline.sh"))
+                .read_text()
+                .replace("/tmp/claude", str(cache))
+            )
+            fixture = json.loads(
+                (MODULE_PATH.parents[1] / "test/fixtures/input.json").read_text()
+            )
+            fixture["workspace"]["current_dir"] = str(project)
+            fixture["session_id"] = "physical-session"
+            project_dir = str(project).replace("/", "-")
+            transcript_dir = home / ".claude/projects" / project_dir
+            transcript_dir.mkdir(parents=True)
+            transcript = transcript_dir / "physical-session.jsonl"
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "message": {
+                            "role": "user",
+                            "content": f"Do not run git -C {worktree} status",
+                        },
+                    }
+                )
+                + "\n"
+            )
+            env = {
+                **os.environ,
+                "HOME": str(home),
+                "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                "STATUSLINE_FORMAT": "default",
+                "TZ": "America/Los_Angeles",
+            }
+
+            def repo_line() -> str:
+                result = subprocess.run(
+                    ["bash", str(script)],
+                    cwd=project,
+                    env=env,
+                    input=json.dumps(fixture),
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                )
+                lines = re.sub(r"\x1b(?:\[[0-9;]*m|\][^\a]*\a)", "", result.stdout).splitlines()
+                return next(line for line in lines if line.startswith("repo"))
+
+            self.assertIn("main", repo_line())
+            with transcript.open("a") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "message": {
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "tool_use",
+                                        "name": "Bash",
+                                        "input": {
+                                            "command": f'printf %s "do not switch: git -C {worktree} status"'
+                                        },
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+            self.assertIn("main", repo_line())
+            with transcript.open("a") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "message": {
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "tool_use",
+                                        "name": "Bash",
+                                        "input": {"command": f'git -C "{worktree}" status'},
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+            self.assertIn("⌥ project worktree (worktree)", repo_line())
+
+            logical_root = tmp / "logical"
+            logical_root.symlink_to(tmp, target_is_directory=True)
+            fixture["workspace"]["current_dir"] = str(logical_root / "project")
+            fixture["session_id"] = "logical-session"
+            logical_project_dir = str(logical_root / "project").replace("/", "-")
+            logical_transcript_dir = home / ".claude/projects" / logical_project_dir
+            logical_transcript_dir.mkdir(parents=True)
+            logical_transcript = logical_transcript_dir / "logical-session.jsonl"
+            logical_transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "name": "Bash",
+                                    "input": {
+                                        "command": f'git -C "{logical_root / "feature tree"}" status'
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                )
+                + "\n"
+            )
+            self.assertIn("⌥ project worktree (worktree)", repo_line())
+
+            fixture["workspace"]["current_dir"] = str(project)
+            fixture["session_id"] = "physical-session"
+            worktree.rename(tmp / "deleted-worktree")
+            self.assertIn("main", repo_line())
+
     def test_parse_shell_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "statusline.conf"
@@ -3247,6 +3413,39 @@ class CodexStatuslineTest(unittest.TestCase):
 
         self.assertEqual(widths, [137])
 
+    def test_footer_pane_height_matches_rendered_rows(self) -> None:
+        body = "model\ntime\naccount\nrepo\ncontext\nweekly\ncredits\nusage\nagents\nmode"
+
+        with (
+            mock.patch.dict(os.environ, {"TMUX_PANE": "%42"}),
+            mock.patch.object(codex_statusline, "terminal_size", return_value=os.terminal_size((137, 12))),
+            mock.patch.object(codex_statusline.subprocess, "run") as run,
+        ):
+            codex_statusline.fit_footer_pane(body)
+
+        run.assert_called_once_with(
+            ["tmux", "resize-pane", "-t", "%42", "-y", "10"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def test_footer_render_does_not_scroll_past_mode(self) -> None:
+        args = codex_statusline.parse_args(["--footer", "--watch", "1"])
+        output = io.StringIO()
+
+        with (
+            mock.patch.object(codex_statusline, "snapshot", return_value={}),
+            mock.patch.object(codex_statusline, "render", return_value="model\nmode"),
+            mock.patch.object(codex_statusline, "fit_footer_pane"),
+            mock.patch.object(codex_statusline.time, "sleep", side_effect=RuntimeError("stop")),
+            mock.patch.object(codex_statusline.sys, "stdout", output),
+            self.assertRaisesRegex(RuntimeError, "stop"),
+        ):
+            codex_statusline.watch_loop(args, codex_statusline.Palette(False))
+
+        self.assertTrue(output.getvalue().endswith("mode"))
+
     def test_watch_freezes_bound_thread_after_first_snapshot(self) -> None:
         with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "ambient-thread"}):
             args = codex_statusline.parse_args(
@@ -3416,6 +3615,7 @@ class CodexStatuslineTest(unittest.TestCase):
                 {
                     "CAPTURE": str(capture),
                     "CODEX_STATUSLINE_CODEX_BIN": str(fake_codex),
+                    "CODEX_STATUSLINE_NATIVE": "0",
                     "PATH": f"{tmp}:{env['PATH']}",
                     "TMUX": "test",
                 }
@@ -3478,6 +3678,44 @@ class CodexStatuslineTest(unittest.TestCase):
                 ],
             )
 
+    def test_launcher_native_mode_uses_copy_friendly_statusline(self) -> None:
+        launcher = MODULE_PATH.with_name("codex-statusline")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            capture = tmp / "args"
+            fake_codex = tmp / "codex"
+            fake_tmux = tmp / "tmux"
+            fake_codex.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "$CAPTURE"\n')
+            fake_tmux.write_text("#!/usr/bin/env bash\nexit 99\n")
+            fake_codex.chmod(0o755)
+            fake_tmux.chmod(0o755)
+            env = {
+                **os.environ,
+                "CAPTURE": str(capture),
+                "CODEX_STATUSLINE_CODEX_BIN": str(fake_codex),
+                "CODEX_STATUSLINE_HEIGHT": "1",
+                "CODEX_STATUSLINE_HISTORY_LIMIT": "0",
+                "CODEX_STATUSLINE_INTERVAL": "0",
+                "CODEX_STATUSLINE_MANAGE_APPROVALS": "0",
+                "CODEX_STATUSLINE_NATIVE": "1",
+                "PATH": f"{tmp}:{os.environ['PATH']}",
+            }
+
+            subprocess.run([str(launcher), "--model", "gpt-test"], check=True, env=env)
+
+            self.assertEqual(
+                capture.read_text().splitlines(),
+                [
+                    "--no-alt-screen",
+                    "-c",
+                    'tui.status_line=["model-with-reasoning","project-name","git-branch","context-used","five-hour-limit","weekly-limit","used-tokens","permissions","approval-mode","task-progress"]',
+                    "-c",
+                    "tui.status_line_use_colors=true",
+                    "--model",
+                    "gpt-test",
+                ],
+            )
+
     def test_launcher_loads_config_file(self) -> None:
         launcher = MODULE_PATH.with_name("codex-statusline")
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3505,6 +3743,7 @@ class CodexStatuslineTest(unittest.TestCase):
                 "CODEX_STATUSLINE_HEIGHT",
                 "CODEX_STATUSLINE_INTERVAL",
                 "CODEX_STATUSLINE_MANAGE_APPROVALS",
+                "CODEX_STATUSLINE_NATIVE",
             ):
                 env.pop(name, None)
             env.update(
@@ -3552,6 +3791,7 @@ class CodexStatuslineTest(unittest.TestCase):
             base_env.update(
                 {
                     "CODEX_STATUSLINE_CODEX_BIN": str(fake_codex),
+                    "CODEX_STATUSLINE_NATIVE": "0",
                     "PATH": f"{tmp}:{base_env['PATH']}",
                     "TMUX": "test",
                 }
@@ -3605,6 +3845,7 @@ class CodexStatuslineTest(unittest.TestCase):
                 {
                     "CAPTURE": str(capture),
                     "CODEX_STATUSLINE_CODEX_BIN": str(fake_codex),
+                    "CODEX_STATUSLINE_NATIVE": "0",
                     "COLUMNS": "117",
                     "LINES": "83",
                     "PATH": f"{tmp}:{env['PATH']}",
@@ -3661,6 +3902,7 @@ class CodexStatuslineTest(unittest.TestCase):
             {
                 "CAPTURE": str(capture),
                 "CODEX_STATUSLINE_CODEX_BIN": str(fake_codex),
+                "CODEX_STATUSLINE_NATIVE": "0",
                 "COLUMNS": "100",
                 "LINES": "40",
                 "PATH": f"{tmp}:{env['PATH']}",
@@ -3720,7 +3962,7 @@ class CodexStatuslineTest(unittest.TestCase):
             home.mkdir()
             codex_home.mkdir()
             fake_bin.mkdir()
-            for name in ("codex", "tmux"):
+            for name in ("codex",):
                 path = fake_bin / name
                 path.write_text("#!/usr/bin/env bash\nexit 0\n")
                 path.chmod(0o755)
@@ -3729,7 +3971,7 @@ class CodexStatuslineTest(unittest.TestCase):
                 {
                     "CODEX_HOME": str(codex_home),
                     "HOME": str(home),
-                    "PATH": f"{fake_bin}:{env['PATH']}",
+                    "PATH": f"{fake_bin}:/usr/bin:/bin",
                 }
             )
 

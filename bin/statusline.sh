@@ -1523,6 +1523,110 @@ FOCUS=""
 
 # ── Git info ────────────────────────────────────────────
 GIT_INFO=""
+same_repository_checkout_root() {
+    local dir="$1" common="$2" candidate_common root
+    [ -d "$dir" ] || return 1
+    candidate_common=$(git -C "$dir" rev-parse --git-common-dir 2>/dev/null) || return 1
+    candidate_common=$(cd "$dir" && cd "$candidate_common" 2>/dev/null && pwd -P) || return 1
+    [ "$candidate_common" = "$common" ] || return 1
+    root=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || return 1
+    cd "$root" 2>/dev/null && pwd -P
+}
+
+executed_checkout_candidates() {
+    awk '
+        function push_token() {
+            if (token != "") {
+                tokens[++token_count] = token
+                token = ""
+            }
+        }
+        function emit_command(    path, position, key) {
+            push_token()
+            if (tokens[1] == "cd") {
+                position = tokens[2] == "--" ? 3 : 2
+                path = tokens[position]
+            } else if (tokens[1] == "git" && tokens[2] == "-C") {
+                path = tokens[3]
+            }
+            if (substr(path, 1, 1) == "/") print path
+            for (key in tokens) delete tokens[key]
+            token_count = 0
+            token = ""
+        }
+        {
+            quote = ""
+            escaped = 0
+            for (cursor = 1; cursor <= length($0); cursor++) {
+                char = substr($0, cursor, 1)
+                if (escaped) {
+                    token = token char
+                    escaped = 0
+                } else if (quote == "\047") {
+                    if (char == "\047") quote = ""
+                    else token = token char
+                } else if (quote == "\"") {
+                    if (char == "\\") escaped = 1
+                    else if (char == "\"") quote = ""
+                    else token = token char
+                } else if (char == "\\") {
+                    escaped = 1
+                } else if (char == "\047" || char == "\"") {
+                    quote = char
+                } else if (char ~ /[ \t\r]/) {
+                    push_token()
+                } else if (char == ";" || char == "|" || char == "&") {
+                    emit_command()
+                } else {
+                    token = token char
+                }
+            }
+            emit_command()
+        }
+    '
+}
+
+# Claude does not update current_dir after a session starts operating in a linked worktree.
+infer_working_dir() {
+    local sid="$1" cwd="$2"
+    [ -z "$sid" ] || [ -z "$cwd" ] && return
+    local project_dir session_file cache common candidate cached resolved
+    project_dir=$(echo "$cwd" | tr '/' '-')
+    session_file="$HOME/.claude/projects/${project_dir}/${sid}.jsonl"
+    [ -f "$session_file" ] || return
+    cache="/tmp/claude/statusline-workdir-${sid}.txt"
+    common=$(git -C "$cwd" rev-parse --git-common-dir 2>/dev/null)
+    [ -n "$common" ] || return
+    common=$(cd "$cwd" && cd "$common" 2>/dev/null && pwd -P)
+    if [ -f "$cache" ] && [ "$cache" -nt "$session_file" ]; then
+        cached=$(cat "$cache")
+        [ -z "$cached" ] && return
+        resolved=$(same_repository_checkout_root "$cached" "$common") && {
+            printf '%s\n' "$resolved"
+            return
+        }
+    fi
+    candidate=$(tail -n 400 "$session_file" 2>/dev/null \
+        | jq -Rr 'fromjson? | select(.type == "assistant" and .message.role == "assistant")
+            | .message.content[]?
+            | select(.type == "tool_use" and .name == "Bash")
+            | .input.command? // empty' \
+        | executed_checkout_candidates \
+        | awk '{ last[NR] = $0 } END { for (i = NR; i >= 1; i--) print last[i] }')
+    local dir
+    while IFS= read -r dir; do
+        [ -n "$dir" ] || continue
+        [ "$dir" = "$cwd" ] && continue
+        resolved=$(same_repository_checkout_root "$dir" "$common") || continue
+        mkdir -p /tmp/claude 2>/dev/null
+        printf '%s' "$resolved" > "$cache"
+        printf '%s\n' "$resolved"
+        return
+    done <<< "$candidate"
+    mkdir -p /tmp/claude 2>/dev/null
+    : > "$cache"
+}
+
 IS_DIRTY=false
 BRANCH=""
 BRANCH_NAME=""
@@ -1530,27 +1634,30 @@ HEAD_SHA=""
 GIT_ROOT=""
 IN_WORKTREE=false
 WORKTREE_NAME=""
-if [ -d "$CWD" ] && git -C "$CWD" rev-parse --git-dir > /dev/null 2>&1; then
-    GIT_ROOT=$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null)
-    BRANCH_NAME=$(git -C "$CWD" branch --show-current 2>/dev/null)
-    HEAD_SHA=$(git -C "$CWD" rev-parse HEAD 2>/dev/null)
+GIT_CWD="$CWD"
+INFERRED_DIR=$(infer_working_dir "$SESSION_ID" "$CWD")
+[ -n "$INFERRED_DIR" ] && GIT_CWD="$INFERRED_DIR"
+if [ -d "$GIT_CWD" ] && git -C "$GIT_CWD" rev-parse --git-dir > /dev/null 2>&1; then
+    GIT_ROOT=$(git -C "$GIT_CWD" rev-parse --show-toplevel 2>/dev/null)
+    BRANCH_NAME=$(git -C "$GIT_CWD" branch --show-current 2>/dev/null)
+    HEAD_SHA=$(git -C "$GIT_CWD" rev-parse HEAD 2>/dev/null)
     BRANCH="$BRANCH_NAME"
     [ -z "$BRANCH" ] && BRANCH="${HEAD_SHA:0:8}"
     # Detect worktree: git-common-dir differs from git-dir when in a worktree
-    GIT_DIR=$(git -C "$CWD" rev-parse --git-dir 2>/dev/null)
-    GIT_COMMON=$(git -C "$CWD" rev-parse --git-common-dir 2>/dev/null)
+    GIT_DIR=$(git -C "$GIT_CWD" rev-parse --git-dir 2>/dev/null)
+    GIT_COMMON=$(git -C "$GIT_CWD" rev-parse --git-common-dir 2>/dev/null)
     if [ -n "$GIT_DIR" ] && [ -n "$GIT_COMMON" ]; then
         # Normalize paths for comparison
-        GIT_DIR_REAL=$(cd "$CWD" && cd "$GIT_DIR" 2>/dev/null && pwd)
-        GIT_COMMON_REAL=$(cd "$CWD" && cd "$GIT_COMMON" 2>/dev/null && pwd)
+        GIT_DIR_REAL=$(cd "$GIT_CWD" && cd "$GIT_DIR" 2>/dev/null && pwd)
+        GIT_COMMON_REAL=$(cd "$GIT_CWD" && cd "$GIT_COMMON" 2>/dev/null && pwd)
         if [ "$GIT_DIR_REAL" != "$GIT_COMMON_REAL" ]; then
             IN_WORKTREE=true
-            WORKTREE_NAME="${CWD##*/}"
+            WORKTREE_NAME="${GIT_CWD##*/}"
         fi
     fi
     if [ -n "$BRANCH" ]; then
         # Use git diff-index for fast dirty check (single call, no untracked scan)
-        if ! git -C "$CWD" diff-index --quiet HEAD -- 2>/dev/null; then
+        if ! git -C "$GIT_CWD" diff-index --quiet HEAD -- 2>/dev/null; then
             IS_DIRTY=true
         fi
 
@@ -1568,9 +1675,9 @@ if [ -d "$CWD" ] && git -C "$CWD" rev-parse --git-dir > /dev/null 2>&1; then
         fi
         # Ahead/behind
         UPSTREAM=""
-        [ -n "$BRANCH_NAME" ] && UPSTREAM=$(git -C "$CWD" rev-parse --abbrev-ref "${BRANCH_NAME}@{upstream}" 2>/dev/null)
+        [ -n "$BRANCH_NAME" ] && UPSTREAM=$(git -C "$GIT_CWD" rev-parse --abbrev-ref "${BRANCH_NAME}@{upstream}" 2>/dev/null)
         if [ -n "$UPSTREAM" ]; then
-            COUNTS=$(git -C "$CWD" rev-list --left-right --count HEAD..."${UPSTREAM}" 2>/dev/null)
+            COUNTS=$(git -C "$GIT_CWD" rev-list --left-right --count HEAD..."${UPSTREAM}" 2>/dev/null)
             AHEAD=$(echo "$COUNTS" | cut -f1)
             BEHIND=$(echo "$COUNTS" | cut -f2)
             AB=""
