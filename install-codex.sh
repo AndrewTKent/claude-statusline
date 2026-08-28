@@ -13,7 +13,7 @@ if [ -f "$CONFIG_FILE" ]; then
     load_codex_statusline_config
     NATIVE_MODE="${CODEX_STATUSLINE_NATIVE:-0}"
 else
-    NATIVE_MODE="${NATIVE_MODE:-1}"
+    NATIVE_MODE="${NATIVE_MODE:-0}"
 fi
 
 if [ ! -d "$CODEX_DIR" ]; then
@@ -27,7 +27,7 @@ command -v python3 >/dev/null 2>&1 || {
 }
 if [ "$NATIVE_MODE" != "1" ]; then
     command -v tmux >/dev/null 2>&1 || {
-        printf "tmux is required for the legacy Codex statusline\n" >&2
+        printf "tmux is required for the multi-line Codex statusline\n" >&2
         exit 1
     }
 fi
