@@ -89,21 +89,6 @@ def terminal_size() -> os.terminal_size:
     return shutil.get_terminal_size((120, 40))
 
 
-def fit_footer_pane(body: str) -> None:
-    pane = os.environ.get("TMUX_PANE")
-    if not pane or os.environ.get("CODEX_STATUSLINE_HEIGHT"):
-        return
-    rows = max(1, len(body.splitlines()))
-    if terminal_size().lines == rows:
-        return
-    subprocess.run(
-        ["tmux", "resize-pane", "-t", pane, "-y", str(rows)],
-        check=False,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-
 def default_width() -> int:
     try:
         return int(os.environ.get("COLUMNS") or terminal_size().columns)
@@ -3532,8 +3517,11 @@ def render_footer(data: dict[str, Any], width: int, p: Palette) -> str:
         row("repo", f"{data['repo']} ({data['branch']})", repo_style),
     ]
     pull_request = data.get("pull_request")
-    if pull_request:
-        lines.append(row("pr", f"#{pull_request['number']} {pull_request['title']}", pr_style))
+    lines.append(
+        row("pr", f"#{pull_request['number']} {pull_request['title']}", pr_style)
+        if pull_request
+        else row("pr", "-")
+    )
     if usage["context_window"] > 0:
         if width >= 64:
             lines.append(render_goal_row("context", usage["context_used"], usage["context_window"], DEFAULT_BAR_WIDTH, p, 2))
@@ -3546,20 +3534,33 @@ def render_footer(data: dict[str, Any], width: int, p: Palette) -> str:
                     solid(color_for_pct(context_pct, p)),
                 )
             )
-    for label, limit in labeled_rate_limits(rate_limits):
-        if width >= 64:
-            lines.append(render_rate_limit_row(label, limit, DEFAULT_BAR_WIDTH, p, 2))
-        else:
-            limit_pct, limit_reset = limit_display(limit)
-            lines.append(
-                row(
-                    label,
-                    f"{format_pct(limit_pct)} {limit_reset}",
-                    solid(color_for_pct(limit_pct, p)),
-                )
+    else:
+        lines.append(row("context", "-"))
+
+    weekly_limit = next(
+        (
+            limit
+            for label, limit in labeled_rate_limits(rate_limits)
+            if label == "weekly"
+        ),
+        None,
+    )
+    if weekly_limit is None:
+        lines.append(row("weekly", "-"))
+    elif width >= 64:
+        lines.append(render_rate_limit_row("weekly", weekly_limit, DEFAULT_BAR_WIDTH, p, 2))
+    else:
+        limit_pct, limit_reset = limit_display(weekly_limit)
+        lines.append(
+            row(
+                "weekly",
+                f"{format_pct(limit_pct)} {limit_reset}",
+                solid(color_for_pct(limit_pct, p)),
             )
-    if credits := credit_balance_text(rate_limits):
-        lines.append(row("credits", f"{credits} remaining"))
+        )
+
+    credits = credit_balance_text(rate_limits)
+    lines.append(row("credits", f"{credits} remaining" if credits else "-"))
 
     lines.extend(
         [
@@ -3882,8 +3883,6 @@ def watch_loop(args: argparse.Namespace, p: Palette) -> int:
             ):
                 args.thread_id = data["thread_id"]
             body = render(data, args, p)
-            if args.footer:
-                fit_footer_pane(body)
             timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z")
             print("\033[2J\033[H", end="")
             print(body, end="" if args.footer else "\n")

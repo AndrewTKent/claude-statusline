@@ -1,8 +1,9 @@
 # Codex CLI Statusline Configuration
 # Copy to ~/.codex/statusline.conf
 
-# Use Codex's native, copy-friendly footer; set to 0 for the tmux dashboard.
-CODEX_STATUSLINE_NATIVE=1
+# Keep the full Claude Code-style dashboard below the composer. Set to 1 for
+# Codex's compact native footer instead.
+CODEX_STATUSLINE_NATIVE=0
 
 # Render format: default | sigil
 # CODEX_STATUSLINE_FORMAT=default
@@ -13,9 +14,9 @@ CODEX_STATUSLINE_NATIVE=1
 # Top monitor refresh interval used by bin/codex-top.
 # CODEX_TOP_INTERVAL=2
 
-# Inline-style pane height, refresh interval, and scrollback depth.
-# Minimum pane height is 12 rows.
-# CODEX_STATUSLINE_HEIGHT=12
+# Claude Code-style footer height, refresh interval, and scrollback depth.
+# The default renderer occupies 11 fixed rows.
+# CODEX_STATUSLINE_HEIGHT=11
 # CODEX_STATUSLINE_INTERVAL=1
 # CODEX_STATUSLINE_HISTORY_LIMIT=100000
 

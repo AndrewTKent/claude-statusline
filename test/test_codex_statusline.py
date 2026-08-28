@@ -3069,11 +3069,25 @@ class CodexStatuslineTest(unittest.TestCase):
 
         self.assertIn("model   GPT-5.6.max", rendered)
         self.assertIn("context", rendered)
-        self.assertIn("5-hour", rendered)
+        self.assertNotIn("5-hour", rendered)
         self.assertIn("weekly", rendered)
         self.assertIn("agents  1/3 running", rendered)
         self.assertIn("shells 3", rendered)
         lines = rendered.splitlines()
+        expected_labels = [
+            "model",
+            "time",
+            "account",
+            "repo",
+            "pr",
+            "context",
+            "weekly",
+            "credits",
+            "usage",
+            "agents",
+            "mode",
+        ]
+        self.assertEqual([line.strip().split(maxsplit=1)[0] for line in lines], expected_labels)
         repo_index = next(i for i, line in enumerate(lines) if line.startswith("  repo"))
         self.assertTrue(lines[repo_index + 1].startswith("  pr"))
         self.assertIn(f"#{pr_number} Show Pull Request Linkage", lines[repo_index + 1])
@@ -3102,24 +3116,28 @@ class CodexStatuslineTest(unittest.TestCase):
             colored,
         )
 
-        unlinked = {**data, "pull_request": None}
-        unlinked_lines = codex_statusline.render_footer(
-            unlinked, 80, codex_statusline.Palette(False)
+        unavailable = {
+            **data,
+            "pull_request": None,
+            "usage": {
+                **data["usage"],
+                "context_window": 0,
+                "rate_limits": {},
+            },
+        }
+        unavailable_lines = codex_statusline.render_footer(
+            unavailable, 80, codex_statusline.Palette(False)
         ).splitlines()
-        self.assertFalse(any(line.startswith("  pr") for line in unlinked_lines))
-        for label in (
-            "model",
-            "time",
-            "account",
-            "repo",
-            "context",
-            "5-hour",
-            "weekly",
-            "usage",
-            "agents",
-            "mode",
-        ):
-            self.assertTrue(any(line.startswith(f"  {label}") for line in unlinked_lines))
+        self.assertEqual(
+            [line.strip().split(maxsplit=1)[0] for line in unavailable_lines],
+            expected_labels,
+        )
+        for label in ("pr", "context", "weekly", "credits"):
+            self.assertEqual(
+                next(line for line in unavailable_lines if line.startswith(f"  {label}")),
+                f"  {label:<7} -",
+            )
+        self.assertEqual(unavailable_lines[-1], "  mode    - · approvals -")
 
         wide_lines = codex_statusline.render_footer(data, 140, codex_statusline.Palette(False)).splitlines()
         self.assertTrue(wide_lines[0].startswith("  model"))
@@ -3132,7 +3150,7 @@ class CodexStatuslineTest(unittest.TestCase):
         tiny_lines = codex_statusline.render_footer(data, 8, codex_statusline.Palette(False)).splitlines()
         self.assertTrue(all(len(line) <= 8 for line in tiny_lines))
 
-    def test_render_footer_labels_weekly_only_primary_by_window(self) -> None:
+    def test_render_footer_keeps_weekly_label_for_primary_window(self) -> None:
         data = {
             "model_display": "GPT-5.6",
             "reasoning_effort": "max",
@@ -3167,6 +3185,7 @@ class CodexStatuslineTest(unittest.TestCase):
         self.assertIn("weekly", rendered)
         self.assertNotIn("5-hour", rendered)
         lines = rendered.splitlines()
+        self.assertEqual(len(lines), 11)
         weekly_index = next(i for i, line in enumerate(lines) if line.startswith("  weekly"))
         self.assertEqual(lines[weekly_index + 1], "  credits 2,089 remaining")
 
@@ -3413,22 +3432,22 @@ class CodexStatuslineTest(unittest.TestCase):
 
         self.assertEqual(widths, [137])
 
-    def test_footer_pane_height_matches_rendered_rows(self) -> None:
+    def test_footer_watch_never_resizes_the_codex_pane(self) -> None:
+        args = codex_statusline.parse_args(["--footer", "--watch", "1"])
         body = "model\ntime\naccount\nrepo\ncontext\nweekly\ncredits\nusage\nagents\nmode"
 
         with (
             mock.patch.dict(os.environ, {"TMUX_PANE": "%42"}),
             mock.patch.object(codex_statusline, "terminal_size", return_value=os.terminal_size((137, 12))),
+            mock.patch.object(codex_statusline, "snapshot", return_value={}),
+            mock.patch.object(codex_statusline, "render", return_value=body),
             mock.patch.object(codex_statusline.subprocess, "run") as run,
+            mock.patch.object(codex_statusline.time, "sleep", side_effect=RuntimeError("stop")),
+            self.assertRaisesRegex(RuntimeError, "stop"),
         ):
-            codex_statusline.fit_footer_pane(body)
+            codex_statusline.watch_loop(args, codex_statusline.Palette(False))
 
-        run.assert_called_once_with(
-            ["tmux", "resize-pane", "-t", "%42", "-y", "10"],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        run.assert_not_called()
 
     def test_footer_render_does_not_scroll_past_mode(self) -> None:
         args = codex_statusline.parse_args(["--footer", "--watch", "1"])
@@ -3437,7 +3456,6 @@ class CodexStatuslineTest(unittest.TestCase):
         with (
             mock.patch.object(codex_statusline, "snapshot", return_value={}),
             mock.patch.object(codex_statusline, "render", return_value="model\nmode"),
-            mock.patch.object(codex_statusline, "fit_footer_pane"),
             mock.patch.object(codex_statusline.time, "sleep", side_effect=RuntimeError("stop")),
             mock.patch.object(codex_statusline.sys, "stdout", output),
             self.assertRaisesRegex(RuntimeError, "stop"),
@@ -3708,7 +3726,7 @@ class CodexStatuslineTest(unittest.TestCase):
                 [
                     "--no-alt-screen",
                     "-c",
-                    'tui.status_line=["model-with-reasoning","project-name","git-branch","context-used","five-hour-limit","weekly-limit","used-tokens","permissions","approval-mode","task-progress"]',
+                    'tui.status_line=["model-with-reasoning","project-name","git-branch","context-used","weekly-limit","used-tokens","permissions","approval-mode","task-progress"]',
                     "-c",
                     "tui.status_line_use_colors=true",
                     "--model",
@@ -3726,7 +3744,6 @@ class CodexStatuslineTest(unittest.TestCase):
             fake_tmux = tmp / "tmux"
             codex_home.mkdir()
             (codex_home / "statusline.conf").write_text(
-                "CODEX_STATUSLINE_HEIGHT=14 \n"
                 "CODEX_STATUSLINE_INTERVAL=3\n"
                 "CODEX_STATUSLINE_MANAGE_APPROVALS=0\n"
             )
@@ -3760,10 +3777,10 @@ class CodexStatuslineTest(unittest.TestCase):
 
             captured = capture.read_text().splitlines()
             split_window = next(line for line in captured if line.startswith("split-window "))
-            self.assertIn("-l 14", split_window)
+            self.assertIn("-l 11", split_window)
             self.assertIn("--watch 3", split_window)
             self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", captured)
-            self.assertIn("set-option mouse on", captured)
+            self.assertIn("set-option mouse off", captured)
             self.assertIn("set-option -w history-limit 100000", captured)
 
             subprocess.run(
@@ -3776,6 +3793,84 @@ class CodexStatuslineTest(unittest.TestCase):
             ][-1]
             self.assertNotIn("--bind-after-ms", latest_split)
             self.assertNotIn("--thread-id", latest_split)
+
+    def test_launcher_inside_tmux_owns_indexed_resize_hooks(self) -> None:
+        launcher = MODULE_PATH.with_name("codex-statusline")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            capture = tmp / "tmux-args"
+            fake_codex = tmp / "codex"
+            fake_tmux = tmp / "tmux"
+            fake_codex.write_text("#!/usr/bin/env bash\nexit 0\n")
+            fake_tmux.write_text(
+                '#!/usr/bin/env bash\n'
+                'printf "%s\\n" "$*" >> "$CAPTURE"\n'
+                'if [[ "$1" == "display-message" && "$*" == *"#{session_id}"* ]]; then\n'
+                '    printf "@9\\n"\n'
+                'elif [[ "$1" == "split-window" ]]; then\n'
+                '    printf "%%1\\n"\n'
+                'elif [[ "$1" == "show-hooks" ]]; then\n'
+                '    case "${@: -1}" in\n'
+                '        client-attached) printf "client-attached\\n" ;;\n'
+                '        client-resized) printf "client-resized[42] keep-indexed\\n" ;;\n'
+                '        window-resized) printf "window-resized[0] keep-unindexed\\n" ;;\n'
+                '    esac\n'
+                'fi\n'
+            )
+            fake_codex.chmod(0o755)
+            fake_tmux.chmod(0o755)
+            env = {
+                **os.environ,
+                "CAPTURE": str(capture),
+                "CODEX_STATUSLINE_CODEX_BIN": str(fake_codex),
+                "CODEX_STATUSLINE_NATIVE": "0",
+                "PATH": f"{tmp}:{os.environ['PATH']}",
+                "TMUX": "test",
+            }
+
+            subprocess.run([str(launcher)], check=True, env=env)
+
+            commands = capture.read_text().splitlines()
+            hook_sets = [
+                line
+                for line in commands
+                if line.startswith("set-hook -t @9 ") and "resize-pane -t '%1' -y 11" in line
+            ]
+            self.assertEqual(len(hook_sets), 3)
+            hook_names = {
+                match.group(1): match.group(2)
+                for line in hook_sets
+                if (match := re.search(r"(client-attached|client-resized|window-resized)\[([0-9]+)\]", line))
+            }
+            self.assertEqual(set(hook_names), {"client-attached", "client-resized", "window-resized"})
+            self.assertEqual(len(set(hook_names.values())), 1)
+            hook_index = next(iter(hook_names.values()))
+            self.assertNotEqual(hook_index, "42")
+            self.assertEqual(
+                {
+                    line
+                    for line in commands
+                    if line.startswith("set-hook -u -t @9 ")
+                },
+                {
+                    f"set-hook -u -t @9 client-attached[{hook_index}]",
+                    f"set-hook -u -t @9 client-resized[{hook_index}]",
+                    f"set-hook -u -t @9 window-resized[{hook_index}]",
+                    "set-hook -u -t @9 client-attached",
+                },
+            )
+            self.assertNotIn("set-hook -u -t @9 client-resized", commands)
+            self.assertNotIn("set-hook -u -t @9 window-resized", commands)
+            self.assertEqual(
+                {
+                    line for line in commands if line.startswith("show-hooks -t @9 ")
+                },
+                {
+                    "show-hooks -t @9 client-attached",
+                    "show-hooks -t @9 client-resized",
+                    "show-hooks -t @9 window-resized",
+                },
+            )
 
     def test_launcher_rejects_zero_interval_and_short_footer(self) -> None:
         launcher = MODULE_PATH.with_name("codex-statusline")
@@ -3798,8 +3893,8 @@ class CodexStatuslineTest(unittest.TestCase):
             )
             cases = (
                 ({"CODEX_STATUSLINE_INTERVAL": "0"}, "positive number"),
-                ({"CODEX_STATUSLINE_HEIGHT": "11"}, "at least 12"),
-                ({"CODEX_STATUSLINE_HEIGHT": "08"}, "at least 12"),
+                ({"CODEX_STATUSLINE_HEIGHT": "10"}, "at least 11"),
+                ({"CODEX_STATUSLINE_HEIGHT": "08"}, "at least 11"),
                 ({"CODEX_STATUSLINE_HISTORY_LIMIT": "0"}, "positive integer"),
             )
 
@@ -3875,7 +3970,22 @@ class CodexStatuslineTest(unittest.TestCase):
             self.assertNotIn("--bind-after-ms", split_window)
             self.assertIn("--owner-pid-file", split_window)
             self.assertIn(f"--cwd {project.resolve()}", split_window)
-            self.assertIn("mouse on", "\n".join(capture.read_text().splitlines()))
+            self.assertIn("-l 11", split_window)
+            resize_hooks = {
+                line
+                for line in capture.read_text().splitlines()
+                if line.startswith("set-hook ")
+            }
+            self.assertEqual(
+                resize_hooks,
+                {
+                    next(line for line in resize_hooks if "client-attached" in line),
+                    next(line for line in resize_hooks if "client-resized" in line),
+                    next(line for line in resize_hooks if "window-resized" in line),
+                },
+            )
+            self.assertTrue(all("resize-pane -t '%1' -y 11" in line for line in resize_hooks))
+            self.assertIn("mouse off", "\n".join(capture.read_text().splitlines()))
             self.assertIn("history-limit 100000", "\n".join(capture.read_text().splitlines()))
 
     def launcher_detached_session_env(self, tmp: Path, capture: Path) -> dict[str, str]:
@@ -3962,7 +4072,7 @@ class CodexStatuslineTest(unittest.TestCase):
             home.mkdir()
             codex_home.mkdir()
             fake_bin.mkdir()
-            for name in ("codex",):
+            for name in ("codex", "tmux"):
                 path = fake_bin / name
                 path.write_text("#!/usr/bin/env bash\nexit 0\n")
                 path.chmod(0o755)
@@ -3978,6 +4088,10 @@ class CodexStatuslineTest(unittest.TestCase):
             subprocess.run([str(installer)], check=True, env=env)
 
             self.assertTrue((codex_home / "statusline.conf").is_file())
+            self.assertIn(
+                "CODEX_STATUSLINE_NATIVE=0",
+                (codex_home / "statusline.conf").read_text(),
+            )
             self.assertEqual(
                 (home / ".local/bin/codex-statusline").resolve(),
                 MODULE_PATH.with_name("codex-statusline"),

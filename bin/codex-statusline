@@ -35,7 +35,7 @@ if [[ -z "$CODEX_BIN" || ! -x "$CODEX_BIN" ]]; then
     exit 1
 fi
 
-FOOTER_HEIGHT="${CODEX_STATUSLINE_HEIGHT:-12}"
+FOOTER_HEIGHT="${CODEX_STATUSLINE_HEIGHT:-11}"
 REFRESH_INTERVAL="${CODEX_STATUSLINE_INTERVAL:-3}"
 MANAGE_APPROVALS="${CODEX_STATUSLINE_MANAGE_APPROVALS:-1}"
 HISTORY_LIMIT="${CODEX_STATUSLINE_HISTORY_LIMIT:-100000}"
@@ -67,7 +67,7 @@ fi
 CODEX_ARGS+=("$@")
 
 if [[ "$NATIVE_MODE" == "1" ]]; then
-    NATIVE_STATUS_LINE='["model-with-reasoning","project-name","git-branch","context-used","five-hour-limit","weekly-limit","used-tokens","permissions","approval-mode","task-progress"]'
+    NATIVE_STATUS_LINE='["model-with-reasoning","project-name","git-branch","context-used","weekly-limit","used-tokens","permissions","approval-mode","task-progress"]'
     exec "$CODEX_BIN" \
         --no-alt-screen \
         -c "tui.status_line=$NATIVE_STATUS_LINE" \
@@ -75,8 +75,8 @@ if [[ "$NATIVE_MODE" == "1" ]]; then
         "${CODEX_ARGS[@]}"
 fi
 
-if [[ ! "$FOOTER_HEIGHT" =~ ^[1-9][0-9]*$ ]] || (( FOOTER_HEIGHT < 12 )); then
-    printf 'CODEX_STATUSLINE_HEIGHT must be an integer of at least 12\n' >&2
+if [[ ! "$FOOTER_HEIGHT" =~ ^[1-9][0-9]*$ ]] || (( FOOTER_HEIGHT < 11 )); then
+    printf 'CODEX_STATUSLINE_HEIGHT must be an integer of at least 11\n' >&2
     exit 1
 fi
 if [[ ! "$REFRESH_INTERVAL" =~ ^[0-9]+([.][0-9]+)?$ || "$REFRESH_INTERVAL" =~ ^0([.]0+)?$ ]]; then
@@ -88,7 +88,7 @@ if [[ ! "$HISTORY_LIMIT" =~ ^[1-9][0-9]*$ ]]; then
     exit 1
 fi
 command -v tmux >/dev/null 2>&1 || {
-    printf 'tmux is required for the legacy Codex statusline\n' >&2
+    printf 'tmux is required for the multi-line Codex statusline\n' >&2
     exit 1
 }
 CODEX_ARGS=(-c 'tui.status_line=[]' ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"})
@@ -129,6 +129,8 @@ FOOTER_COMMAND="$(shell_join python3 "$SCRIPT_DIR/codex_statusline.py" --footer 
 
 if [[ -n "${TMUX:-}" ]]; then
     footer_pane=""
+    hook_target=""
+    hook_index="$$"
     prior_mouse="$(tmux show-options -v mouse 2>/dev/null || true)"
     prior_history_limit="$(tmux show-options -wv history-limit 2>/dev/null || true)"
     restore_tmux_options() {
@@ -143,7 +145,21 @@ if [[ -n "${TMUX:-}" ]]; then
             tmux set-option -wu history-limit 2>/dev/null || true
         fi
     }
+    remove_resize_hooks() {
+        if [[ -z "$hook_target" ]]; then
+            return
+        fi
+        local hook hook_state
+        for hook in client-attached client-resized window-resized; do
+            tmux set-hook -u -t "$hook_target" "${hook}[${hook_index}]" 2>/dev/null || true
+            hook_state="$(tmux show-hooks -t "$hook_target" "$hook" 2>/dev/null || true)"
+            if [[ "$hook_state" == "$hook" ]]; then
+                tmux set-hook -u -t "$hook_target" "$hook" 2>/dev/null || true
+            fi
+        done
+    }
     cleanup_pane() {
+        remove_resize_hooks
         if [[ -n "$footer_pane" ]]; then
             tmux kill-pane -t "$footer_pane" 2>/dev/null || true
         fi
@@ -152,9 +168,13 @@ if [[ -n "${TMUX:-}" ]]; then
     }
     trap cleanup_pane EXIT HUP INT TERM
     printf '%s\n' "$$" > "$OWNER_PID_FILE"
-    tmux set-option mouse on
+    tmux set-option mouse off
     tmux set-option -w history-limit "$HISTORY_LIMIT"
     footer_pane="$(tmux split-window -v -l "$FOOTER_HEIGHT" -d -P -F '#{pane_id}' -c "$WORKING_DIR" "$FOOTER_COMMAND")"
+    hook_target="$(tmux display-message -p '#{session_id}')"
+    for hook in client-attached client-resized window-resized; do
+        tmux set-hook -t "$hook_target" "${hook}[${hook_index}]" "resize-pane -t '$footer_pane' -y $FOOTER_HEIGHT"
+    done
     set +e
     if (( ${#CODEX_ARGS[@]} )); then
         "$CODEX_BIN" "${CODEX_ARGS[@]}"
@@ -214,7 +234,7 @@ trap cleanup_session EXIT HUP INT TERM
 
 bootstrap_pane="$(tmux new-session -d -s "$SESSION" -x "$TERMINAL_WIDTH" -y "$TERMINAL_HEIGHT" -c "$WORKING_DIR" -P -F '#{pane_id}' "sleep 86400")"
 tmux set-option -t "$SESSION" status off
-tmux set-option -t "$SESSION" mouse on
+tmux set-option -t "$SESSION" mouse off
 tmux set-option -w -t "$bootstrap_pane" history-limit "$HISTORY_LIMIT"
 top_pane="$(tmux split-window -t "$bootstrap_pane" -v -l 1 -d -P -F '#{pane_id}' -c "$WORKING_DIR" "sleep 86400")"
 if [[ -z "$top_pane" ]] || [[ "$(tmux display-message -p -t "$top_pane" '#{pane_id}')" != "$top_pane" ]]; then
