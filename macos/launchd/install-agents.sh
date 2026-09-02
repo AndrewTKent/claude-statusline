@@ -48,13 +48,19 @@ run() {
 
 # fswatch is the watcher's only external dependency; without it launchd would
 # crash-loop the agent every 10s instead of reporting one clear failure.
-if [ "$ACTION" = "install" ] && [ "$AGENT_METRICS_RECORDER" = "1" ]; then
+if [ "$ACTION" != "install" ]; then
+    run "agent-metrics recorder" install-agent-metrics.sh
+    run "token-scan watcher" install-daemon.sh
+elif [ "$AGENT_METRICS_RECORDER" = "1" ]; then
     "$LAUNCHD_DIR/install-daemon.sh" --remove
     echo "Agent Metrics recorder enabled — legacy token scanner disabled"
-elif [ "$ACTION" = "install" ] && ! command -v fswatch >/dev/null 2>&1; then
+    run "agent-metrics recorder" install-agent-metrics.sh
+elif ! command -v fswatch >/dev/null 2>&1; then
+    "$LAUNCHD_DIR/install-agent-metrics.sh" --remove
     echo "[!] fswatch not installed — skipping token-scan watcher"
     echo "    brew install fswatch, then re-run this script"
 else
+    "$LAUNCHD_DIR/install-agent-metrics.sh" --remove
     run "token-scan watcher" install-daemon.sh
 fi
 

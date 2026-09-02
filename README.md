@@ -163,8 +163,10 @@ manual backfill. Bounded scans reserve capacity for appended live files and for
 both providers while rotating through older sources by salted source ID.
 `watch` is an explicit foreground loop that defaults to 5,000 lines every 60
 seconds, measured after each completed cycle. It prints live/backfill progress
-and remaining file/byte counts; Ctrl-C stops it cleanly. There is no daemon,
-autostart, or launch-at-login integration. The local dashboard polls that database for a stacked token
+and remaining file/byte counts; Ctrl-C stops it cleanly. With
+`AGENT_METRICS_RECORDER=1` in `statusline.conf`, `macos/launchd/install-agents.sh`
+keeps `watch` running as a launchd agent (`com.claude-agent-metrics-watch`) in
+place of the token scanner; otherwise nothing autostarts it. The local dashboard polls that database for a stacked token
 timeline with selectable token series, one-minute raw or trailing moving-average views, a trailing-day hourly/cumulative view, provider/account/model/effort/session/agent filters, account and model
 totals, parent/child agent drilldown, compactions, tool outcomes and durations,
 turn latency, quota snapshots, and explicitly exposed cost. `serve` does not
