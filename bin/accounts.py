@@ -1464,7 +1464,14 @@ def mark_auth_dead(label: str, entry: dict, now_ts: float) -> None:
         _notify_needs_login(label)
 
 
+def notifications_enabled() -> bool:
+    raw = os.environ.get("STATUSLINE_NOTIFY") or _conf_var("STATUSLINE_NOTIFY")
+    return raw.strip() == "1"
+
+
 def _notify_needs_login(label: str) -> None:
+    if not notifications_enabled():
+        return
     try:
         subprocess.run(
             [
