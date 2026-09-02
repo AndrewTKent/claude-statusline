@@ -384,6 +384,15 @@ account_label_is_excluded() {
     return 1
 }
 
+# Board-only: ACCOUNTS_HIDE drops rows from the statusline; the router still uses them.
+account_label_is_hidden() {
+    local candidate="$1" hidden
+    for hidden in ${ACCOUNTS_HIDE:-}; do
+        [ "$candidate" = "$hidden" ] && return 0
+    done
+    return 1
+}
+
 # ── Reusable ledger writer ───────────────────────────────
 # Usage: update_ledger <mode> <file> <session_id> <value> <today> [acct]
 #
@@ -1005,7 +1014,7 @@ render_shared_account_snapshot() {
     local today_tokens="" lifetime_tokens=0 today_display session_display_fmt lifetime_display
     local metrics_db="${AGENT_METRICS_DB:-$HOME/Library/Application Support/statusline/agent-metrics/metrics.sqlite3}"
     if [ "${AGENT_METRICS_RECORDER:-0}" = "1" ] && [ -r "$metrics_db" ] && command -v sqlite3 >/dev/null 2>&1; then
-        today_tokens=$(sqlite3 -readonly -cmd '.timeout 1000' "$metrics_db" \
+        today_tokens=$(sqlite3 -cmd '.timeout 1000' "$metrics_db" \
             "select coalesce(sum(input_tokens + output_tokens), 0) from minute_metrics where provider='claude' and minute >= strftime('%s','now','localtime','start of day','utc') * 1000" \
             2>/dev/null)
     fi
@@ -1039,6 +1048,7 @@ render_shared_account_snapshot() {
             row_scoped_reset row_scoped_stale row_scoped_pending row_expired row_leases; do
             [ -z "$row_label" ] && continue
             account_label_is_excluded "$row_label" && continue
+            account_label_is_hidden "$row_label" && [ "$row_label" != "$routed_label" ] && continue
             row_display="$(printf '%s' "${row_label:0:1}" | tr '[:lower:]' '[:upper:]')${row_label:1}"
             [ "${#row_display}" -gt "$name_width" ] && name_width=${#row_display}
             sort_key="${row_five_reset:-9999}"
@@ -2395,6 +2405,9 @@ if [ "${SHOW_ACCOUNT_RESETS:-0}" = "1" ]; then
                     if [ "$_route_mode" != "set" ] || [ "$tag" != "$_route_label" ]; then
                         continue
                     fi
+                fi
+                if account_label_is_hidden "$tag" && { [ "$em" != "$ACCT_EMAIL" ] || [ "$uuid" != "$ACCT_ORG_UUID" ]; }; then
+                    continue
                 fi
                 parsed+="${em}|${uuid}|${tag}|${ep}|${pct}|${pct_state}|${seven_day_iso}|${weekly_pct_ledger}|${fbl_iso}|${fable_pct_ledger}|${last_seen_ts}"$'\n'
                 if [ -n "$ep" ]; then

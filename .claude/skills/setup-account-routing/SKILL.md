@@ -26,6 +26,7 @@ Run `/setup-statusline` first — both tools share `~/.claude/statusline.conf`.
    ACCOUNT_LABELS="gmail:me@gmail.com work:me@corp.com|org-uuid"
    LABEL_COLORS="gmail:magenta work:cyan"   # optional
    ACCOUNTS_EXCLUDE=""                      # labels excluded from automatic routing
+   ACCOUNTS_HIDE=""                         # labels hidden from the statusline board, still routed
    SHOW_ACCOUNT_RESETS=1
    ```
 

@@ -53,10 +53,13 @@ mkdir -p "$TEST_HOME/.claude/projects/$project_dir"
 cat > "$TEST_HOME/.claude/projects/$project_dir/session-test.jsonl" <<JSON
 {"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"git -C $WORKTREE/nested status"}}]}}
 JSON
-sqlite3 "$TEST_HOME/metrics.sqlite3" <<SQL
+sqlite3 "$TEST_HOME/metrics.sqlite3" >/dev/null <<SQL
+pragma journal_mode=wal;
 create table minute_metrics(provider text, minute integer, input_tokens integer, output_tokens integer);
 insert into minute_metrics values('claude', strftime('%s','now','localtime','start of day','utc') * 1000, 1200, 34);
 SQL
+sqlite3 "$TEST_HOME/metrics.sqlite3" "pragma wal_checkpoint(truncate);" >/dev/null
+rm -f "$TEST_HOME/metrics.sqlite3-wal" "$TEST_HOME/metrics.sqlite3-shm"
 branch=$(git -C "$WORKTREE" branch --show-current)
 worktree_root=$(git -C "$WORKTREE" rev-parse --show-toplevel)
 pr_cache_key=$(printf '%s\0%s' "$worktree_root" "$branch" | cksum)
