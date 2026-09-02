@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# A supervised session exports the routed account; the renders below must not inherit it.
+unset ACCOUNTS_ROUTED_LABEL ACCOUNTS_ROUTED_EMAIL ACCOUNTS_ROUTED_ORG_UUID ACCOUNTS_POLICY_SCOPE ACCOUNTS_ROUTER_STATE
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SANDBOX=$(mktemp -d)

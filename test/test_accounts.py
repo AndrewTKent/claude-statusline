@@ -4575,6 +4575,19 @@ class TestMarkAuthDead:
         assert entry["auth_dead_at"] == int(NOW_TS + 60)
 
 
+class TestNotifyNeedsLogin:
+    def test_silent_unless_opted_in(self, monkeypatch):
+        runs: list[list[str]] = []
+        monkeypatch.setattr(accounts.subprocess, "run", lambda cmd, **_kw: runs.append(cmd))
+        monkeypatch.setattr(accounts, "_conf_var", lambda _name: "")
+        monkeypatch.delenv("STATUSLINE_NOTIFY", raising=False)
+        accounts._notify_needs_login("gmail")
+        assert runs == []
+        monkeypatch.setenv("STATUSLINE_NOTIFY", "1")
+        accounts._notify_needs_login("gmail")
+        assert len(runs) == 1 and runs[0][0] == "osascript"
+
+
 class TestVerifyEntryAuth:
     @pytest.fixture(autouse=True)
     def _no_keychain(self, monkeypatch):
