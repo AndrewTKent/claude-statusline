@@ -2641,15 +2641,19 @@ class CodexStatuslineTest(unittest.TestCase):
 
         self.assertEqual(selected, "owned-root")
 
-    def test_owner_thread_selection_matches_realpath_of_symlinked_rollout(self) -> None:
+    def test_owner_thread_selection_matches_old_symlinked_rollout_by_thread_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             real_dir = tmp / "real"
             real_dir.mkdir()
             link_dir = tmp / "link"
             link_dir.symlink_to(real_dir)
-            rollout = link_dir / "rollout-root.jsonl"
+            thread_id = "00000000-0000-0000-0000-000000000001"
+            rollout = link_dir / f"rollout-{thread_id}.jsonl"
             rollout.write_text("{}\n")
+            child_id = "00000000-0000-0000-0000-000000000002"
+            child_rollout = real_dir / f"rollout-{child_id}.jsonl"
+            child_rollout.write_text("{}\n")
             pid_file = tmp / "owner.pid"
             pid_file.write_text("123\n")
             conn = sqlite3.connect(":memory:")
@@ -2667,19 +2671,35 @@ class CodexStatuslineTest(unittest.TestCase):
             )
             conn.execute(
                 "insert into threads values (?, ?, ?, 0, ?, ?, '/tmp', '', 0, '', '', '', '', '', 0, '', '')",
-                ("root", "cli", str(rollout), 100, 100_000),
+                (thread_id, "cli", str(rollout), 100, 100_000),
+            )
+            conn.execute(
+                "insert into threads values (?, ?, ?, 0, ?, ?, '/tmp', '', 0, '', '', '', '', '', 0, '', '')",
+                (child_id, '{"subagent":{}}', str(child_rollout), 500, 500_000),
+            )
+            conn.executemany(
+                "insert into threads values (?, 'cli', ?, 0, ?, ?, '/tmp', '', 0, '', '', '', '', '', 0, '', '')",
+                (
+                    (
+                        f"newer-{index}",
+                        f"/tmp/newer-{index}.jsonl",
+                        200 + index,
+                        (200 + index) * 1000,
+                    )
+                    for index in range(201)
+                ),
             )
 
             resolved = os.path.realpath(str(rollout))
             with mock.patch.object(
                 codex_statusline,
                 "process_rollout_paths",
-                return_value={resolved},
+                return_value={resolved, str(child_rollout)},
             ):
                 selected = codex_statusline.select_owner_thread_id(conn, str(pid_file))
             conn.close()
 
-        self.assertEqual(selected, "root")
+        self.assertEqual(selected, thread_id)
 
     def test_process_rollout_paths_finds_open_rollout_unmocked(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
