@@ -91,7 +91,7 @@ command -v tmux >/dev/null 2>&1 || {
     printf 'tmux is required for the multi-line Codex statusline\n' >&2
     exit 1
 }
-CODEX_ARGS=(-c 'tui.status_line=[]' ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"})
+CODEX_ARGS=(--no-alt-screen -c 'tui.status_line=[]' ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"})
 
 WORKING_DIR="$(pwd -P)"
 CODEX_WORKING_DIR="$WORKING_DIR"
@@ -168,7 +168,7 @@ if [[ -n "${TMUX:-}" ]]; then
     }
     trap cleanup_pane EXIT HUP INT TERM
     printf '%s\n' "$$" > "$OWNER_PID_FILE"
-    tmux set-option mouse off
+    tmux set-option mouse on
     tmux set-option -w history-limit "$HISTORY_LIMIT"
     footer_pane="$(tmux split-window -v -l "$FOOTER_HEIGHT" -d -P -F '#{pane_id}' -c "$WORKING_DIR" "$FOOTER_COMMAND")"
     hook_target="$(tmux display-message -p '#{session_id}')"
@@ -234,7 +234,7 @@ trap cleanup_session EXIT HUP INT TERM
 
 bootstrap_pane="$(tmux new-session -d -s "$SESSION" -x "$TERMINAL_WIDTH" -y "$TERMINAL_HEIGHT" -c "$WORKING_DIR" -P -F '#{pane_id}' "sleep 86400")"
 tmux set-option -t "$SESSION" status off
-tmux set-option -t "$SESSION" mouse off
+tmux set-option -t "$SESSION" mouse on
 tmux set-option -w -t "$bootstrap_pane" history-limit "$HISTORY_LIMIT"
 top_pane="$(tmux split-window -t "$bootstrap_pane" -v -l 1 -d -P -F '#{pane_id}' -c "$WORKING_DIR" "sleep 86400")"
 if [[ -z "$top_pane" ]] || [[ "$(tmux display-message -p -t "$top_pane" '#{pane_id}')" != "$top_pane" ]]; then
