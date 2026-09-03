@@ -91,12 +91,15 @@ codex-statusline --sandbox read-only --ask-for-approval on-request
 ```
 
 The default launcher uses a fixed bottom pane matching the multi-line Claude
-Code status view. It shows the current model, elapsed time,
-account, repository, linked pull request, context use, the weekly limit,
-remaining purchased credits, tokens, agents, and running tools. It binds each
+Code status view. It shows the current model, elapsed time, routed account,
+repository and branch, context use, local tokens consumed, purchased credits,
+permissions, and each registered Codex account's weekly quota and reset time.
+Codex does not expose a fixed token balance
+for subscription limits; the footer reports exact quota percentage remaining
+instead of inventing a token estimate. It binds each
 footer to the rollout file opened by its owning Codex process, so concurrent and
 resumed sessions do not exchange context values. The renderer always occupies
-11 rows, so changing session data cannot move the composer. Tmux mouse handling
+up to 14 rows by default, so changing session data cannot move the composer. Tmux mouse handling
 is disabled so the terminal owns ordinary drag selection and copy/paste. Pane
 scrollback keeps a 100,000-line history; tune it with
 `CODEX_STATUSLINE_HISTORY_LIMIT`. When launched inside an existing
@@ -381,11 +384,13 @@ Create `~/.claude/statusline.conf` (bash, sourced directly). Full annotated vers
 
 ## Accounts: Multi-Account Routing
 
-`accounts` (`bin/accounts.py`) is a per-session router and headroom board. Each
-account gets a native Claude config under `~/.accounts/profiles/<label>`.
+`accounts` (`bin/accounts.py`) and `codex-accounts` (`bin/codex_accounts.py`)
+provide per-session routing and headroom boards. Each Claude account gets a
+native config under `~/.accounts/profiles/<label>`; each Codex account gets an
+isolated `CODEX_HOME` under `~/.codex-accounts/profiles/<label>`.
 Credentials and entitlement caches are isolated; projects, transcripts, settings,
 skills, and plugins are shared. Interactive sessions remain first-party
-`claude.ai` subscription sessions instead of API/setup-token sessions.
+subscription sessions instead of API-token sessions.
 
 For shared statusline rendering, enable `SHARED_ACCOUNT_SNAPSHOT=1` in
 `statusline.conf`. The router installer registers a launch agent that runs
@@ -398,10 +403,10 @@ Install the router from a local checkout:
 ./install-account-router.sh
 ```
 
-The installer puts the router wrapper at `~/.local/bin/claude`, keeps native
-Claude binaries under `~/.local/share/claude/versions`, installs the router
-tools under `~/.local/bin`, and prepends a supervised launcher from
-`~/.accounts/bin` in new zsh sessions.
+The installer puts the Claude router wrapper at `~/.local/bin/claude`, keeps
+native Claude binaries under `~/.local/share/claude/versions`, installs both
+router toolsets under `~/.local/bin`, and prepends supervised launchers from
+`~/.accounts/bin` and `~/.codex-accounts/bin` in new zsh sessions.
 
 `ACCOUNTS_HARD_SESSION_LIMIT=1` is an opt-in overage guard. A supervised
 session resumes on another safe account on the next supervisor check after
@@ -421,6 +426,31 @@ session resumes on another safe account on the next supervisor check after
 | `accounts tokens` | List minted tokens and expiry |
 | `accounts sync` | Converge the token vault with a second machine |
 | `accounts pick-env` | Emit `CLAUDE_CONFIG_DIR` and account metadata |
+
+Codex uses its own command because the two CLIs expose different auth and quota
+interfaces:
+
+| Command | What it does |
+|---------|---------------|
+| `codex-accounts register [label]` | Register the current authenticated Codex home |
+| `codex-accounts login [label]` | Authenticate another ChatGPT account in an isolated home |
+| `codex-accounts auto` | Route supervised sessions to the account with the most headroom |
+| `codex-accounts set <label>` | Pin supervised sessions to one account |
+| `codex-accounts status` | Show the mode and each account's quota windows |
+| `codex-accounts poll` | Refresh quota through Codex app-server without an inference |
+| `codex-accounts pick --poll` | Poll and print the account selected by the current policy |
+
+Codex requires `cli_auth_credentials_store = "file"` and this SessionStart hook:
+
+```toml
+[[hooks.SessionStart]]
+command = "if [ -x \"$HOME/.local/bin/codex-account-session\" ]; then exec \"$HOME/.local/bin/codex-account-session\"; fi"
+```
+
+The hook binds each thread to its routed label so the statusline stays correct
+when concurrent sessions use different accounts. At 90% binding usage, the
+supervisor moves a live thread only when another account is at least 15 points
+lower. A hard `codex-accounts set` pin moves it on the next supervisor check.
 
 Inside Claude Code, prefix these with `!` (for example,
 `!accounts set acme-max`). Set `"respondToBashCommands": false` in

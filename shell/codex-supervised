@@ -1,0 +1,15 @@
+#!/bin/sh
+
+router="$HOME/.local/bin/codex-router"
+if [ -x "$router" ] && command -v python3 >/dev/null 2>&1; then
+    exec "$router" "$@"
+fi
+
+for candidate in /opt/homebrew/bin/codex /usr/local/bin/codex /usr/bin/codex; do
+    if [ -x "$candidate" ]; then
+        exec "$candidate" "$@"
+    fi
+done
+
+echo "codex: neither codex-router nor a native binary found" >&2
+exit 127

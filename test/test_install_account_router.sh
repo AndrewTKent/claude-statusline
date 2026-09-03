@@ -24,9 +24,14 @@ ln -s "$HOME/.local/share/claude/versions/2.0.0" "$HOME/.local/bin/claude"
 [ "$(readlink "$HOME/.local/bin/accounts")" = "$HOME/.local/lib/statusline/accounts.py" ]
 [ "$(readlink "$HOME/.local/bin/claude-router")" = "$HOME/.local/lib/statusline/claude-router.py" ]
 [ "$(readlink "$HOME/.accounts/bin/claude")" = "$HOME/.local/bin/claude-supervised" ]
+[ "$(readlink "$HOME/.local/bin/codex-accounts")" = "$HOME/.local/lib/statusline/codex_accounts.py" ]
+[ "$(readlink "$HOME/.local/bin/codex-router")" = "$HOME/.local/lib/statusline/codex-router.py" ]
+[ "$(readlink "$HOME/.local/bin/codex-account-session")" = "$HOME/.local/lib/statusline/codex-account-session.py" ]
+[ "$(readlink "$HOME/.codex-accounts/bin/codex")" = "$HOME/.local/bin/codex-supervised" ]
 [ ! -L "$HOME/.local/bin/claude" ]
 grep -q claude-router "$HOME/.local/bin/claude"
 [ "$(grep -Fxc 'export PATH="$HOME/.accounts/bin:$PATH"' "$HOME/.zshrc")" -eq 1 ]
+[ "$(grep -Fxc 'export PATH="$HOME/.codex-accounts/bin:$PATH"' "$HOME/.zshrc")" -eq 1 ]
 
 output=$(
     CLAUDE_CONFIG_DIR="$HOME/.claude" \
@@ -35,6 +40,19 @@ output=$(
 )
 printf '%s\n' "$output" | grep -Fx "$HOME/.accounts/bin/claude"
 printf '%s\n' "$output" | grep -Fx 'native --version'
+
+mkdir -p "$test_root/native"
+cat > "$test_root/native/codex" <<'EOF'
+#!/bin/sh
+printf 'codex-native %s\n' "$*"
+EOF
+chmod 755 "$test_root/native/codex"
+codex_output=$(
+    CODEX_REAL_BIN="$test_root/native/codex" \
+        PATH="$HOME/.codex-accounts/bin:$HOME/.local/bin:/usr/bin:/bin" \
+        codex --version
+)
+[ "$codex_output" = "codex-native --version" ]
 
 mkdir -p "$test_root/bin"
 printf '#!/bin/sh\nexit 0\n' > "$test_root/bin/launchctl"

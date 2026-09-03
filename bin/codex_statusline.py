@@ -1414,8 +1414,19 @@ def decode_jwt_payload(token: str) -> dict[str, Any]:
         return {}
 
 
-@lru_cache(maxsize=1)
-def account_label() -> str:
+@lru_cache(maxsize=512)
+def account_label(thread_id: str = "") -> str:
+    if thread_id:
+        thread_dir = Path(
+            os.environ.get(
+                "CODEX_ACCOUNTS_THREAD_DIR",
+                Path.home() / ".codex-accounts" / "thread-accounts",
+            )
+        )
+        binding = read_json(thread_dir / f"{thread_id}.json")
+        label = binding.get("label")
+        if isinstance(label, str) and label:
+            return label
     auth = read_json(CODEX_HOME / "auth.json")
     tokens = auth.get("tokens") if isinstance(auth.get("tokens"), dict) else {}
     claims = decode_jwt_payload(str(tokens.get("id_token", "")))
@@ -3207,6 +3218,75 @@ def credit_balance_text(rate_limits: dict[str, Any]) -> str:
     return format(balance, ",.0f")
 
 
+def weekly_rate_limit(rate_limits: dict[str, Any]) -> dict[str, Any] | None:
+    for key, fallback_label in (("primary", "5-hour"), ("secondary", "weekly")):
+        limit = rate_limits.get(key)
+        if not isinstance(limit, dict) or limit.get("used_percent") is None:
+            continue
+        window_minutes = limit.get("window_minutes", limit.get("window_duration_mins"))
+        if rate_limit_window_label(window_minutes, fallback_label) == "weekly":
+            return limit
+    return None
+
+
+def account_binding_usage(rate_limits: dict[str, Any]) -> float:
+    values = []
+    for key in ("primary", "secondary"):
+        limit = rate_limits.get(key)
+        if isinstance(limit, dict) and limit.get("used_percent") is not None:
+            values.append(float(limit["used_percent"]))
+    if rate_limits.get("rate_limit_reached_type") or rate_limits.get("spend_control_reached"):
+        values.append(100.0)
+    return max(values, default=101.0)
+
+
+def codex_account_board(current_account: str) -> dict[str, Any]:
+    root = Path(os.environ.get("CODEX_ACCOUNTS_HOME", Path.home() / ".codex-accounts"))
+    registry = read_json(root / "accounts.json")
+    accounts = registry.get("accounts") if isinstance(registry.get("accounts"), dict) else {}
+    usage = read_json(root / "usage.json")
+    mode = read_json(root / "mode.json")
+    current_label = current_account
+    for label, account in accounts.items():
+        if current_account == label or current_account == account.get("email"):
+            current_label = label
+            break
+
+    rows = []
+    for label in accounts:
+        account_usage = usage.get(label) if isinstance(usage.get(label), dict) else {}
+        rate_limits = (
+            account_usage.get("rate_limits")
+            if isinstance(account_usage.get("rate_limits"), dict)
+            else {}
+        )
+        rows.append(
+            {
+                "label": label,
+                "weekly": weekly_rate_limit(rate_limits),
+                "binding_usage": account_binding_usage(rate_limits),
+                "error": str(account_usage.get("error") or ""),
+            }
+        )
+
+    selected = ""
+    if mode.get("mode") == "set" and mode.get("label") in accounts:
+        selected = str(mode["label"])
+    elif rows:
+        usable = [row for row in rows if not row["error"] and row["binding_usage"] < 100]
+        if usable:
+            selected = min(usable, key=lambda row: (row["binding_usage"], row["label"]))[
+                "label"
+            ]
+    rows.sort(key=lambda row: (row["label"] != current_label, row["label"]))
+    return {
+        "current_label": current_label,
+        "mode": str(mode.get("mode") or "auto"),
+        "selected": selected,
+        "rows": rows,
+    }
+
+
 def snapshot_for_thread(
     thread: Thread,
     tokens: TokenSummary,
@@ -3234,7 +3314,7 @@ def snapshot_for_thread(
         "model_display": display_model(model),
         "reasoning_effort": effort,
         "context_window": window,
-        "account": account_label(),
+        "account": account_label(thread.id),
         "repo": git.repo,
         "branch": git.display_branch,
         "pull_request": (
@@ -3459,13 +3539,12 @@ def render_sigil(data: dict[str, Any], p: Palette) -> str:
 
 def render_footer(data: dict[str, Any], width: int, p: Palette) -> str:
     usage = data["usage"]
-    activity = data["activity"]
-    agents = data.get("agents") or {}
     tokens = data["tokens"]
     rate_limits = usage.get("rate_limits") or {}
+    account_board = codex_account_board(data["account"])
 
     effort_name = data["reasoning_effort"]
-    effort = f".{effort_name}" if effort_name else ""
+    effort = f" · {effort_name}" if effort_name else ""
 
     def solid(color: str) -> Callable[[str], str]:
         return lambda value: f"{color}{value}{p.reset}"
@@ -3484,20 +3563,6 @@ def render_footer(data: dict[str, Any], width: int, p: Palette) -> str:
             return f"{p.blue}{model}{p.reset}{effort_colors.get(effort_name, p.white)}{effort}{p.reset}"
         return f"{p.blue}{value}{p.reset}"
 
-    def repo_style(value: str) -> str:
-        repo, separator, branch = value.partition(" (")
-        if not separator:
-            return f"{p.cyan}{value}{p.reset}"
-        if not branch.endswith(")"):
-            branch = f"{branch[:-2]}…)" if len(branch) > 1 else ")"
-        branch_color = p.orange if "*" in data["branch"] else p.green
-        return f"{p.cyan}{repo}{p.reset} {branch_color}({branch}{p.reset}"
-
-    def pr_style(value: str) -> str:
-        number, separator, title = value.partition(" ")
-        suffix = f" {p.white}{title}{p.reset}" if separator else ""
-        return f"{p.cyan}{number}{p.reset}{suffix}"
-
     def row(
         label: str,
         value: str,
@@ -3510,18 +3575,26 @@ def render_footer(data: dict[str, Any], width: int, p: Palette) -> str:
         styled = style(clipped) if style else solid(p.white)(clipped)
         return f"  {p.white}{label:<7}{p.reset} {styled}"
 
+    route_mode = account_board.get("mode", "auto")
+    if route_mode == "set":
+        route_text = f"set → {account_board['selected'] or '?'}"
+    elif account_board.get("selected") and account_board["selected"] != account_board.get("current_label"):
+        route_text = f"auto → {account_board['selected']}"
+    else:
+        route_text = "auto"
+    account_text = f"{account_board.get('current_label') or data['account']} · {route_text}"
+
     lines = [
         row("model", f"{data['model_display']}{effort}", model_style),
         row("time", f"⏱ {format_duration(data['session_age_seconds'])}"),
-        row("account", data["account"], solid(p.orange)),
-        row("repo", f"{data['repo']} ({data['branch']})", repo_style),
+        row("account", account_text, solid(p.orange)),
+        row("repo", data["repo"], solid(p.cyan)),
+        row(
+            "branch",
+            data["branch"],
+            solid(p.orange if "*" in data["branch"] else p.green),
+        ),
     ]
-    pull_request = data.get("pull_request")
-    lines.append(
-        row("pr", f"#{pull_request['number']} {pull_request['title']}", pr_style)
-        if pull_request
-        else row("pr", "-")
-    )
     if usage["context_window"] > 0:
         if width >= 64:
             lines.append(render_goal_row("context", usage["context_used"], usage["context_window"], DEFAULT_BAR_WIDTH, p, 2))
@@ -3537,51 +3610,42 @@ def render_footer(data: dict[str, Any], width: int, p: Palette) -> str:
     else:
         lines.append(row("context", "-"))
 
-    weekly_limit = next(
-        (
-            limit
-            for label, limit in labeled_rate_limits(rate_limits)
-            if label == "weekly"
-        ),
-        None,
-    )
-    if weekly_limit is None:
-        lines.append(row("weekly", "-"))
-    elif width >= 64:
-        lines.append(render_rate_limit_row("weekly", weekly_limit, DEFAULT_BAR_WIDTH, p, 2))
-    else:
-        limit_pct, limit_reset = limit_display(weekly_limit)
-        lines.append(
-            row(
-                "weekly",
-                f"{format_pct(limit_pct)} {limit_reset}",
-                solid(color_for_pct(limit_pct, p)),
-            )
-        )
-
     credits = credit_balance_text(rate_limits)
-    lines.append(row("credits", f"{credits} remaining" if credits else "-"))
-
-    lines.extend(
-        [
-            row(
-                "usage",
-                f"today {format_tokens(tokens['today'])} · session {format_tokens(usage['session_total'])} · lifetime {format_tokens(tokens['lifetime'])}",
-            ),
-            row(
-                "agents",
-                f"{int(agents.get('active', 0))}/{int(agents.get('total', 0))} running · "
-                f"tools {activity['active_tools'] + int(agents.get('active_tools', 0))} · "
-                f"shells {activity['active_shells'] + int(agents.get('active_shells', 0))}",
-                solid(p.green if int(agents.get("active", 0)) else p.dim),
-            ),
-            row(
-                "mode",
-                f"{data.get('sandbox', '-')} · approvals {data.get('approval_mode', '-')}",
-                solid(p.dim),
-            ),
-        ]
+    lines.append(
+        row(
+            "tokens",
+            f"today {format_tokens(tokens['today'])} · week {format_tokens(tokens.get('week', 0))} used · "
+            f"session {format_tokens(usage['session_total'])} · credits {credits or '-'}",
+        )
     )
+    sandbox = data.get("sandbox", "-")
+    approvals = data.get("approval_mode", "-")
+    permissions = (
+        "⏵⏵ bypass permissions on"
+        if sandbox == "disabled" and approvals == "never"
+        else f"sandbox {sandbox} · approvals {approvals}"
+    )
+    lines.append(row("mode", permissions, solid(p.dim)))
+
+    board_rows = account_board.get("rows") or []
+    if board_rows and width >= 40:
+        def clip_board_line(value: str) -> str:
+            return value if len(value) <= width else f"{value[: width - 1]}…"
+
+        lines.append(
+            clip_board_line(f"    {'acct':<16} {'week':>6}  reset")
+        )
+        for account in board_rows:
+            marker = "*" if account["label"] == account_board.get("current_label") else "·"
+            weekly = account.get("weekly")
+            if weekly:
+                used, reset = limit_display(weekly)
+                reset_value = "now" if reset == "reset" else reset.removeprefix("resets ").removeprefix("reset ")
+                detail = f"{format_pct(used):>6}  {reset_value}"
+            else:
+                detail = "     —  unavailable"
+            label = short_text(str(account["label"]), 16)
+            lines.append(clip_board_line(f"  {marker} {label:<16} {detail}"))
     return "\n".join(lines)
 
 
