@@ -2228,6 +2228,13 @@ def agent_label(thread: Thread) -> str:
     return "root"
 
 
+def workflow_label(thread: Thread) -> str:
+    path = thread.agent_path.removeprefix("/root/").strip("/")
+    label = " ".join(part.replace("_", "-") for part in path.split("/") if part)
+    label = re.sub(r"\biri-(?=\d)", "IRI-", label)
+    return label or agent_label(thread)
+
+
 def activity_key(thread: Thread) -> tuple[str, bool, int]:
     return (thread.id, is_subagent_thread(thread), thread.created_at)
 
@@ -3146,13 +3153,22 @@ def render_goal_row(label: str, value: int, goal: int, width: int, p: Palette, i
     )
 
 
-def render_rate_limit_row(label: str, limit: dict[str, Any], width: int, p: Palette, indent: int = 8) -> str:
+def render_rate_limit_row(
+    label: str,
+    limit: dict[str, Any],
+    width: int,
+    p: Palette,
+    indent: int = 8,
+    include_reset: bool = True,
+) -> str:
     used_percent, reset = limit_display(limit)
     bar = build_pct_bar(used_percent, width, p)
     pct_color = color_for_pct(used_percent, p)
+    pct = format_pct(used_percent)
+    reset_suffix = f" {p.dim}{reset}{p.reset}" if include_reset else ""
     return (
         f"{' ' * indent}{p.white}{label:<7}{p.reset} {bar} "
-        f"{pct_color}{format_pct(used_percent).ljust(7)}{p.reset} {p.dim}{reset}{p.reset}"
+        f"{pct_color}{pct.ljust(7) if include_reset else pct}{p.reset}{reset_suffix}"
     )
 
 
@@ -3341,21 +3357,23 @@ def descendant_activity_summary(
     descendants: list[Thread],
     now: datetime,
     active_window_seconds: int,
-) -> dict[str, int]:
-    activities = [
-        rollout_activity(thread, now, active_window_seconds)
+) -> dict[str, Any]:
+    recent = [
+        (thread, rollout_activity(thread, now, active_window_seconds))
         for thread in descendants
         if int(now.timestamp()) - thread.updated_at <= active_window_seconds
     ]
+    running = [
+        workflow_label(thread)
+        for thread, activity in recent
+        if activity.active_turn_seconds > 0 or activity.active_tools > 0
+    ]
     return {
         "total": len(descendants),
-        "active": sum(
-            1
-            for activity in activities
-            if activity.active_turn_seconds > 0 or activity.active_tools > 0
-        ),
-        "active_tools": sum(activity.active_tools for activity in activities),
-        "active_shells": sum(activity.active_shells for activity in activities),
+        "active": len(running),
+        "active_tools": sum(activity.active_tools for _, activity in recent),
+        "active_shells": sum(activity.active_shells for _, activity in recent),
+        "running": running,
     }
 
 
@@ -3595,20 +3613,19 @@ def render_footer(data: dict[str, Any], width: int, p: Palette) -> str:
             solid(p.orange if "*" in data["branch"] else p.green),
         ),
     ]
-    if usage["context_window"] > 0:
-        if width >= 64:
-            lines.append(render_goal_row("context", usage["context_used"], usage["context_window"], DEFAULT_BAR_WIDTH, p, 2))
-        else:
-            context_pct = usage["context_used"] * 100.0 / usage["context_window"]
+    weekly = weekly_rate_limit(rate_limits)
+    if weekly:
+        weekly_used, _ = limit_display(weekly)
+        if width >= 30:
             lines.append(
-                row(
-                    "context",
-                    f"{format_pct(context_pct)} {format_tokens(usage['context_used'])}/{format_tokens(usage['context_window'])}",
-                    solid(color_for_pct(context_pct, p)),
+                render_rate_limit_row(
+                    "weekly", weekly, DEFAULT_BAR_WIDTH, p, 2, include_reset=False
                 )
             )
+        else:
+            lines.append(row("weekly", format_pct(weekly_used), solid(color_for_pct(weekly_used, p))))
     else:
-        lines.append(row("context", "-"))
+        lines.append(row("weekly", "-"))
 
     credits = credit_balance_text(rate_limits)
     lines.append(
@@ -3646,6 +3663,9 @@ def render_footer(data: dict[str, Any], width: int, p: Palette) -> str:
                 detail = "     —  unavailable"
             label = short_text(str(account["label"]), 16)
             lines.append(clip_board_line(f"  {marker} {label:<16} {detail}"))
+    for workflow in (data.get("agents") or {}).get("running", []):
+        status = short_text(f"◯ {workflow} 0/1 agents done", width)
+        lines.append(f"{p.dim}{status}{p.reset}")
     return "\n".join(lines)
 
 
