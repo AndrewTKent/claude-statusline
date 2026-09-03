@@ -3068,7 +3068,7 @@ class CodexStatuslineTest(unittest.TestCase):
             "tokens": {"today": 4000, "week": 6000, "lifetime": 9000},
             "usage": {
                 "context_window": 1000,
-                "context_used": 510,
+                "context_used": 450,
                 "session_total": 5000,
                 "rate_limits": {
                     "primary": {"used_percent": 67.0, "resets_at": 1_900_000_000},
@@ -3113,10 +3113,11 @@ class CodexStatuslineTest(unittest.TestCase):
         self.assertIn("account andrew · auto → personal", rendered)
         self.assertIn("repo    statusline", rendered)
         self.assertIn("branch  feat/codex-top", rendered)
+        self.assertIn("  context ●●●●●●○○○○○○○○○ 45%", rendered)
         self.assertIn("  weekly  ●●●○○○○○○○○○○○○ 24%", rendered)
-        self.assertNotIn("context", rendered)
+        self.assertNotIn("450/1.0k", rendered)
         self.assertNotIn("5-hour", rendered)
-        self.assertIn("tokens  today 4.0k · week 6.0k used · session 5.0k · credits -", rendered)
+        self.assertIn("usage   today 4.0k · session 5.0k · lifetime 9.0k", rendered)
         self.assertIn("acct", rendered)
         self.assertIn("* andrew", rendered)
         self.assertIn("· personal", rendered)
@@ -3138,8 +3139,9 @@ class CodexStatuslineTest(unittest.TestCase):
             "account",
             "repo",
             "branch",
+            "context",
             "weekly",
-            "tokens",
+            "usage",
             "mode",
         ]
         self.assertEqual(
@@ -3179,6 +3181,10 @@ class CodexStatuslineTest(unittest.TestCase):
         self.assertEqual(
             [line.strip().split(maxsplit=1)[0] for line in unavailable_lines],
             expected_labels,
+        )
+        self.assertEqual(
+            next(line for line in unavailable_lines if line.startswith("  context")),
+            "  context -",
         )
         self.assertEqual(
             next(line for line in unavailable_lines if line.startswith("  weekly")),
@@ -3236,8 +3242,8 @@ class CodexStatuslineTest(unittest.TestCase):
         self.assertNotIn("reset", weekly_line)
         self.assertNotIn("5-hour", rendered)
         lines = rendered.splitlines()
-        self.assertEqual(len(lines), 8)
-        self.assertIn("  tokens  today 0 · week 0 used · session 0 · credits 2,089", lines)
+        self.assertEqual(len(lines), 9)
+        self.assertIn("  usage   today 0 · session 0 · lifetime 0", lines)
 
         data.update(
             {
@@ -3275,11 +3281,6 @@ class CodexStatuslineTest(unittest.TestCase):
         ).splitlines()
         weekly_index = next(i for i, line in enumerate(rendered) if "weekly" in line)
         self.assertEqual(rendered[weekly_index + 1], "        credits 2,089 remaining")
-
-        data["usage"]["rate_limits"]["credits"] = {"balance": "0", "has_credits": False}
-        with mock.patch.object(codex_statusline, "codex_account_board", return_value={"rows": []}):
-            rendered = codex_statusline.render_footer(data, 100, codex_statusline.Palette(False))
-        self.assertIn("credits 0", rendered)
 
     def test_codex_account_board_maps_email_and_reports_weekly_headroom(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3324,6 +3325,10 @@ class CodexStatuslineTest(unittest.TestCase):
         self.assertEqual(board["rows"][0]["weekly"]["used_percent"], 40)
 
     def test_credit_balance_text_handles_unlimited_and_invalid_balances(self) -> None:
+        self.assertEqual(
+            codex_statusline.credit_balance_text({"credits": {"balance": "0"}}),
+            "0",
+        )
         self.assertEqual(
             codex_statusline.credit_balance_text({"credits": {"unlimited": True}}),
             "unlimited",

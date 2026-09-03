@@ -3142,14 +3142,26 @@ def sandbox_label(policy: str) -> str:
     return "-"
 
 
-def render_goal_row(label: str, value: int, goal: int, width: int, p: Palette, indent: int = 8) -> str:
+def render_goal_row(
+    label: str,
+    value: int,
+    goal: int,
+    width: int,
+    p: Palette,
+    indent: int = 8,
+    include_detail: bool = True,
+) -> str:
     bar, pct = build_bar(value, goal, width, p)
     detail = f"{format_tokens(value)}/{format_tokens(goal)}" if goal > 0 else format_tokens(value)
-    pct_text = format_pct(pct).ljust(7) if goal > 0 else "goal n/a"
+    pct_text = format_pct(pct)
+    detail_suffix = ""
+    if include_detail:
+        pct_text = pct_text.ljust(7) if goal > 0 else "goal n/a"
+        detail_suffix = f" {p.dim}{detail}{p.reset}"
     pct_color = color_for_pct(pct, p)
     return (
         f"{' ' * indent}{p.white}{label:<7}{p.reset} {bar} "
-        f"{pct_color}{pct_text}{p.reset} {p.dim}{detail}{p.reset}"
+        f"{pct_color}{pct_text}{p.reset}{detail_suffix}"
     )
 
 
@@ -3613,6 +3625,25 @@ def render_footer(data: dict[str, Any], width: int, p: Palette) -> str:
             solid(p.orange if "*" in data["branch"] else p.green),
         ),
     ]
+    if usage["context_window"] > 0:
+        if width >= 30:
+            lines.append(
+                render_goal_row(
+                    "context",
+                    usage["context_used"],
+                    usage["context_window"],
+                    DEFAULT_BAR_WIDTH,
+                    p,
+                    2,
+                    include_detail=False,
+                )
+            )
+        else:
+            context_pct = usage["context_used"] * 100.0 / usage["context_window"]
+            lines.append(row("context", format_pct(context_pct), solid(color_for_pct(context_pct, p))))
+    else:
+        lines.append(row("context", "-"))
+
     weekly = weekly_rate_limit(rate_limits)
     if weekly:
         weekly_used, _ = limit_display(weekly)
@@ -3627,12 +3658,11 @@ def render_footer(data: dict[str, Any], width: int, p: Palette) -> str:
     else:
         lines.append(row("weekly", "-"))
 
-    credits = credit_balance_text(rate_limits)
     lines.append(
         row(
-            "tokens",
-            f"today {format_tokens(tokens['today'])} · week {format_tokens(tokens.get('week', 0))} used · "
-            f"session {format_tokens(usage['session_total'])} · credits {credits or '-'}",
+            "usage",
+            f"today {format_tokens(tokens['today'])} · session {format_tokens(usage['session_total'])} · "
+            f"lifetime {format_tokens(tokens['lifetime'])}",
         )
     )
     sandbox = data.get("sandbox", "-")
