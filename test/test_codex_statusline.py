@@ -3010,6 +3010,7 @@ class CodexStatuslineTest(unittest.TestCase):
             approval_mode="",
             git_branch="",
             archived=0,
+            agent_path="/root/release_train/solei_local",
         )
         stale = dataclasses.replace(base, id="stale", rollout_path="/tmp/stale.jsonl", updated_at=100)
         activity = codex_statusline.RolloutActivity(
@@ -3045,7 +3046,13 @@ class CodexStatuslineTest(unittest.TestCase):
         rollout_activity.assert_called_once_with(base, datetime.fromtimestamp(1000), 100)
         self.assertEqual(
             summary,
-            {"total": 2, "active": 1, "active_tools": 1, "active_shells": 1},
+            {
+                "total": 2,
+                "active": 1,
+                "active_tools": 1,
+                "active_shells": 1,
+                "running": ["release-train solei-local"],
+            },
         )
 
     def test_render_footer_shows_live_limits_and_workers_within_width(self) -> None:
@@ -3065,11 +3072,21 @@ class CodexStatuslineTest(unittest.TestCase):
                 "session_total": 5000,
                 "rate_limits": {
                     "primary": {"used_percent": 67.0, "resets_at": 1_900_000_000},
-                    "secondary": {"used_percent": 13.0, "resets_at": 1_900_604_800},
+                    "secondary": {
+                        "used_percent": 24.0,
+                        "window_minutes": 10_080,
+                        "resets_at": 1_900_604_800,
+                    },
                 },
             },
             "activity": {"active_tools": 1, "active_shells": 1},
-            "agents": {"total": 3, "active": 1, "active_tools": 2, "active_shells": 2},
+            "agents": {
+                "total": 3,
+                "active": 1,
+                "active_tools": 2,
+                "active_shells": 2,
+                "running": ["release-train solei-local"],
+            },
             "sandbox": "disabled",
             "approval_mode": "never",
         }
@@ -3096,7 +3113,8 @@ class CodexStatuslineTest(unittest.TestCase):
         self.assertIn("account andrew · auto → personal", rendered)
         self.assertIn("repo    statusline", rendered)
         self.assertIn("branch  feat/codex-top", rendered)
-        self.assertIn("context", rendered)
+        self.assertIn("  weekly  ●●●○○○○○○○○○○○○ 24%", rendered)
+        self.assertNotIn("context", rendered)
         self.assertNotIn("5-hour", rendered)
         self.assertIn("tokens  today 4.0k · week 6.0k used · session 5.0k · credits -", rendered)
         self.assertIn("acct", rendered)
@@ -3113,13 +3131,14 @@ class CodexStatuslineTest(unittest.TestCase):
         self.assertNotIn("resets", account_row)
         self.assertNotIn("left", account_header)
         self.assertNotIn("33%", account_row)
+        self.assertEqual(rendered.splitlines()[-1], "◯ release-train solei-local 0/1 agents done")
         expected_labels = [
             "model",
             "time",
             "account",
             "repo",
             "branch",
-            "context",
+            "weekly",
             "tokens",
             "mode",
         ]
@@ -3146,6 +3165,7 @@ class CodexStatuslineTest(unittest.TestCase):
         unavailable = {
             **data,
             "pull_request": None,
+            "agents": {"running": []},
             "usage": {
                 **data["usage"],
                 "context_window": 0,
@@ -3161,8 +3181,8 @@ class CodexStatuslineTest(unittest.TestCase):
             expected_labels,
         )
         self.assertEqual(
-            next(line for line in unavailable_lines if line.startswith("  context")),
-            "  context -",
+            next(line for line in unavailable_lines if line.startswith("  weekly")),
+            "  weekly  -",
         )
         self.assertEqual(unavailable_lines[-1], "  mode    ⏵⏵ bypass permissions on")
 
@@ -3178,7 +3198,7 @@ class CodexStatuslineTest(unittest.TestCase):
             tiny_lines = codex_statusline.render_footer(data, 8, codex_statusline.Palette(False)).splitlines()
         self.assertTrue(all(len(line) <= 8 for line in tiny_lines))
 
-    def test_footer_omits_weekly_summary_while_default_keeps_it(self) -> None:
+    def test_footer_shows_weekly_without_reset_while_default_keeps_it(self) -> None:
         data = {
             "model_display": "GPT-5.6",
             "reasoning_effort": "max",
@@ -3211,7 +3231,9 @@ class CodexStatuslineTest(unittest.TestCase):
         with mock.patch.object(codex_statusline, "codex_account_board", return_value={"rows": []}):
             rendered = codex_statusline.render_footer(data, 100, codex_statusline.Palette(False))
 
-        self.assertNotIn("\n  weekly", rendered)
+        weekly_line = next(line for line in rendered.splitlines() if line.startswith("  weekly"))
+        self.assertEqual(weekly_line, "  weekly  ●●●●●●●●●●●●●●○ 96%")
+        self.assertNotIn("reset", weekly_line)
         self.assertNotIn("5-hour", rendered)
         lines = rendered.splitlines()
         self.assertEqual(len(lines), 8)
