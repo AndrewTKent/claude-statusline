@@ -3769,6 +3769,7 @@ class CodexStatuslineTest(unittest.TestCase):
             self.assertEqual(
                 capture.read_text().splitlines(),
                 [
+                    "--no-alt-screen",
                     "-c",
                     "tui.status_line=[]",
                     "--dangerously-bypass-approvals-and-sandbox",
@@ -3780,19 +3781,35 @@ class CodexStatuslineTest(unittest.TestCase):
             subprocess.run([str(launcher)], check=True, env=env)
             self.assertEqual(
                 capture.read_text().splitlines(),
-                ["-c", "tui.status_line=[]", "--dangerously-bypass-approvals-and-sandbox"],
+                [
+                    "--no-alt-screen",
+                    "-c",
+                    "tui.status_line=[]",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                ],
             )
 
             subprocess.run([str(launcher), "--sandbox", "read-only"], check=True, env=env)
             self.assertEqual(
                 capture.read_text().splitlines(),
-                ["-c", "tui.status_line=[]", "--sandbox", "read-only"],
+                [
+                    "--no-alt-screen",
+                    "-c",
+                    "tui.status_line=[]",
+                    "--sandbox",
+                    "read-only",
+                ],
             )
 
             subprocess.run([str(launcher), "--yolo"], check=True, env=env)
             self.assertEqual(
                 capture.read_text().splitlines(),
-                ["-c", "tui.status_line=[]", "--yolo"],
+                [
+                    "--no-alt-screen",
+                    "-c",
+                    "tui.status_line=[]",
+                    "--yolo",
+                ],
             )
 
             for permissions in (("-sread-only",), ("-s=read-only",), ("-anever",), ("-a=never",)):
@@ -3806,6 +3823,7 @@ class CodexStatuslineTest(unittest.TestCase):
             self.assertEqual(
                 capture.read_text().splitlines(),
                 [
+                    "--no-alt-screen",
                     "-c",
                     "tui.status_line=[]",
                     "--dangerously-bypass-approvals-and-sandbox",
@@ -3898,7 +3916,7 @@ class CodexStatuslineTest(unittest.TestCase):
             self.assertIn("-l 14", split_window)
             self.assertIn("--watch 3", split_window)
             self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", captured)
-            self.assertIn("set-option mouse off", captured)
+            self.assertIn("set-option mouse on", captured)
             self.assertIn("set-option -w history-limit 100000", captured)
 
             subprocess.run(
@@ -4083,6 +4101,7 @@ class CodexStatuslineTest(unittest.TestCase):
             self.assertIn("-x 117 -y 83", new_session)
             self.assertIn("sleep 86400", new_session)
             self.assertIn("runner.sh", respawn_pane)
+            self.assertIn("--no-alt-screen", respawn_pane)
             self.assertNotIn("--internal-run", new_session)
             self.assertIn("kill-pane -t %0", capture.read_text())
             self.assertNotIn("--bind-after-ms", split_window)
@@ -4103,7 +4122,7 @@ class CodexStatuslineTest(unittest.TestCase):
                 },
             )
             self.assertTrue(all("resize-pane -t '%1' -y 14" in line for line in resize_hooks))
-            self.assertIn("mouse off", "\n".join(capture.read_text().splitlines()))
+            self.assertIn("mouse on", "\n".join(capture.read_text().splitlines()))
             self.assertIn("history-limit 100000", "\n".join(capture.read_text().splitlines()))
 
     def launcher_detached_session_env(self, tmp: Path, capture: Path) -> dict[str, str]:
