@@ -15,7 +15,7 @@ jobs:
         uses: ludeeus/action-shellcheck@master
         with:
           scandir: bin/
-          additional_files: install.sh install-account-router.sh uninstall.sh install-codex.sh shell/claude-supervised test/test_install_account_router.sh
+          additional_files: install.sh install-account-router.sh uninstall.sh install-codex.sh shell/claude-supervised shell/codex-supervised test/test_install_account_router.sh
           severity: error
 
   test-claude:
@@ -31,7 +31,7 @@ jobs:
       - name: Install pytest
         run: python3 -m pip install pytest
       - name: Claude-side tests
-        run: python3 -m pytest test/test_accounts.py test/test_claude_router.py test/test_scan_tokens.py test/test_agent_metrics.py -q
+        run: python3 -m pytest test/test_accounts.py test/test_claude_router.py test/test_codex_accounts.py test/test_codex_router.py test/test_scan_tokens.py test/test_agent_metrics.py -q
 
   test:
     runs-on: ${{ matrix.os }}
