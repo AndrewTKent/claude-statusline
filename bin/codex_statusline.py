@@ -82,6 +82,9 @@ TOOL_SESSION_PATTERN = re.compile(
     r"""session_id["']?\s*:\s*["']?([A-Za-z0-9_-]+)"""
 )
 TOOL_SESSION_VALUE_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
+ROLLOUT_THREAD_ID_PATTERN = re.compile(
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$"
+)
 NON_WHITESPACE_PATTERN = re.compile(r"\S")
 
 
@@ -1708,12 +1711,26 @@ def select_owner_thread_id(conn: sqlite3.Connection, owner_pid_file: str) -> str
     rollout_paths = process_rollout_paths(owner_pid)
     if not rollout_paths:
         return ""
-    placeholders = ",".join("?" for _ in rollout_paths)
-    rows = conn.execute(
-        f"select {THREAD_COLUMNS} from threads where rollout_path in ({placeholders}) "
-        "order by coalesce(updated_at_ms, updated_at * 1000) desc",
-        tuple(rollout_paths),
-    ).fetchall()
+    thread_ids = {
+        match.group(1)
+        for path in rollout_paths
+        if (match := ROLLOUT_THREAD_ID_PATTERN.search(Path(path).name))
+    }
+    rows = []
+    if thread_ids:
+        placeholders = ",".join("?" for _ in thread_ids)
+        rows = conn.execute(
+            f"select {THREAD_COLUMNS} from threads where id in ({placeholders}) "
+            "order by coalesce(updated_at_ms, updated_at * 1000) desc",
+            tuple(thread_ids),
+        ).fetchall()
+    if not rows:
+        placeholders = ",".join("?" for _ in rollout_paths)
+        rows = conn.execute(
+            f"select {THREAD_COLUMNS} from threads where rollout_path in ({placeholders}) "
+            "order by coalesce(updated_at_ms, updated_at * 1000) desc",
+            tuple(rollout_paths),
+        ).fetchall()
     if not rows:
         # Symlinked CODEX_HOME: fd scans report realpaths while the DB stores the opened path.
         recent = conn.execute(
