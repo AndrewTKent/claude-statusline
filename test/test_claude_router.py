@@ -1909,6 +1909,7 @@ def test_statusline_tracks_effort_transitions_in_router_state(tmp_path, monkeypa
 def test_statusline_says_when_a_forced_target_is_pending(tmp_path):
     home = tmp_path / "home"
     (home / ".claude").mkdir(parents=True)
+    (home / ".claude" / "statusline.conf").write_text("MAX_COLS=200\n")
     (home / ".accounts").mkdir()
     (home / ".accounts" / "mode.json").write_text(
         '{"mode":"set","label":"preferred"}'
@@ -1946,6 +1947,7 @@ def test_statusline_says_when_a_forced_target_is_pending(tmp_path):
 def test_statusline_says_when_an_env_pin_is_bypassed(tmp_path):
     home = tmp_path / "home"
     (home / ".claude").mkdir(parents=True)
+    (home / ".claude" / "statusline.conf").write_text("MAX_COLS=200\n")
     profile = home / ".accounts" / "profiles" / "safe"
     profile.mkdir(parents=True)
     project = tmp_path / "project"
