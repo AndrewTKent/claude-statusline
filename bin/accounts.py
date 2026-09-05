@@ -1796,7 +1796,8 @@ def poll_blobs_usage(blobs: dict) -> int:
     """Query each stored account's remaining limits with its OWN access token
     and write them to the board (account-resets.json). Pure reads. Skips blobs
     whose access token has expired (would 401) — those show the reset-aware
-    estimate until the account is next active and its blob refreshes."""
+    estimate until the account is next active and its blob refreshes. One dead
+    account only ages its own row; the poll fails only when nothing answered."""
     now = int(time.time())
     fresh: dict[str, dict] = {}
     failed = 0
@@ -1819,8 +1820,10 @@ def poll_blobs_usage(blobs: dict) -> int:
             e.get("email"), e.get("org_uuid"), usage, now
         )
     merge_reset_rows(fresh)
-    if failed:
+    if failed and not fresh:
         raise AccountsError(f"usage poll failed for {failed} account(s)")
+    if failed:
+        print(f"accounts: usage poll failed for {failed} account(s)", file=sys.stderr)
     return len(fresh)
 
 

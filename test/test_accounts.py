@@ -1989,6 +1989,43 @@ class TestPollBlobsUsage:
         assert accounts.poll_blobs_usage(blobs) == 0
         assert merged == {}
 
+    def test_one_dead_account_does_not_fail_the_poll(self, monkeypatch, capsys):
+        blobs = {
+            "accounts": {
+                "work": {"blob": _live_blob("work"), "email": "work@example.com", "org_uuid": "org-work"},
+                "dead": {"blob": _live_blob("dead"), "email": "dead@example.com", "org_uuid": "org-dead"},
+            }
+        }
+        monkeypatch.setattr(accounts.time, "time", lambda: 2_000.0)
+        monkeypatch.setattr(accounts, "profile_live_blob", lambda _label: None)
+        monkeypatch.setattr(
+            accounts,
+            "fetch_usage",
+            lambda token: {"five_hour": {"utilization": 12}} if token == "work" else None,
+        )
+        monkeypatch.setattr(accounts, "usage_to_reset_row", lambda *_args: {"five_hour_pct": 12})
+        merged = {}
+        monkeypatch.setattr(accounts, "merge_reset_rows", merged.update)
+
+        assert accounts.poll_blobs_usage(blobs) == 1
+
+        assert merged == {"work@example.com|org-work": {"five_hour_pct": 12}}
+        assert "usage poll failed for 1 account(s)" in capsys.readouterr().err
+
+    def test_every_account_failing_raises(self, monkeypatch):
+        blobs = {
+            "accounts": {
+                "dead": {"blob": _live_blob("dead"), "email": "dead@example.com", "org_uuid": "org-dead"},
+            }
+        }
+        monkeypatch.setattr(accounts.time, "time", lambda: 2_000.0)
+        monkeypatch.setattr(accounts, "profile_live_blob", lambda _label: None)
+        monkeypatch.setattr(accounts, "fetch_usage", lambda _token: None)
+        monkeypatch.setattr(accounts, "merge_reset_rows", lambda _rows: None)
+
+        with pytest.raises(accounts.AccountsError, match="usage poll failed for 1 account"):
+            accounts.poll_blobs_usage(blobs)
+
 
 def _live_blob(atok, future_ms=3_000_000_000_000):
     # access + refresh both far-future: poll won't skip it, cred isn't expired
